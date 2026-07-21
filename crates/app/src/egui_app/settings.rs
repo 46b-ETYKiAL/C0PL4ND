@@ -57,6 +57,11 @@ const CATEGORIES: &[&str] = &[
     "Keybindings",
     "Updates",
     "Privacy",
+    // Config file management. This section is rendered by `render_sections` and was
+    // previously ABSENT from this list, which made it reachable only by typing a
+    // matching term into the settings search box — a built page with no way to click
+    // to it. `every_rendered_section_is_reachable` now fails if that recurs.
+    "Config",
 ];
 
 /// Cross-category search labels for the **Appearance** section. Kept as a named
@@ -3378,6 +3383,69 @@ fn step_line_height_px(px: f32, delta: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every section `render_sections` actually renders must be reachable from the
+    /// left-nav.
+    ///
+    /// The **Config** section regressed exactly this way: the page was fully built,
+    /// but `"Config"` was missing from [`CATEGORIES`], so `sel` could never equal it
+    /// and the only way to reach the page was to type a matching term into the
+    /// settings search box. A built page nobody can click to is indistinguishable
+    /// from a missing feature.
+    ///
+    /// This scans THIS file's own source for the section names passed to
+    /// `section_visible` and asserts each one is offered in the nav. The needle is
+    /// assembled with `concat!` so the scan cannot match this test's own text.
+    ///
+    /// The scan is deliberately truncated at the start of this `#[cfg(test)]` module:
+    /// the tests below call `section_visible` with LITERAL arguments
+    /// (`section_visible("Font", "", "Font", …)`), which a naive whole-file scan
+    /// would mistake for rendered production sections. A guard that reads its own
+    /// test code is the classic way these wiring checks go quietly wrong.
+    #[test]
+    fn every_rendered_section_is_reachable_from_the_nav() {
+        let whole = include_str!("settings.rs");
+        // First occurrence is the real module boundary; any later match is inside
+        // this test's own text and cannot precede it.
+        let src = match whole.find(concat!("#[cfg", "(test)]")) {
+            Some(end) => &whole[..end],
+            None => whole,
+        };
+        let needle = concat!("section_", "visible(");
+        let mut rendered: Vec<&str> = Vec::new();
+        let mut rest = src;
+        while let Some(hit) = rest.find(needle) {
+            let (before, after) = rest.split_at(hit);
+            // Skip the function DEFINITION — only call sites name a section.
+            let is_definition = before.trim_end().ends_with("fn");
+            rest = &after[needle.len()..];
+            if is_definition {
+                continue;
+            }
+            // Args are `sel, q, "Name", &[…]` — the first string literal after the
+            // open paren is the section name, in both rustfmt layouts.
+            let Some(open) = rest.find('"') else { continue };
+            let tail = &rest[open + 1..];
+            let Some(close) = tail.find('"') else { continue };
+            rendered.push(&tail[..close]);
+        }
+
+        assert!(
+            !rendered.is_empty(),
+            "the source scan found no section_visible call sites — the scan itself \
+             has broken, which would make this test vacuously green"
+        );
+
+        let missing: Vec<&&str> = rendered
+            .iter()
+            .filter(|name| !CATEGORIES.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these settings sections are rendered but NOT listed in CATEGORIES, so \
+             they are unreachable from the left-nav: {missing:?}"
+        );
+    }
 
     #[test]
     fn builtin_themes_include_the_default() {

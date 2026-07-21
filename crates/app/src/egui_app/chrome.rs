@@ -12,12 +12,297 @@
 //! buttons use Phosphor glyphs via `ui.button` so they self-size and never fall
 //! back to tofu.
 
+use std::collections::HashSet;
+
 use c0pl4nd_core::term::MouseMode;
-use egui::{RichText, Sense};
+use egui::{Color32, RichText, Sense};
 use egui_phosphor::thin as icon;
 
-use super::theme::{brand, ChromeColors};
+use super::grid::PaneId;
+use super::theme::{brand, ChromeColors, CLOSE_RED, CLOSE_RED_PRESSED};
 use super::C0pl4ndApp;
+
+// ---------------------------------------------------------------------------
+// Flat chrome glyph buttons — ONE shared hover/press/focus treatment
+// ---------------------------------------------------------------------------
+//
+// Every glyph button in the chrome (tab pin, tab ×, the ‹ › tab step-arrows and
+// the caption cluster ⚙ — ▢ ✕) goes through [`glyph_button`]. Before this there
+// were TWO hand-rolled copies of the pattern (the caption cluster and
+// `step_arrow`) and the tab pin/× had NONE — they were `Button::…frame(false)`,
+// which egui paints with no fill and no stroke in EVERY widget state
+// (`egui-0.34.3/src/widgets/button.rs:353-357`), so the `flatten_chrome_buttons`
+// hover veil was discarded and the glyph colour was baked at construction. The
+// result was a button with zero hover feedback (the reported bug). Funnelling all
+// four sites through one helper is what stops a future change fixing one and
+// regressing another.
+
+/// Interaction state of a flat chrome glyph button. Each maps to a VISUALLY
+/// DISTINCT paint (see [`chrome_glyph_paint`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GlyphState {
+    /// Not interactive (e.g. a step-arrow with no previous/next tab).
+    Disabled,
+    /// Idle — no pointer, not held.
+    Rest,
+    /// Pointer over the button.
+    Hover,
+    /// Primary button held down over the button.
+    Press,
+}
+
+/// The resolved paint for one flat chrome glyph button: the glyph colour and the
+/// optional backplate fill. Pure data so the state→colour mapping is unit-testable
+/// without an egui `Ui`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct GlyphPaint {
+    /// Colour the glyph is drawn in.
+    pub glyph: Color32,
+    /// Backplate fill, or `None` for a fully frameless (idle) button.
+    pub fill: Option<Color32>,
+}
+
+/// Duration (seconds) of the hover fade. Short enough to feel immediate, long
+/// enough to read as a fade rather than a snap.
+pub(super) const HOVER_FADE_SECONDS: f32 = 0.10;
+
+/// The hover-fade duration to pass to `Context::animate_bool_with_time`: **zero**
+/// under the reduced-motion preference (WCAG 2.3.3 — the state still changes, it
+/// just changes instantly), else [`HOVER_FADE_SECONDS`]. Pure so the
+/// reduced-motion branch is unit-testable without an OS query.
+pub(super) fn hover_fade_time(reduced_motion: bool) -> f32 {
+    if reduced_motion {
+        0.0
+    } else {
+        HOVER_FADE_SECONDS
+    }
+}
+
+/// The subtle hover/press veil for a chrome button, matching the polarity
+/// `flatten_chrome_buttons` uses (white on dark themes, black on light) and the
+/// same alphas (20 hover / 32 press) so the animated fill lands on exactly the
+/// treatment the rest of the chrome already speaks.
+fn veil(colors: ChromeColors, alpha: u8) -> Color32 {
+    if super::theme::is_light(colors.bg) {
+        Color32::from_black_alpha(alpha)
+    } else {
+        Color32::from_white_alpha(alpha)
+    }
+}
+
+/// Resolve the paint for a flat chrome glyph button.
+///
+/// * `rest` — the idle glyph colour (the muted tone for the pin/×/caption, a
+///   brighter mid-tone for the step-arrows, brand violet for a PINNED pin).
+/// * `is_close` — the ✕ / × takes the conventional destructive-red treatment.
+/// * `t` — the animated hover amount, `0.0` (rest) .. `1.0` (fully hovered); it
+///   fades the glyph AND the fill so the transition is continuous. Under reduced
+///   motion the caller passes a zero-duration animation, so `t` is only ever
+///   exactly `0.0` or `1.0`.
+///
+/// The four states are guaranteed distinct: disabled is dimmer than rest, hover
+/// brightens the glyph over a veil (close-red for the ✕), and press deepens both.
+pub(super) fn chrome_glyph_paint(
+    state: GlyphState,
+    colors: ChromeColors,
+    rest: Color32,
+    is_close: bool,
+    t: f32,
+) -> GlyphPaint {
+    let t = t.clamp(0.0, 1.0);
+    match state {
+        // Dimmer than rest, and never a backplate — an inert chevron.
+        GlyphState::Disabled => GlyphPaint {
+            glyph: rest.lerp_to_gamma(colors.bg, 0.55),
+            fill: None,
+        },
+        // Held: the deepest treatment of the four.
+        GlyphState::Press => GlyphPaint {
+            glyph: if is_close { Color32::WHITE } else { colors.fg },
+            fill: Some(if is_close {
+                CLOSE_RED_PRESSED
+            } else {
+                veil(colors, 32)
+            }),
+        },
+        // Rest and Hover share one continuous ramp parameterised by `t`, so the
+        // fade-in and the fade-out are the same code path.
+        GlyphState::Rest | GlyphState::Hover => {
+            let hot = if is_close { Color32::WHITE } else { colors.fg };
+            let glyph = rest.lerp_to_gamma(hot, t);
+            let fill = if t <= 0.0 {
+                None
+            } else if is_close {
+                Some(CLOSE_RED.gamma_multiply(t))
+            } else {
+                Some(veil(colors, (t * 20.0).round() as u8))
+            };
+            GlyphPaint { glyph, fill }
+        }
+    }
+}
+
+/// Paint one flat chrome glyph button into `rect` and return its `Response`.
+///
+/// The hover state is pre-checked with `rect_contains_pointer` so the glyph
+/// colour and fill are chosen BEFORE the `Button` paints — a plain flow `Button`
+/// cannot do this (its text colour is fixed at construction), which is precisely
+/// why the tab pin/× had no hover feedback.
+///
+/// `anim_id` MUST be derived from the button's stable identity (pane id + role),
+/// never `ui.next_auto_id()`: auto ids shift when a tab is inserted or removed,
+/// which would restart every in-flight animation on the strip.
+///
+/// A keyboard-focused button gets an explicit focus RING (egui 0.34 has no
+/// focus-ring style — see [`super::theme::focus_ring_color`]), drawn outside the
+/// rect so it is distinct from both the hover veil and the press fill.
+#[allow(clippy::too_many_arguments)]
+fn glyph_button(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    text: impl FnOnce(Color32) -> RichText,
+    colors: ChromeColors,
+    rest: Color32,
+    is_close: bool,
+    enabled: bool,
+    anim_id: egui::Id,
+    hover_text: &str,
+) -> egui::Response {
+    let hovered = enabled && ui.rect_contains_pointer(rect);
+    let held = hovered && ui.input(|i| i.pointer.primary_down());
+    let t = ui.ctx().animate_bool_with_time(
+        anim_id,
+        hovered,
+        hover_fade_time(c0pl4nd_core::reduced_motion::reduced_motion()),
+    );
+    let state = if !enabled {
+        GlyphState::Disabled
+    } else if held {
+        GlyphState::Press
+    } else if hovered {
+        GlyphState::Hover
+    } else {
+        GlyphState::Rest
+    };
+    let paint = chrome_glyph_paint(state, colors, rest, is_close, t);
+    // `min_size(rect.size())` keeps the HIT TARGET at the full rect (>= 24x24 for
+    // the tab controls — Fitts / WCAG 2.5.8) while the glyph itself stays small.
+    let mut button = egui::Button::new(text(paint.glyph)).min_size(rect.size());
+    match paint.fill {
+        Some(fill) => button = button.fill(fill),
+        // Nothing to paint: stay frameless so an idle button never floats as an
+        // opaque chip over the translucent bar.
+        None => button = button.frame(false),
+    }
+    let resp = ui.put(rect, button).on_hover_text(hover_text);
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            rect.expand(1.0),
+            egui::CornerRadius::same(4),
+            egui::Stroke::new(2.0, super::theme::focus_ring_color(colors)),
+            egui::StrokeKind::Outside,
+        );
+    }
+    resp
+}
+
+/// Minimum hit-target edge (logical px) for the in-tab pin/× controls. The glyph
+/// is 13px, but a 13px target is a Fitts-law miss magnet and below the WCAG 2.5.8
+/// target-size floor — so the BUTTON is allocated at this size while the glyph is
+/// unchanged.
+const TAB_CONTROL_HIT: f32 = 24.0;
+
+/// The next in-tab control rect at the flow cursor, vertically centred on the tab
+/// row and sized to [`TAB_CONTROL_HIT`].
+///
+/// Pre-computing the rect is what makes hover feedback POSSIBLE: [`glyph_button`]
+/// must know whether the pointer is inside BEFORE it constructs the button, because
+/// an `egui::Button`'s text colour is fixed at construction and can never respond to
+/// hover afterwards. That is precisely why the pin/× read as dead controls before.
+fn tab_control_rect(ui: &egui::Ui) -> egui::Rect {
+    let cy = ui.max_rect().center().y;
+    let x0 = ui.cursor().min.x;
+    egui::Rect::from_min_max(
+        egui::pos2(x0, cy - TAB_CONTROL_HIT / 2.0),
+        egui::pos2(x0 + TAB_CONTROL_HIT, cy + TAB_CONTROL_HIT / 2.0),
+    )
+}
+
+/// The egui-memory key the in-flight tab drag is stored under.
+fn tab_drag_id() -> egui::Id {
+    egui::Id::new("tab_strip_drag")
+}
+
+// ---------------------------------------------------------------------------
+// Tab middle-click + drag-to-reorder
+// ---------------------------------------------------------------------------
+
+/// The drag payload for a tab drag-to-reorder gesture: the pane being moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TabDrag(PaneId);
+
+/// The egui-memory key the user's explicit tab order is stored under.
+fn tab_order_id() -> egui::Id {
+    egui::Id::new("tab_strip_user_order")
+}
+
+/// Whether a middle-click on a tab should close it.
+///
+/// A PINNED tab's × is deliberately hidden (unpin to close, so a pinned pane
+/// cannot be shut by accident) — middle-click must not become a back door around
+/// that, so it is inert on a pinned tab. Pure → unit-testable.
+pub(super) fn middle_click_closes(is_pinned: bool) -> bool {
+    !is_pinned
+}
+
+/// Re-order `tabs` (already in the derived pinned-first order) by the user's
+/// explicit `saved` order.
+///
+/// Panes present in `saved` sort by their saved rank; panes the user has never
+/// moved (a freshly-opened tab) keep their derived position AFTER the ordered
+/// ones within their group. The pinned/unpinned GROUPING is re-asserted as the
+/// primary key, so a saved order can never interleave a pinned tab with an
+/// unpinned one. Pure → unit-testable.
+pub(super) fn apply_saved_order<T>(
+    mut tabs: Vec<(PaneId, T)>,
+    saved: &[PaneId],
+    pinned: &HashSet<PaneId>,
+) -> Vec<(PaneId, T)> {
+    let rank = |p: &PaneId| saved.iter().position(|s| s == p).unwrap_or(usize::MAX);
+    // Stable sort: equal keys (e.g. two never-moved tabs) keep derived order.
+    tabs.sort_by_key(|(pid, _)| (!pinned.contains(pid), rank(pid)));
+    tabs
+}
+
+/// Compute the new tab order after dropping `from` onto `to`.
+///
+/// `before` is true when the pointer was on the LEFT half of the target tab (drop
+/// before it), false for the right half (drop after it). Returns `None` — meaning
+/// "no change" — for a no-op drop (onto itself), an unknown pane, or a
+/// CROSS-GROUP drop (pinned onto unpinned or vice versa), because pinned tabs are
+/// a distinct leading group and a drag must never smuggle a tab across that
+/// boundary. Pure → unit-testable.
+pub(super) fn reorder_tabs(
+    order: &[PaneId],
+    pinned: &HashSet<PaneId>,
+    from: PaneId,
+    to: PaneId,
+    before: bool,
+) -> Option<Vec<PaneId>> {
+    if from == to {
+        return None;
+    }
+    if pinned.contains(&from) != pinned.contains(&to) {
+        return None;
+    }
+    if !order.contains(&from) || !order.contains(&to) {
+        return None;
+    }
+    let mut out: Vec<PaneId> = order.iter().copied().filter(|p| *p != from).collect();
+    let at = out.iter().position(|p| *p == to)?;
+    out.insert(if before { at } else { at + 1 }, from);
+    (out != order).then_some(out)
+}
 
 /// Outcome of one chrome frame — the actions the user requested via the chrome
 /// widgets. The host applies them after the panel closure returns so that the
@@ -232,6 +517,20 @@ impl C0pl4ndApp {
             // Stable sort: pinned first, original visual order preserved within
             // each group (`sort_by_key` is stable).
             tabs.sort_by_key(|(pid, _)| !self.pinned.contains(pid));
+            // Then re-assert the user's explicit drag-to-reorder order on top of
+            // that grouping. Persisted in egui memory, so it survives tab open/close
+            // within the session; panes the user never moved keep their derived slot.
+            let saved_order: Vec<PaneId> = ui
+                .ctx()
+                .data(|d| d.get_temp::<Vec<PaneId>>(tab_order_id()).unwrap_or_default());
+            let tabs = apply_saved_order(tabs, &saved_order, &self.pinned);
+            // The pane order actually on screen this frame — the basis a drop
+            // computes the new order from.
+            let visible_order: Vec<PaneId> = tabs.iter().map(|(p, _)| *p).collect();
+            // An in-flight tab drag, and where it would land. Resolved AFTER the
+            // strip closure so the reorder never mutates the list mid-iteration.
+            let dragging: Option<TabDrag> = ui.ctx().data(|d| d.get_temp::<TabDrag>(tab_drag_id()));
+            let mut drop_target: Option<(PaneId, PaneId, bool)> = None;
             let cur = tabs.iter().position(|(pid, _)| *pid == self.focused_pane);
             let prev_target = cur
                 .filter(|&i| i > 0)
@@ -375,19 +674,69 @@ impl C0pl4ndApp {
                             if tab.clicked() {
                                 actions.focus_tab = Some(pane_id);
                             }
+                            // Middle-click closes — the universal browser/terminal
+                            // convention. Inert on a PINNED tab: its × is deliberately
+                            // hidden so a pinned pane cannot be shut by accident, and
+                            // middle-click must not become a back door around that.
+                            if tab.middle_clicked() && middle_click_closes(is_pinned) {
+                                actions.close_tab = Some(pane_id);
+                            }
+                            // Drag-to-reorder. The tab body is the drag handle; the
+                            // pin/× keep their own click semantics.
+                            let tab = tab.interact(egui::Sense::click_and_drag());
+                            if tab.drag_started() {
+                                ui.ctx()
+                                    .data_mut(|d| d.insert_temp(tab_drag_id(), TabDrag(pane_id)));
+                            }
+                            // While a drag is live, the tab under the pointer is the drop
+                            // target; the pointer's side of centre decides before/after.
+                            // An insertion caret is painted so the drop point is visible.
+                            if let (Some(TabDrag(from)), Some(pos)) =
+                                (dragging, ui.ctx().pointer_interact_pos())
+                            {
+                                if from != pane_id && tab.rect.contains(pos) {
+                                    let before = pos.x < tab.rect.center().x;
+                                    drop_target = Some((from, pane_id, before));
+                                    let x = if before {
+                                        tab.rect.left()
+                                    } else {
+                                        tab.rect.right()
+                                    };
+                                    ui.painter().vline(
+                                        x,
+                                        tab.rect.y_range(),
+                                        egui::Stroke::new(2.0, colors.accent),
+                                    );
+                                }
+                            }
                             // Pinned → SOLID violet pin (Fill family); unpinned → thin
                             // muted pin. The fill glyph makes "pinned" read at a glance.
-                            let pin_text = if is_pinned {
-                                RichText::new(egui_phosphor::fill::PUSH_PIN)
-                                    .family(egui::FontFamily::Name("phosphor-fill".into()))
-                                    .size(13.0)
-                                    .color(brand::PURPLE)
-                            } else {
-                                RichText::new(icon::PUSH_PIN).size(13.0).color(colors.muted)
-                            };
-                            let pin = ui
-                                .add(egui::Button::new(pin_text).frame(false))
-                                .on_hover_text(&pin_label);
+                            // Routed through `glyph_button` (pre-computed rect) so the
+                            // glyph recolours and the hover veil fills under the
+                            // pointer. A plain flow `Button` bakes its text colour at
+                            // construction and `.frame(false)` paints no fill in ANY
+                            // state — which is exactly why the pin/× read as dead.
+                            let pin_rest = if is_pinned { brand::PURPLE } else { colors.muted };
+                            let pin = glyph_button(
+                                ui,
+                                tab_control_rect(ui),
+                                |c| {
+                                    if is_pinned {
+                                        RichText::new(egui_phosphor::fill::PUSH_PIN)
+                                            .family(egui::FontFamily::Name("phosphor-fill".into()))
+                                            .size(13.0)
+                                            .color(c)
+                                    } else {
+                                        RichText::new(icon::PUSH_PIN).size(13.0).color(c)
+                                    }
+                                },
+                                colors,
+                                pin_rest,
+                                false,
+                                true,
+                                egui::Id::new(("tab_pin_hover", pane_id)),
+                                &pin_label,
+                            );
                             pin.widget_info(|| {
                                 egui::WidgetInfo::labeled(
                                     egui::WidgetType::Button,
@@ -399,14 +748,20 @@ impl C0pl4ndApp {
                                 actions.pin_tab = Some(pane_id);
                             }
                             if !is_pinned {
-                                let close = ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new(icon::X).size(13.0).color(colors.muted),
-                                        )
-                                        .frame(false),
-                                    )
-                                    .on_hover_text(&close_label);
+                                // `is_close = true` selects the CLOSE_RED hover family
+                                // (and CLOSE_RED_PRESSED when held) — the Windows
+                                // convention for a destructive ✕.
+                                let close = glyph_button(
+                                    ui,
+                                    tab_control_rect(ui),
+                                    |c| RichText::new(icon::X).size(13.0).color(c),
+                                    colors,
+                                    colors.muted,
+                                    true,
+                                    true,
+                                    egui::Id::new(("tab_close_hover", pane_id)),
+                                    &close_label,
+                                );
                                 close.widget_info(|| {
                                     egui::WidgetInfo::labeled(
                                         egui::WidgetType::Button,
@@ -437,6 +792,21 @@ impl C0pl4ndApp {
                         }
                     }
                 });
+            // Resolve the drag AFTER the strip closure so the order is never mutated
+            // mid-iteration. On release: commit the new order if the pointer was over a
+            // valid target, then clear the drag either way (a release over empty space
+            // is a cancelled drag, not a reorder).
+            if dragging.is_some() && ui.ctx().input(|i| i.pointer.any_released()) {
+                if let Some((from, to, before)) = drop_target {
+                    if let Some(new_order) =
+                        reorder_tabs(&visible_order, &self.pinned, from, to, before)
+                    {
+                        ui.ctx()
+                            .data_mut(|d| d.insert_temp(tab_order_id(), new_order));
+                    }
+                }
+                ui.ctx().data_mut(|d| d.remove::<TabDrag>(tab_drag_id()));
+            }
             // Record overflow for NEXT frame's left-arrow gate, and render the
             // RIGHT chevron now (it may use THIS frame's overflow). Overflow =
             // content wider than the viewport (egui's own "needs scrolling" signal).

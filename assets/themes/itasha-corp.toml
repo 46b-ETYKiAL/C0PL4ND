@@ -25,7 +25,10 @@ cyan = "#00ffc8"
 white = "#e8e6f0"
 
 [bright]   # ANSI 8-15 — lifted siblings
-black = "#4a4366"
+# Dimmed/secondary text lives here (git hashes, comments, `ls` metadata). Raised
+# from #4a4366 (2.04:1 — below the WCAG AA 4.5:1 floor) to 4.73:1 against the
+# #121212 background, keeping the violet cast rather than going neutral grey.
+black = "#837b9f"
 red = "#ff6f88"
 green = "#5cffb4"
 yellow = "#ffd57a"

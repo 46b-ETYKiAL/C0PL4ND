@@ -365,7 +365,16 @@ impl Theme {
                 white: "#e8e6f0".into(),
             },
             bright: AnsiRow {
-                black: "#4a4366".into(),
+                // Bright-black is the conventional slot for DIMMED / secondary text —
+                // git hashes, code comments, `ls` metadata, prompt segments. The former
+                // `#4a4366` scored only 2.04:1 against the `#121212` background, well
+                // under the WCAG AA 4.5:1 floor, which is a large part of the reported
+                // "some text is hard to see". This value scores 4.73:1 while keeping the
+                // theme's violet cast (B > R > G) rather than falling back to a neutral
+                // grey. For reference, Windows Terminal's Campbell `#767676` reaches only
+                // 4.12:1 against this darker background, so this clears WT too.
+                // Pinned by `bright_black_meets_wcag_aa_against_background`.
+                black: "#837b9f".into(),
                 red: "#ff6f88".into(),
                 green: "#5cffb4".into(),
                 yellow: "#ffd57a".into(),
@@ -550,6 +559,48 @@ impl Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bright-black (ANSI 8) is the conventional slot for DIMMED / secondary text —
+    /// git hashes, code comments, `ls` metadata, prompt segments. It therefore has to
+    /// stay legible against the window background, and it is the one palette slot
+    /// where a "tasteful" dark value is indistinguishable from a bug.
+    ///
+    /// It regressed exactly that way: `#4a4366` scored **2.04:1**, less than half the
+    /// WCAG AA 4.5:1 floor, and was a large part of the reported "some text is hard to
+    /// see". This pins the fix so a future palette edit cannot quietly undo it.
+    ///
+    /// Deliberately asserted against the REAL WCAG formula rather than a hardcoded
+    /// expected hex, so the test still means something if the colour is re-tuned.
+    #[test]
+    fn bright_black_meets_wcag_aa_against_background() {
+        /// WCAG 2.2 AA contrast floor for normal-size body text.
+        const WCAG_AA: f32 = 4.5;
+
+        let theme = Theme::builtin_void();
+        let bg = parse_hex(&theme.background).expect("background must parse");
+        let dim = parse_hex(&theme.bright.black).expect("bright.black must parse");
+        let ratio = color_model::contrast_ratio(dim, bg);
+
+        assert!(
+            ratio >= WCAG_AA,
+            "bright.black {} on background {} is {ratio:.2}:1 — below the WCAG AA \
+             floor of {WCAG_AA}:1. This slot carries dimmed/secondary text; a value \
+             this dark makes git hashes, comments and `ls` metadata unreadable.",
+            theme.bright.black,
+            theme.background,
+        );
+
+        // Guard the other direction too: bright-black must stay RECESSED relative to
+        // primary foreground, or "dim" text stops reading as dim and the tier
+        // collapses. Raising contrast must not turn secondary text into body text.
+        let fg = parse_hex(&theme.foreground).expect("foreground must parse");
+        assert!(
+            color_model::relative_luminance(dim) < color_model::relative_luminance(fg),
+            "bright.black {} must remain dimmer than the primary foreground {}",
+            theme.bright.black,
+            theme.foreground,
+        );
+    }
 
     #[test]
     fn parse_hex_works() {

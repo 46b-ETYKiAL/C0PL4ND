@@ -4121,22 +4121,76 @@ impl C0pl4ndApp {
             }
         }
 
-        // 0a''''''''') Ctrl/Cmd+Shift+C copies the live mouse selection to the
-        //             clipboard on demand (the MANUAL copy path; copy-on-select is
-        //             the auto path). Consumed so C never reaches the PTY as the
-        //             Ctrl+C interrupt byte.
-        let copy_sel = ctx.input_mut(|i| {
-            let mut hit = false;
-            i.events.retain(|ev| {
-                let m = matches!(
-                    ev,
-                    egui::Event::Key { key: egui::Key::C, pressed: true, modifiers, .. }
-                    if modifiers.shift && (modifiers.ctrl || modifiers.command) && !modifiers.alt
-                );
-                hit |= m;
-                !m
-            });
-            hit
+        // 0a''''''''') CLIPBOARD CHORDS — `Event::Copy` / `Event::Cut`, NOT `Event::Key`.
+        //
+        // `egui-winit` intercepts the clipboard chords in its window-event
+        // dispatcher and RETURNS EARLY, so it never emits an `Event::Key` for
+        // them (egui-winit-0.34.3/src/lib.rs:1016-1027). Its predicate ignores
+        // Shift — `is_copy_command` is `modifiers.command && key == C` (:1311) —
+        // and on Windows/Linux `modifiers.command` IS `ctrl` (:473). So BOTH
+        // `Ctrl+C` and `Ctrl+Shift+C` (and `Ctrl+Insert`) collapse into a single
+        // `egui::Event::Copy`, and `Ctrl+X` into `egui::Event::Cut`.
+        //
+        // Matching `Event::Key { key: C, .. }` here — as this handler used to —
+        // is therefore DEAD CODE: copy silently did nothing, and, far worse,
+        // `Ctrl+C` never reached the PTY, so a running command could not be
+        // interrupted. We recover the chord from the frame's modifier snapshot
+        // (`InputState::modifiers`, which egui copies verbatim from
+        // `RawInput::modifiers` — egui-0.34.3/src/input_state/mod.rs:485 — and
+        // which egui-winit keeps current from `ModifiersChanged`) and:
+        //
+        //   Ctrl+Shift+C          → copy the selection (the terminal copy chord).
+        //   Ctrl+C  WITH selection → copy the selection AND CLEAR it (Windows
+        //                            Terminal's behaviour). Clearing is what keeps
+        //                            SIGINT reachable: the very next Ctrl+C has no
+        //                            selection and therefore interrupts.
+        //   Ctrl+C  NO selection   → restore the swallowed key so the normal PTY
+        //                            forwarder encodes it — 0x03, SIGINT.
+        //   Ctrl+X (any selection) → always restore the key (0x18 / the readline
+        //                            `C-x` prefix); a terminal cannot "cut" its
+        //                            scrollback, so cut must never eat the chord.
+        //
+        // macOS: `command` is Super there, so `Ctrl+C`/`Ctrl+X` still arrive as
+        // real `Event::Key`s and are untouched by this block; a `Cmd+C`/`Cmd+X`
+        // reaches us with `ctrl == false` and always means COPY, never interrupt.
+        //
+        // Restoring the key (rather than writing 0x03 directly) keeps ONE PTY
+        // encoding path: the kitty keyboard protocol, REPORT-EVENT-TYPES, and
+        // `forward_key` all still apply, exactly as if egui-winit had not
+        // swallowed the chord.
+        let selection_live = self
+            .selection
+            .is_some_and(|s| s.anchor != s.head && self.terms.contains_key(&s.pane));
+        let mut copy_sel = false;
+        let mut clear_after_copy = false;
+        ctx.input_mut(|i| {
+            let m = i.modifiers;
+            let mut kept: Vec<egui::Event> = Vec::with_capacity(i.events.len());
+            for ev in i.events.drain(..) {
+                match ev {
+                    egui::Event::Copy => {
+                        if m.shift || !m.ctrl {
+                            copy_sel = true;
+                        } else if selection_live {
+                            copy_sel = true;
+                            clear_after_copy = true;
+                        } else {
+                            kept.push(restored_chord_key(egui::Key::C, m));
+                        }
+                    }
+                    egui::Event::Cut => {
+                        if m.ctrl {
+                            kept.push(restored_chord_key(egui::Key::X, m));
+                        } else {
+                            // macOS `Cmd+X`: no cut semantics in a terminal grid —
+                            // treat it as a copy rather than dropping it.
+                            copy_sel = true;
+                        }
+                    }
+                    other => kept.push(other),
+                }
+            }
+            i.events = kept;
         });
         if copy_sel {
             if let Some(sel) = self.selection {
@@ -4158,6 +4212,12 @@ impl C0pl4ndApp {
                     }
                 }
             }
+        }
+        if clear_after_copy {
+            // Windows Terminal semantics: a bare `Ctrl+C` that copied a selection
+            // also DISMISSES it, so the chord is not permanently hijacked — the
+            // next `Ctrl+C` finds no selection and sends SIGINT.
+            self.selection = None;
         }
 
         // 0b) route this frame's input. When the palette is open, its navigation

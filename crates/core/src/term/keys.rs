@@ -55,9 +55,12 @@ pub enum LogicalKey {
     Function(u8),
 }
 
-/// Active modifier keys at the time of the press. Only `alt` currently affects
-/// the encoding (Alt-as-Meta `ESC`-prefixing); `ctrl`/`shift`/`logo` are carried
-/// for completeness and forward-compatibility so callers need not change shape.
+/// Active modifier keys at the time of the press.
+///
+/// All four participate in the encoding: `alt` drives Alt-as-Meta
+/// `ESC`-prefixing, and every modifier feeds the xterm modifier parameter
+/// (`1 + shift + alt*2 + ctrl*4 + super*8`) used by the `CSI 1 ; <p> <letter>`
+/// cursor-key form and the `CSI <n> ; <p> ~` editing-key form.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KeyModifiers {
     /// Control key held.
@@ -80,35 +83,131 @@ impl KeyModifiers {
     };
 }
 
+/// How `Ctrl+Backspace` is encoded on the legacy path.
+///
+/// xterm's spec-correct answer is `0x08` (`^H`), but `^H` is indistinguishable
+/// from `Ctrl+H`, and neither readline nor PSReadLine binds `^H` to
+/// backward-kill-word out of the box — so the spec-correct byte often does
+/// nothing useful. `0x17` (`^W`) IS bound to backward-kill-word by default in
+/// both, so it is offered as an opt-in ergonomic alternative.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CtrlBackspace {
+    /// `0x08` (`^H`) — the xterm/spec-correct encoding. The default.
+    #[default]
+    ControlH,
+    /// `0x17` (`^W`) — the readline / PSReadLine backward-kill-word binding.
+    ControlW,
+}
+
+impl CtrlBackspace {
+    /// The single byte this encoding emits for `Ctrl+Backspace`.
+    fn byte(self) -> u8 {
+        match self {
+            CtrlBackspace::ControlH => 0x08,
+            CtrlBackspace::ControlW => 0x17,
+        }
+    }
+}
+
+/// Tunable knobs for the legacy [`encode_key`] path.
+///
+/// [`encode_key`] uses [`KeyEncodeOptions::default`]; a front end that surfaces
+/// a user preference calls [`encode_key_with`] instead. Adding a field here is
+/// source-compatible for every caller that constructs it with `..Default`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyEncodeOptions {
+    /// Which byte `Ctrl+Backspace` emits. Defaults to [`CtrlBackspace::ControlH`].
+    pub ctrl_backspace: CtrlBackspace,
+}
+
+/// The xterm modifier parameter: `1 + shift + alt*2 + ctrl*4 + super*8`.
+///
+/// Identical to the kitty protocol's modifier value — the two protocols share
+/// this formula, so one function serves both (see [`kitty_mod_value`]).
+/// A value of `1` means "no modifiers held".
+fn xterm_mod_param(mods: KeyModifiers) -> u8 {
+    kitty_mod_value(mods)
+}
+
+/// Whether any modifier is held (i.e. the xterm modifier parameter is not `1`).
+fn any_modifier(mods: KeyModifiers) -> bool {
+    xterm_mod_param(mods) != 1
+}
+
 /// Encode a logical key into the bytes to write to the PTY.
 ///
-/// Honours DECCKM (`app_cursor`): in application-cursor mode the arrow and
-/// Home/End keys use SS3 (`ESC O x`) instead of CSI (`ESC [ x`), which is what
-/// readline/vim expect. Encodes the function keys (F1–F12) and editing keys
-/// (Home/End/Insert/Delete/PageUp/PageDown). Alt acts as Meta: an `Alt`-modified
-/// text key is prefixed with `ESC` (the xterm convention behind Alt+B / Alt+F
-/// word motion in bash). Returns `None` when the key produces no PTY bytes
-/// (e.g. an empty text string, or an out-of-range function key).
+/// Equivalent to [`encode_key_with`] using [`KeyEncodeOptions::default`].
+///
+/// Honours DECCKM (`app_cursor`): in application-cursor mode the *unmodified*
+/// arrow and Home/End keys use SS3 (`ESC O x`) instead of CSI (`ESC [ x`), which
+/// is what readline/vim expect. Encodes the function keys (F1–F12) and editing
+/// keys (Home/End/Insert/Delete/PageUp/PageDown). Alt acts as Meta: an
+/// `Alt`-modified text key is prefixed with `ESC` (the xterm convention behind
+/// Alt+B / Alt+F word motion in bash). Returns `None` when the key produces no
+/// PTY bytes (e.g. an empty text string, or an out-of-range function key).
+///
+/// Modified cursor and editing keys carry the xterm modifier parameter, so
+/// `Ctrl+Left` is `ESC [ 1 ; 5 D` (the sequence a shell's line editor needs for
+/// word-jump) rather than a bare `ESC [ D`.
 pub fn encode_key(key: &LogicalKey, app_cursor: bool, mods: KeyModifiers) -> Option<Vec<u8>> {
-    // Arrow / Home / End: SS3 in application-cursor mode, else CSI.
+    encode_key_with(key, app_cursor, mods, KeyEncodeOptions::default())
+}
+
+/// [`encode_key`] with explicit [`KeyEncodeOptions`].
+///
+/// # Modifier encoding
+///
+/// The modifier parameter is `1 + shift + alt*2 + ctrl*4 + super*8` — so Shift
+/// is `2`, Alt `3`, Ctrl `5`, Ctrl+Shift `6`, Ctrl+Alt `7`. When any modifier is
+/// held:
+///
+/// - arrows and Home/End use `CSI 1 ; <param> <letter>` — **even in DECCKM
+///   application-cursor mode**, because the SS3 form has no modifier field at
+///   all. Unmodified keys keep the exact SS3/CSI behaviour they always had.
+/// - Insert/Delete/PageUp/PageDown use `CSI <n> ; <param> ~` (e.g. `Ctrl+Delete`
+///   → `ESC [ 3 ; 5 ~`). Unmodified output is byte-identical to before.
+/// - `Ctrl+Backspace` emits [`KeyEncodeOptions::ctrl_backspace`]'s byte;
+///   `Alt+Backspace` is the Meta form `ESC DEL`; plain Backspace stays `DEL`.
+pub fn encode_key_with(
+    key: &LogicalKey,
+    app_cursor: bool,
+    mods: KeyModifiers,
+    opts: KeyEncodeOptions,
+) -> Option<Vec<u8>> {
+    let param = xterm_mod_param(mods);
+    let modified = any_modifier(mods);
+    // Arrow / Home / End. Modified => the CSI-with-parameter form (the SS3 form
+    // cannot carry modifiers, so it is bypassed even under DECCKM). Unmodified
+    // => SS3 in application-cursor mode, else CSI.
     let cursor = |c: u8| -> Vec<u8> {
-        if app_cursor {
+        if modified {
+            format!("\x1b[1;{param}{}", c as char).into_bytes()
+        } else if app_cursor {
             vec![0x1b, b'O', c]
         } else {
             vec![0x1b, b'[', c]
         }
     };
-    // `ESC [ <n> ~` editing/function-key form.
-    let tilde = |n: &[u8]| -> Vec<u8> {
-        let mut v = Vec::with_capacity(n.len() + 3);
-        v.extend_from_slice(b"\x1b[");
-        v.extend_from_slice(n);
-        v.push(b'~');
-        v
+    // `ESC [ <n> ~` editing-key form, gaining a `; <param>` field when modified.
+    let tilde = |n: &str| -> Vec<u8> {
+        if modified {
+            format!("\x1b[{n};{param}~").into_bytes()
+        } else {
+            format!("\x1b[{n}~").into_bytes()
+        }
     };
+    // The tilde helper is also used for F5–F12, whose modified forms this legacy
+    // path deliberately leaves alone (see the `Function` arm below).
+    let plain_tilde = |n: &str| -> Vec<u8> { format!("\x1b[{n}~").into_bytes() };
     let base: Option<Vec<u8>> = match key {
         LogicalKey::Enter => Some(vec![b'\r']),
-        LogicalKey::Backspace => Some(vec![0x7f]),
+        // Ctrl+Backspace is a distinct byte; Alt+Backspace falls through to the
+        // Meta ESC-prefix below (DEL is not ESC, so it gets prefixed).
+        LogicalKey::Backspace => Some(if mods.ctrl {
+            vec![opts.ctrl_backspace.byte()]
+        } else {
+            vec![0x7f]
+        }),
         LogicalKey::Tab => Some(vec![b'\t']),
         LogicalKey::Escape => Some(vec![0x1b]),
         LogicalKey::Space => Some(vec![b' ']),
@@ -118,24 +217,26 @@ pub fn encode_key(key: &LogicalKey, app_cursor: bool, mods: KeyModifiers) -> Opt
         LogicalKey::ArrowLeft => Some(cursor(b'D')),
         LogicalKey::Home => Some(cursor(b'H')),
         LogicalKey::End => Some(cursor(b'F')),
-        LogicalKey::Insert => Some(tilde(b"2")),
-        LogicalKey::Delete => Some(tilde(b"3")),
-        LogicalKey::PageUp => Some(tilde(b"5")),
-        LogicalKey::PageDown => Some(tilde(b"6")),
-        // F1–F4 use SS3 (the VT100 PF-key form); F5–F12 use CSI tilde.
+        LogicalKey::Insert => Some(tilde("2")),
+        LogicalKey::Delete => Some(tilde("3")),
+        LogicalKey::PageUp => Some(tilde("5")),
+        LogicalKey::PageDown => Some(tilde("6")),
+        // F1–F4 use SS3 (the VT100 PF-key form); F5–F12 use CSI tilde. The
+        // function keys keep their UNMODIFIED encoding regardless of modifiers
+        // (the kitty path carries modified function keys) — hence `plain_tilde`.
         LogicalKey::Function(n) => match n {
             1 => Some(vec![0x1b, b'O', b'P']),
             2 => Some(vec![0x1b, b'O', b'Q']),
             3 => Some(vec![0x1b, b'O', b'R']),
             4 => Some(vec![0x1b, b'O', b'S']),
-            5 => Some(tilde(b"15")),
-            6 => Some(tilde(b"17")),
-            7 => Some(tilde(b"18")),
-            8 => Some(tilde(b"19")),
-            9 => Some(tilde(b"20")),
-            10 => Some(tilde(b"21")),
-            11 => Some(tilde(b"23")),
-            12 => Some(tilde(b"24")),
+            5 => Some(plain_tilde("15")),
+            6 => Some(plain_tilde("17")),
+            7 => Some(plain_tilde("18")),
+            8 => Some(plain_tilde("19")),
+            9 => Some(plain_tilde("20")),
+            10 => Some(plain_tilde("21")),
+            11 => Some(plain_tilde("23")),
+            12 => Some(plain_tilde("24")),
             _ => None,
         },
         LogicalKey::Text(s) => {
@@ -611,9 +712,19 @@ mod tests {
             Some(vec![0x1b, b'b'])
         );
         // Alt+ArrowUp must NOT double-prefix ESC (it already starts with ESC).
+        // It carries the Alt modifier parameter (3) instead.
+        let out = encode_key(&LogicalKey::ArrowUp, false, alt).expect("arrow encodes");
+        assert_eq!(out, b"\x1b[1;3A".to_vec());
+        assert_ne!(out.first(), out.get(1), "must not double-prefix ESC");
+        // Same for an editing key that already begins with ESC.
         assert_eq!(
-            encode_key(&LogicalKey::ArrowUp, false, alt),
-            Some(b"\x1b[A".to_vec())
+            encode_key(&LogicalKey::Delete, false, alt),
+            Some(b"\x1b[3;3~".to_vec())
+        );
+        // …and for a function key, whose legacy form is modifier-free.
+        assert_eq!(
+            encode_key(&LogicalKey::Function(5), false, alt),
+            Some(b"\x1b[15~".to_vec())
         );
     }
 

@@ -31,6 +31,81 @@ pub fn is_light(c: Color32) -> bool {
     luminance(c) > 0.5
 }
 
+/// WCAG 2.x **relative luminance** (0.0..=1.0) of an opaque colour — the
+/// gamma-linearised, differently-weighted sibling of [`luminance`] (which is the
+/// cheap Rec.601 approximation used for the light/dark polarity pivot). The two
+/// are deliberately separate: polarity only needs a rough split, whereas a
+/// contrast RATIO that claims WCAG conformance must use the WCAG formula.
+pub fn relative_luminance(c: Color32) -> f32 {
+    let lin = |v: u8| {
+        let s = f32::from(v) / 255.0;
+        if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let [r, g, b, _] = c.to_array();
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+
+/// WCAG contrast ratio between two opaque colours — `1.0` (identical) up to
+/// `21.0` (black on white). WCAG 2.4.11 / 2.4.13 require **>= 3:1** for a focus
+/// indicator against BOTH the focused control and its surroundings, which is the
+/// floor [`focus_ring_color`] is built to guarantee.
+pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// The Windows-standard destructive close-red (`#E81123`) — the hover fill of
+/// the caption ✕ and the tab ×. Lives here (next to [`focus_ring_color`], which
+/// must contrast against it) so the ring's guarantee is computed against the real
+/// value rather than a copy that could drift.
+pub const CLOSE_RED: Color32 = Color32::from_rgb(0xE8, 0x11, 0x23);
+
+/// The pressed shade of [`CLOSE_RED`] — visibly darker so a held ✕ is never the
+/// same pixel as a merely-hovered one.
+pub const CLOSE_RED_PRESSED: Color32 = Color32::from_rgb(0xA3, 0x0C, 0x18);
+
+/// The keyboard-focus ring colour for the flat chrome buttons.
+///
+/// egui 0.34 has **no** dedicated focus-ring style (there is no `focus_stroke`
+/// field); [`egui::Style::interact`] merely returns the *active* visuals for a
+/// focused widget, so a keyboard-focused chrome button otherwise looks
+/// permanently PRESSED and is indistinguishable from hover. The chrome therefore
+/// paints its own ring, and this picks its colour.
+///
+/// The ring must clear the WCAG 2.4.11/2.4.13 **3:1** floor against every surface
+/// it can land on: the titlebar `panel`, the window `bg`, and the ✕'s
+/// [`CLOSE_RED`] hover fill. The theme `accent` is preferred (brand-consistent)
+/// and only falls back to the higher-contrast monochrome pole when it does not
+/// clear the floor against all three — and one of white/black always does, so the
+/// guarantee holds for ANY theme.
+pub fn focus_ring_color(colors: ChromeColors) -> Color32 {
+    let against = [colors.panel, colors.bg, CLOSE_RED];
+    let worst = |c: Color32| {
+        against
+            .iter()
+            .map(|s| contrast_ratio(c, *s))
+            .fold(f32::INFINITY, f32::min)
+    };
+    let accent_score = worst(colors.accent);
+    if accent_score >= FOCUS_RING_MIN_CONTRAST {
+        return colors.accent;
+    }
+    let (white, black) = (worst(Color32::WHITE), worst(Color32::BLACK));
+    if white >= black {
+        Color32::WHITE
+    } else {
+        Color32::BLACK
+    }
+}
+
+/// The WCAG 2.4.11 non-text contrast floor a focus indicator must clear.
+pub const FOCUS_RING_MIN_CONTRAST: f32 = 3.0;
+
 /// Parse a `c0pl4nd_core::Theme` `#rrggbb` field into an egui `Color32`, falling
 /// back to `fallback` when the field is empty or unparseable (e.g. the optional
 /// `selection_background` slot a minimal theme omits).
@@ -152,6 +227,21 @@ pub fn visuals_from_theme(theme: &c0pl4nd_core::Theme) -> Visuals {
     v.widgets.active.bg_fill = bezel;
     v.widgets.active.bg_stroke = Stroke::new(1.0f32, press); // press accent
     v.widgets.active.fg_stroke = Stroke::new(1.0f32, fg);
+
+    // Pointing-hand cursor over interactive controls. egui's default is
+    // `interact_cursor: None` (style.rs:1538) and `Button` only calls
+    // `set_cursor_icon` when it is `Some` (widgets/button.rs:374-378) — so with
+    // the default NO button, tab, or toolbar control anywhere in the app changed
+    // the mouse cursor, which reads as "not clickable". This is set on the
+    // Visuals (not per-widget) so every button in the app inherits it from ONE
+    // place.
+    //
+    // It does not fight the two explicit `set_cursor_icon` call-sites: the
+    // frameless resize edges run BEFORE the panels and sit on the window border
+    // where no button lives, and the terminal grid is not a `Button` (it is a
+    // bare `interact` rect), so its I-beam / link hand are unaffected — a widget
+    // only inherits this cursor by being a `Button`.
+    v.interact_cursor = Some(egui::CursorIcon::PointingHand);
 
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0f32, bezel); // separators
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0f32, fg);

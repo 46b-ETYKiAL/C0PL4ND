@@ -127,6 +127,14 @@ This section is the authoritative as-shipped ledger; earlier rows above are the 
 - **D3** in-app settings panel (font/theme/cursor/scrollback/opacity/startup; live-apply + TOML write-back)
 - **VT-core parser**: DEC private modes, alternate screen, DECSCUSR cursor shape, bracketed-paste/cursor-visibility getters, `encode_mouse()`, `cursor_position()`
 - **E1** per-cell background color + inverse-video rendering
+  - **Correction (2026-07-21):** this was true of the legacy winit/wgpu renderer
+    only; the *shipping* egui renderer regressed E1 (its `ColorRun` was fg-only and
+    `paint_grid_native` emitted no background quads), so `ls`/`grep --color`/`git
+    diff`/htop/vim backgrounds rendered flat. E1 is now genuinely shipped in the
+    egui binary: `RunStyle` carries the background, `paint_grid_native` emits bg
+    quads (skipping the window default), reverse video renders visibly, and the
+    styled underline / strikethrough / dim attributes draw. Verified by the render
+    snapshot tests, not just the parser tests.
 - **E3** clipboard paste + bracketed-paste wrapping (dependency-free shell-out)
 - **E5/E7** terminal cursor draw (block/bar/underline, blink, visibility)
 - **E6** mouse reporting → PTY (DEC 1000/1002/1003 + SGR 1006)

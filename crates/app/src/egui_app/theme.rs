@@ -393,6 +393,105 @@ mod tests {
         assert!(is_light(light.bg) && is_light(light.panel));
     }
 
+    /// Every builtin theme this app ships, so the theme-wide guarantees below
+    /// (focus-ring contrast) are asserted against the real fleet, not one theme.
+    const ALL_BUILTIN_THEMES: [&str; 13] = [
+        "ghost-paper",
+        "dialup-glow",
+        "present-day",
+        "thermoptic",
+        "capsule-mono",
+        "jet-age",
+        "packet-trace",
+        "cockpit-amber",
+        "nerv-magi",
+        "colony-drift",
+        "kanjo-loop",
+        "yaksha-ink",
+        "datamosh-haze",
+    ];
+
+    fn every_builtin_palette() -> Vec<(&'static str, ChromeColors)> {
+        std::iter::once((
+            "void",
+            ChromeColors::from_theme(&c0pl4nd_core::Theme::builtin_void()),
+        ))
+        .chain(ALL_BUILTIN_THEMES.iter().map(|name| {
+            let t = c0pl4nd_core::Theme::builtin_named(name)
+                .unwrap_or_else(|| panic!("{name} embedded"));
+            (*name, ChromeColors::from_theme(&t))
+        }))
+        .collect()
+    }
+
+    #[test]
+    fn contrast_ratio_matches_the_wcag_reference_points() {
+        // The two anchors of the WCAG scale: identical colours are 1:1, and
+        // black-on-white is the 21:1 maximum.
+        assert!((contrast_ratio(Color32::WHITE, Color32::WHITE) - 1.0).abs() < 0.01);
+        assert!((contrast_ratio(Color32::BLACK, Color32::WHITE) - 21.0).abs() < 0.05);
+        // Symmetric in its arguments.
+        let (a, b) = (
+            Color32::from_rgb(0x12, 0x34, 0x56),
+            Color32::from_rgb(0xab, 0xcd, 0xef),
+        );
+        assert!((contrast_ratio(a, b) - contrast_ratio(b, a)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn focus_ring_clears_the_wcag_floor_against_every_surface_on_every_theme() {
+        // WCAG 2.4.11/2.4.13: a focus indicator needs >= 3:1 against BOTH the
+        // control and its surroundings. The ring can land on the titlebar panel,
+        // the window background, or the ✕'s close-red hover fill — so all three
+        // must clear the floor, for every shipped theme.
+        for (name, colors) in every_builtin_palette() {
+            let ring = focus_ring_color(colors);
+            for (label, surface) in [
+                ("panel", colors.panel),
+                ("bg", colors.bg),
+                ("close-red", CLOSE_RED),
+            ] {
+                let ratio = contrast_ratio(ring, surface);
+                assert!(
+                    ratio >= FOCUS_RING_MIN_CONTRAST,
+                    "{name}: focus ring {ring:?} only reaches {ratio:.2}:1 against {label} \
+                     (WCAG floor is {FOCUS_RING_MIN_CONTRAST}:1)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn focus_ring_prefers_the_brand_accent_but_falls_back_when_it_cannot_contrast() {
+        // A palette whose accent is nearly the panel colour cannot be the ring —
+        // the fallback pole is chosen instead (proving the guarantee is not
+        // satisfied by luck of the theme).
+        let mut colors = ChromeColors::from_theme(&c0pl4nd_core::Theme::builtin_void());
+        colors.accent = colors.panel;
+        let ring = focus_ring_color(colors);
+        assert_ne!(
+            ring, colors.accent,
+            "an accent that cannot contrast must not be used"
+        );
+        assert!(contrast_ratio(ring, colors.panel) >= FOCUS_RING_MIN_CONTRAST);
+    }
+
+    #[test]
+    fn visuals_set_a_pointing_hand_interact_cursor() {
+        // D2: egui's default is None, so nothing in the app changed the cursor.
+        // Asserted on both polarities — it is set unconditionally.
+        for theme in [
+            c0pl4nd_core::Theme::builtin_void(),
+            c0pl4nd_core::Theme::builtin_named("ghost-paper").expect("ghost-paper embedded"),
+        ] {
+            assert_eq!(
+                visuals_from_theme(&theme).interact_cursor,
+                Some(egui::CursorIcon::PointingHand),
+                "buttons must show a pointing hand on hover"
+            );
+        }
+    }
+
     #[test]
     fn wordmark_tones_are_readable_bright_and_contrasting() {
         // Normalised per-channel distance (0.0..=1.0) — proves the two tones are

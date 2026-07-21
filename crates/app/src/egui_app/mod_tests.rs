@@ -102,31 +102,67 @@ fn quote_path_for_shell_posix_escapes_single_quote() {
 #[test]
 fn glyph_cache_key_is_content_pass_and_style_sensitive() {
     let style = row_style_key(14.0, (200, 200, 200));
-    let base = glyph_cache_key('a', (255, 0, 0), RowPass::Main, style);
+    let base = glyph_cache_key(
+        'a',
+        (255, 0, 0),
+        RowPass::Main,
+        style,
+        glyph_cache::GlyphAttrs::default(),
+    );
     assert_eq!(
         base,
-        glyph_cache_key('a', (255, 0, 0), RowPass::Main, style),
+        glyph_cache_key(
+            'a',
+            (255, 0, 0),
+            RowPass::Main,
+            style,
+            glyph_cache::GlyphAttrs::default()
+        ),
         "identical glyph+colour+pass+style → same key (a cache HIT, reused per cell)"
     );
     assert_ne!(
         base,
-        glyph_cache_key('b', (255, 0, 0), RowPass::Main, style),
+        glyph_cache_key(
+            'b',
+            (255, 0, 0),
+            RowPass::Main,
+            style,
+            glyph_cache::GlyphAttrs::default()
+        ),
         "a different glyph must change the key"
     );
     assert_ne!(
         base,
-        glyph_cache_key('a', (0, 255, 0), RowPass::Main, style),
+        glyph_cache_key(
+            'a',
+            (0, 255, 0),
+            RowPass::Main,
+            style,
+            glyph_cache::GlyphAttrs::default()
+        ),
         "a colour change must change the key"
     );
     assert_ne!(
         base,
-        glyph_cache_key('a', (255, 0, 0), RowPass::GhostRed, style),
+        glyph_cache_key(
+            'a',
+            (255, 0, 0),
+            RowPass::GhostRed,
+            style,
+            glyph_cache::GlyphAttrs::default()
+        ),
         "a different pass (chromatic ghost) must change the key"
     );
     let style2 = row_style_key(18.0, (200, 200, 200));
     assert_ne!(
         base,
-        glyph_cache_key('a', (255, 0, 0), RowPass::Main, style2),
+        glyph_cache_key(
+            'a',
+            (255, 0, 0),
+            RowPass::Main,
+            style2,
+            glyph_cache::GlyphAttrs::default()
+        ),
         "a font-size change must change the key"
     );
 }

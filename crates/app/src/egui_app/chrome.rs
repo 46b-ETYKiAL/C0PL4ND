@@ -520,9 +520,10 @@ impl C0pl4ndApp {
             // Then re-assert the user's explicit drag-to-reorder order on top of
             // that grouping. Persisted in egui memory, so it survives tab open/close
             // within the session; panes the user never moved keep their derived slot.
-            let saved_order: Vec<PaneId> = ui
-                .ctx()
-                .data(|d| d.get_temp::<Vec<PaneId>>(tab_order_id()).unwrap_or_default());
+            let saved_order: Vec<PaneId> = ui.ctx().data(|d| {
+                d.get_temp::<Vec<PaneId>>(tab_order_id())
+                    .unwrap_or_default()
+            });
             let tabs = apply_saved_order(tabs, &saved_order, &self.pinned);
             // The pane order actually on screen this frame — the basis a drop
             // computes the new order from.
@@ -716,7 +717,11 @@ impl C0pl4ndApp {
                             // pointer. A plain flow `Button` bakes its text colour at
                             // construction and `.frame(false)` paints no fill in ANY
                             // state — which is exactly why the pin/× read as dead.
-                            let pin_rest = if is_pinned { brand::PURPLE } else { colors.muted };
+                            let pin_rest = if is_pinned {
+                                brand::PURPLE
+                            } else {
+                                colors.muted
+                            };
                             let pin = glyph_button(
                                 ui,
                                 tab_control_rect(ui),

@@ -1321,6 +1321,13 @@ impl C0pl4ndApp {
                         line_height_px,
                         pad,
                         &pane_colors,
+                        // The current match takes the theme's CURSOR colour — the
+                        // one palette entry that already means "where you are" —
+                        // so it is hue-distinct from the accent tint the other
+                        // matches share, in every theme.
+                        c0pl4nd_core::theme::parse_hex(&theme.cursor)
+                            .map(|(r, g, b)| egui::Color32::from_rgb(r, g, b))
+                            .unwrap_or(pane_colors.accent),
                         hl,
                     );
                 }
@@ -1525,15 +1532,30 @@ impl C0pl4ndApp {
                 // release; a plain click clears any selection; the wheel scrolls
                 // this pane's scrollback. This is the mouse text-selection the egui
                 // shell lacked entirely (the legacy shell had it).
-                let pos = resp
-                    .interact_pointer_pos()
-                    .or(resp.hover_pos())
-                    .or_else(|| ui.input(|i| i.pointer.latest_pos()));
+                // NOTE (selection lifetime): this path deliberately does NOT fall
+                // back to the global `pointer.latest_pos()` the mouse-REPORTING
+                // branch above uses. That fallback made a primary press ANYWHERE —
+                // including inside the floating right-click context menu, which
+                // always drops down-RIGHT over the pane and so maps to a real grid
+                // cell — reset `selection` to an empty `anchor == head`. Since the
+                // menu's "Copy" item is gated on `anchor != head` and `clicked()`
+                // fires on RELEASE, the press that reached for Copy disabled Copy.
+                // `interact_pointer_pos()` still tracks a drag that leaves the pane,
+                // so nothing is lost.
+                let pos = resp.interact_pointer_pos().or(resp.hover_pos());
                 // Hit cell as an ABSOLUTE (line, col): display row + window_start.
                 let cell0 = pos
                     .and_then(|p| cell_at_pos(p, origin, cw, ch))
                     .map(|(r, c)| (window_start + r, c));
-                if ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary)) {
+                // ...and the press itself is gated on the pointer being over THIS
+                // pane's body with nothing floating above it. `contains_pointer`
+                // resolves through the layer stack, so an open context menu / popup
+                // / modal over the pane makes it false — a click on a menu item can
+                // no longer clobber the selection that item is about to copy.
+                let press_over_body = resp.contains_pointer();
+                if press_over_body
+                    && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
+                {
                     if let Some((line, c)) = cell0 {
                         // Alt-drag selects a rectangular BLOCK; a plain drag is
                         // line-wise. The mode is fixed at press and carried for the
@@ -1701,7 +1723,22 @@ impl C0pl4ndApp {
                     .and_then(PaneTerm::window_start)
                     .unwrap_or(0);
                 if let Some((start, end)) = selection_visible_rows(sel.anchor, sel.head, ws, rows) {
-                    let wash = egui::Color32::from_rgba_unmultiplied(0x60, 0x80, 0xc0, 0x60);
+                    // The selection wash comes from the ACTIVE THEME
+                    // (`selection_background`), not a hard-coded steel blue: a
+                    // fixed `#6080c0` ignored every theme the user picked and
+                    // clashed with any palette that was not blue-ish. The theme's
+                    // own colour is opaque, so it is applied at the wash alpha
+                    // that keeps the glyphs beneath legible; the builtin fallback
+                    // preserves the previous look for a theme with no selection
+                    // colour set.
+                    let sel_bg = c0pl4nd_core::theme::parse_hex(&theme.selection_background)
+                        .unwrap_or((0x60, 0x80, 0xc0));
+                    let wash = egui::Color32::from_rgba_unmultiplied(
+                        sel_bg.0,
+                        sel_bg.1,
+                        sel_bg.2,
+                        SELECTION_WASH_ALPHA,
+                    );
                     let block = sel.mode == SelectionMode::Block;
                     // Block mode: every row shares the same column range; the wash
                     // must paint the SAME rectangle each row so it matches the
@@ -1737,6 +1774,41 @@ impl C0pl4ndApp {
                         let sel_rect =
                             egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y0 + ch));
                         painter.rect_filled(sel_rect, 0.0, wash);
+                        // Honour `selection_foreground` too: re-draw the selected
+                        // glyphs in the theme's selection text colour ON TOP of
+                        // the wash. Without this the wash alone tints whatever
+                        // colour the text already had, so a dark-on-dark or
+                        // low-contrast pairing stayed unreadable while selected —
+                        // the theme declares a selection foreground precisely to
+                        // guarantee contrast, and it was being ignored.
+                        // `parse_hex` returns Result, not Option — a malformed
+                        // selection_foreground simply leaves the wash to tint the
+                        // existing glyphs rather than failing the frame.
+                        if let Ok(sel_fg) =
+                            c0pl4nd_core::theme::parse_hex(&theme.selection_foreground)
+                        {
+                            let fg32 = egui::Color32::from_rgb(sel_fg.0, sel_fg.1, sel_fg.2);
+                            let font = egui::FontId::monospace(font_size);
+                            if let Some(rows) = terms.get(&pane_id).and_then(PaneTerm::grid_rows) {
+                                if let Some(runs) = rows.get(r) {
+                                    for (c, _, col_cells) in pane_term::row_glyph_cells(runs) {
+                                        if col_cells < lo || col_cells > hi {
+                                            continue;
+                                        }
+                                        painter.text(
+                                            egui::pos2(
+                                                origin.x + col_cells as f32 * cw,
+                                                origin.y + r as f32 * ch,
+                                            ),
+                                            egui::Align2::LEFT_TOP,
+                                            c,
+                                            font.clone(),
+                                            fg32,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -5218,6 +5290,123 @@ fn grid_text_origin(rect: egui::Rect, padding: f32) -> egui::Pos2 {
     rect.left_top() + egui::vec2(p, p)
 }
 
+/// Alpha the theme's opaque `selection_background` is washed over the grid at.
+///
+/// The theme colour is an opaque RGB; painting it solid would hide the text
+/// underneath (the wash is drawn AFTER the glyphs). This alpha is the previous
+/// hard-coded wash's alpha, so the selection reads exactly as before while now
+/// taking the ACTIVE THEME's hue instead of a fixed steel blue.
+const SELECTION_WASH_ALPHA: u8 = 0x60;
+
+/// Snap a POINT coordinate to the physical-pixel grid at `ppp`.
+///
+/// Background quads must tile without seams: two adjacent cells with the same
+/// background are painted as separate rectangles whose shared edge lands on a
+/// fractional pixel at most DPI scalings. Rounding that edge to a whole physical
+/// pixel makes the left quad's right edge and the right quad's left edge the
+/// SAME value, so they abut exactly — no bright hairline where the window
+/// background shows through, and no double-blended overlap.
+fn snap_to_physical(v: f32, ppp: f32) -> f32 {
+    if ppp > 0.0 {
+        (v * ppp).round() / ppp
+    } else {
+        v
+    }
+}
+
+/// Draw one span's underline in `style`, from `x0` to `x1` with its top at `y`.
+///
+/// Every variant is drawn ANALYTICALLY from the span geometry (no glyph, no
+/// texture), so all of them stay crisp and correctly-proportioned at any
+/// `pixels_per_point` — the requirement that rules out rendering the curly
+/// variant as a repeated `~`-like glyph, which aliases into mush on HiDPI.
+// Geometry primitive: endpoints, thickness, colour, style and pixels-per-point
+// are all independent painting parameters. A struct would not reduce the count,
+// only rename it — the same rationale as `glyph_button`'s existing allow.
+#[allow(clippy::too_many_arguments)]
+fn paint_underline(
+    painter: &egui::Painter,
+    x0: f32,
+    x1: f32,
+    y: f32,
+    thickness: f32,
+    color: egui::Color32,
+    style: c0pl4nd_core::grid::UnderlineStyle,
+    ppp: f32,
+) {
+    use c0pl4nd_core::grid::UnderlineStyle as U;
+    if x1 <= x0 {
+        return;
+    }
+    // A solid horizontal bar from `a` to `b`, snapped so it is exactly the
+    // requested thickness in physical pixels.
+    let bar = |a: f32, b: f32, top: f32| {
+        let ty = snap_to_physical(top, ppp);
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(a, ty),
+                egui::pos2(b, ty + thickness.max(1.0 / ppp.max(0.01))),
+            ),
+            0.0,
+            color,
+        );
+    };
+    match style {
+        U::None => {}
+        U::Single => bar(x0, x1, y),
+        // Two hairlines with a gap of one thickness between them.
+        U::Double => {
+            bar(x0, x1, y - thickness);
+            bar(x0, x1, y + thickness);
+        }
+        // Dot on / dot off at a 2x period.
+        U::Dotted => {
+            let step = (thickness * 2.0).max(1.0);
+            let mut x = x0;
+            while x < x1 {
+                bar(x, (x + thickness).min(x1), y);
+                x += step;
+            }
+        }
+        // Longer dashes at a 7x period — visually distinct from dotted.
+        U::Dashed => {
+            let dash = (thickness * 4.0).max(2.0);
+            let step = (thickness * 7.0).max(3.0);
+            let mut x = x0;
+            while x < x1 {
+                bar(x, (x + dash).min(x1), y);
+                x += step;
+            }
+        }
+        // Undercurl (nvim LSP diagnostics): a sine sampled at ~1 physical pixel
+        // so the wave has the same shape and amplitude in PHYSICAL terms on a
+        // 1x and a 2x display.
+        U::Curly => {
+            let amplitude = thickness * 1.5;
+            let period = (thickness * 6.0).max(4.0);
+            let sample = (1.0 / ppp.max(0.01)).max(0.25);
+            let mid = y + thickness * 0.5;
+            let mut pts: Vec<egui::Pos2> = Vec::new();
+            let mut x = x0;
+            while x < x1 {
+                let phase = (x - x0) / period * std::f32::consts::TAU;
+                pts.push(egui::pos2(x, mid + phase.sin() * amplitude));
+                x += sample;
+            }
+            // Always close on the span's right edge so the curl spans the full
+            // run regardless of where the sampling loop happened to stop.
+            let phase = (x1 - x0) / period * std::f32::consts::TAU;
+            pts.push(egui::pos2(x1, mid + phase.sin() * amplitude));
+            if pts.len() >= 2 {
+                painter.add(egui::Shape::line(
+                    pts,
+                    egui::Stroke::new(thickness.max(1.0 / ppp.max(0.01)), color),
+                ));
+            }
+        }
+    }
+}
+
 /// Paint a pane's visible grid with egui's NATIVE text painter, using the
 /// per-row colour runs from [`PaneTerm::grid_rows`]. This is the single,
 /// engine-agnostic render path for BOTH the live window and the headless
@@ -5284,7 +5473,7 @@ fn paint_grid_native(
                 term.grid_text()
                     .unwrap_or_default()
                     .lines()
-                    .map(|line| vec![(line.to_string(), default_fg)])
+                    .map(|line| vec![(line.to_string(), pane_term::RunStyle::plain(default_fg))])
                     .collect(),
             )
         }
@@ -5312,13 +5501,62 @@ fn paint_grid_native(
     // (advanced by each glyph's cell width) is the true grid column. Blank cells
     // are skipped (the background is already painted); this also bounds the glyph
     // count to the non-blank glyphs actually on screen.
+    // --- PASS 1: per-cell BACKGROUNDS -------------------------------------
+    // Every cell whose resolved background is NOT the window default gets a
+    // filled quad, painted BEFORE any glyph so the text sits on top of it. This
+    // is what makes `grep --color`, `ls` directory colours, `git diff`, fzf's
+    // selected row, starship segments and every TUI's selected row show their
+    // coloured block — the runs used to carry only a foreground, so all of that
+    // rendered as plain text on the window background. It is also what makes
+    // reverse video (SGR `7`) visible at all: with no quad, an inverse cell drew
+    // its BACKGROUND colour as text onto an unchanged background.
+    //
+    // `row_cell_spans` merges neighbouring same-style runs, so a highlighted
+    // region is ONE quad rather than one per glyph, and the quads are snapped to
+    // the physical pixel grid: adjacent spans share a snapped boundary, so they
+    // tile exactly with no hairline seam and no overlap at any DPI.
+    let bold_font = egui::FontId::new(font_size, fonts::bold_monospace_family());
+    let faux_bold = !fonts::bold_face_available();
+    for (row_idx, runs) in rows.iter().enumerate() {
+        let row_y = origin.y + row_idx as f32 * ch;
+        let y0 = snap_to_physical(row_y, ppp);
+        let y1 = snap_to_physical(row_y + ch, ppp);
+        for span in pane_term::row_cell_spans(runs) {
+            let Some(bg) = span.style.bg else {
+                continue; // window default — the common case, no quad needed
+            };
+            let x0 = snap_to_physical(origin.x + span.col as f32 * cw, ppp);
+            let x1 = snap_to_physical(origin.x + (span.col + span.width) as f32 * cw, ppp);
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)),
+                0.0,
+                egui::Color32::from_rgb(bg.0, bg.1, bg.2),
+            );
+        }
+    }
+
+    // --- PASS 2: glyphs ----------------------------------------------------
     for (row_idx, runs) in rows.iter().enumerate() {
         let row_y = origin.y + row_idx as f32 * ch;
         // `row_glyph_cells` is the single source of truth for per-cell X: each
         // painted glyph paired with its grid cell column (wide glyphs advance 2,
         // blanks skipped). Positions are COMPUTED from the cell column, never
         // accumulated from glyph advances — see its doc + unit tests.
-        for (c, rgb, col_cells) in pane_term::row_glyph_cells(runs) {
+        for (c, style, col_cells) in pane_term::row_glyph_cells(runs) {
+            let rgb = style.fg;
+            let attrs = glyph_cache::GlyphAttrs {
+                bold: style.bold,
+                italic: style.italic,
+            };
+            // A bold cell is drawn with the dedicated bold FAMILY (egui's FontId
+            // selects a family, not a weight). When the machine has no bold cut
+            // that family mirrors the regular stack, so the glyph is additionally
+            // double-struck a half physical pixel to the right — faux bold, the
+            // same fallback every terminal uses rather than drawing SGR-1 thin.
+            let glyph_font = if style.bold { &bold_font } else { &font };
             let cell_origin = egui::pos2(origin.x + col_cells as f32 * cw, row_y);
             // --- chromatic aberration (CRT effect, off by default): pure-
             // channel ghosts at ±offset BEHIND the crisp glyph (red left,
@@ -5329,15 +5567,15 @@ fn paint_grid_native(
                 let red = egui::Color32::from_rgba_unmultiplied(255, 0, 0, ghost_alpha);
                 let red_g = galley_cache.glyph(
                     painter,
-                    glyph_cache_key(c, (ghost_alpha, 0, 1), RowPass::GhostRed, style_key),
-                    || build_glyph_job(c, &font, red),
+                    glyph_cache_key(c, (ghost_alpha, 0, 1), RowPass::GhostRed, style_key, attrs),
+                    || build_glyph_job(c, glyph_font, red, attrs),
                 );
                 painter.galley(cell_origin + egui::vec2(-off, 0.0), red_g, default_fg32);
                 let blue = egui::Color32::from_rgba_unmultiplied(0, 0, 255, ghost_alpha);
                 let blue_g = galley_cache.glyph(
                     painter,
-                    glyph_cache_key(c, (ghost_alpha, 0, 2), RowPass::GhostBlue, style_key),
-                    || build_glyph_job(c, &font, blue),
+                    glyph_cache_key(c, (ghost_alpha, 0, 2), RowPass::GhostBlue, style_key, attrs),
+                    || build_glyph_job(c, glyph_font, blue, attrs),
                 );
                 painter.galley(cell_origin + egui::vec2(off, 0.0), blue_g, default_fg32);
             }
@@ -5345,10 +5583,71 @@ fn paint_grid_native(
             let color = egui::Color32::from_rgb(rgb.0, rgb.1, rgb.2);
             let main_g = galley_cache.glyph(
                 painter,
-                glyph_cache_key(c, rgb, RowPass::Main, style_key),
-                || build_glyph_job(c, &font, color),
+                glyph_cache_key(c, rgb, RowPass::Main, style_key, attrs),
+                || build_glyph_job(c, glyph_font, color, attrs),
             );
+            // Faux bold: no bold cut is installed, so double-strike the SAME
+            // galley half a PHYSICAL pixel right, UNDER the crisp pass. That
+            // thickens the stem at any DPI without shifting the cell (the offset
+            // is sub-cell), which is how a terminal shows SGR-1 on a font that
+            // ships only one weight.
+            if style.bold && faux_bold {
+                painter.galley(
+                    cell_origin + egui::vec2(0.5 / ppp.max(0.01), 0.0),
+                    std::sync::Arc::clone(&main_g),
+                    default_fg32,
+                );
+            }
             painter.galley(cell_origin, main_g, default_fg32);
+        }
+    }
+
+    // --- PASS 3: line decorations -----------------------------------------
+    // Underlines (including the `4:0..5` styled variants and the SGR 58/59
+    // underline colour) and strikethrough are drawn ANALYTICALLY per contiguous
+    // span rather than baked into each glyph's galley. Per-span is what makes an
+    // underline continuous across a word instead of one dash per glyph, and
+    // analytic is what makes the curly variant survive HiDPI — a sampled sine
+    // scales with `pixels_per_point`, a pre-rendered squiggle glyph does not.
+    for (row_idx, runs) in rows.iter().enumerate() {
+        let row_y = origin.y + row_idx as f32 * ch;
+        for span in pane_term::row_cell_spans(runs) {
+            if !span.style.has_decoration() {
+                continue;
+            }
+            let x0 = origin.x + span.col as f32 * cw;
+            let x1 = origin.x + (span.col + span.width) as f32 * cw;
+            // At least one PHYSICAL pixel, so a decoration is never sub-pixel and
+            // invisible on a low-DPI display.
+            let thickness = (ch * 0.06).max(1.0 / ppp.max(0.01));
+            let deco_rgb = span.style.underline_color.unwrap_or(span.style.fg);
+            let deco = egui::Color32::from_rgb(deco_rgb.0, deco_rgb.1, deco_rgb.2);
+            if span.style.underline != c0pl4nd_core::grid::UnderlineStyle::None {
+                paint_underline(
+                    painter,
+                    x0,
+                    x1,
+                    row_y + ch - thickness * 2.0,
+                    thickness,
+                    deco,
+                    span.style.underline,
+                    ppp,
+                );
+            }
+            if span.style.strikeout {
+                // Strikethrough always takes the TEXT colour: SGR 58 scopes the
+                // custom colour to the underline only.
+                let fg = span.style.fg;
+                let y = snap_to_physical(row_y + ch * 0.55, ppp);
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0, y),
+                        egui::pos2(x1, y + thickness.max(1.0 / ppp.max(0.01))),
+                    ),
+                    0.0,
+                    egui::Color32::from_rgb(fg.0, fg.1, fg.2),
+                );
+            }
         }
     }
 
@@ -5482,6 +5781,25 @@ fn quote_path_for_shell(path: &std::path::Path, shell_label: &str) -> String {
 /// whose text is already delivered via `egui::Event::Text` (ordinary printable
 /// characters), so they are not double-sent. Ctrl-letter chords ARE encoded
 /// here (egui does not emit `Event::Text` for them) into their C0 control byte.
+/// Rebuild the `Event::Key` that `egui-winit` swallowed when it converted a
+/// clipboard chord into `Event::Copy` / `Event::Cut`.
+///
+/// `Event::Copy`/`Event::Cut` carry no key and no modifiers, so the chord is
+/// reconstructed from the frame's modifier snapshot plus the key the predicate
+/// that fired implies (`C` for copy, `X` for cut). Feeding this back into the
+/// event queue lets the ONE existing PTY encoder ([`egui_key_to_logical`] +
+/// `PaneTerm::forward_key`) produce the control byte, instead of a second
+/// hand-rolled `write_bytes` path that would bypass the kitty keyboard protocol.
+fn restored_chord_key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    }
+}
+
 fn egui_key_to_logical(
     key: egui::Key,
     mods: c0pl4nd_core::term::KeyModifiers,

@@ -591,15 +591,16 @@ fn privacy_clear_now_erases_the_recorded_history() {
 // ---- settings search reaches the nav-less Config section ----------------------
 
 #[test]
-fn the_config_section_is_reachable_only_through_search() {
+fn the_config_section_is_reachable_from_the_nav_and_by_search() {
     // The Config section (config-file path + "Open config folder") is rendered by
-    // `render_sections` under `section_visible(sel, q, "Config", …)`, but "Config"
-    // is NOT in `CATEGORIES` — so no left-nav item can ever select it and, with an
-    // empty query, `selected == "Config"` is unreachable. Search is its ONLY door.
+    // `render_sections` under `section_visible(sel, q, "Config", …)`.
     //
-    // This test pins that as the CURRENT behaviour so a nav entry (or the section's
-    // removal) is a deliberate, visible change rather than a silent one. It asserts
-    // BOTH halves: absent from the nav, present via search.
+    // This test previously pinned a BUG as intended behaviour: `"Config"` was
+    // missing from `CATEGORIES`, so no left-nav item could ever select it and
+    // search was the section's only door — a fully built page the user could not
+    // click to. The old test even carried the instruction "if one was added, this
+    // test should be updated to select it directly". The category has now been
+    // added, so this asserts the corrected behaviour: reachable BOTH ways.
     //
     // The section's buttons are NOT clicked: "Open config folder" calls
     // `reveal_in_file_manager`, which spawns a real `explorer` process, and
@@ -608,20 +609,27 @@ fn the_config_section_is_reachable_only_through_search() {
     let mut h = harness(&app);
     open_settings(&mut h);
 
-    // No left-nav Button labelled "Config" exists...
+    // A left-nav item labelled "Config" now exists...
     assert!(
         h.query_by_role_and_label(egui::accesskit::Role::Button, "Config")
-            .is_none(),
-        "there is no left-nav item for the Config section — if one was added, \
-         this test should be updated to select it directly"
+            .is_some(),
+        "the Config section must have a left-nav item — without one the page is \
+         built but unclickable, which is indistinguishable from a missing feature"
     );
 
-    // ...but searching its label reveals the section heading (role Label).
+    // ...and selecting it reveals the section heading (role Label).
+    select_category(&mut h, "Config");
+    assert!(
+        h.query_by_role_and_label(egui::accesskit::Role::Label, "Config")
+            .is_some(),
+        "selecting the Config nav item must show the Config section"
+    );
+
+    // Search remains a valid second door — the nav entry must not have replaced it.
     search_for(&mut h, "config");
     assert!(
         h.query_by_role_and_label(egui::accesskit::Role::Label, "Config")
             .is_some(),
-        "searching 'config' must reveal the Config section — it is the section's \
-         only reachable door"
+        "searching 'config' must still reveal the Config section"
     );
 }

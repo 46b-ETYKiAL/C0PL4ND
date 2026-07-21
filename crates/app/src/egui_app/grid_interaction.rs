@@ -390,6 +390,10 @@ pub(crate) fn paint_link_underlines(
 /// uses, so the quads land on the cell grid. GPU-free (egui rects only). A
 /// match whose `line` exceeds the visible row count is skipped (the grid may
 /// have scrolled since the match set was computed mid-frame).
+// Geometry primitive: every argument is an independent painting parameter
+// (surface, cell metrics, colours), like `glyph_button` above. Grouping them into
+// a struct would only move the same fields behind one name.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_search_highlight(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -397,6 +401,7 @@ pub(crate) fn paint_search_highlight(
     line_height_px: f32,
     padding: f32,
     colors: &theme::ChromeColors,
+    current_match: egui::Color32,
     hl: SearchHighlight<'_>,
 ) {
     if hl.spans.is_empty() {
@@ -417,16 +422,23 @@ pub(crate) fn paint_search_highlight(
         let w = (col_end - s.col_start) as f32 * cw;
         let y0 = origin.y + s.line as f32 * ch;
         let span = egui::Rect::from_min_size(egui::pos2(x0, y0), egui::vec2(w, ch));
-        // Dim accent tint behind every match.
-        painter.rect_filled(span, 1.0, colors.accent.gamma_multiply(0.30));
-        // The active match also gets a crisp outline so it reads as "current".
         if idx == hl.selected {
+            // The CURRENT match gets its own distinct FILL, not merely an
+            // outline over the same tint every other match uses. With one shared
+            // colour the active match was near-indistinguishable at a glance —
+            // an outline reads as a border, not as "this is the one you are on",
+            // which is the whole point of a find overlay. A solid-ish fill plus
+            // the outline makes it unmistakable.
+            painter.rect_filled(span, 1.0, current_match.gamma_multiply(0.75));
             painter.rect_stroke(
                 span,
                 1.0,
-                egui::Stroke::new(1.5f32, colors.accent),
+                egui::Stroke::new(1.5f32, current_match),
                 egui::StrokeKind::Inside,
             );
+        } else {
+            // Dim accent tint behind every OTHER match.
+            painter.rect_filled(span, 1.0, colors.accent.gamma_multiply(0.30));
         }
     }
 }

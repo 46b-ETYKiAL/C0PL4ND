@@ -30,11 +30,115 @@ use c0pl4nd_core::term::{
 };
 use c0pl4nd_core::{Session, Theme};
 
-/// A foreground colour run: a string of consecutive same-colour glyphs and the
-/// RGB triple they render in. The egui paint layer turns these into glyphon
-/// `Attrs`; keeping the type as a plain `(String, (u8,u8,u8))` keeps this module
-/// free of any glyphon/egui dependency (so it stays headlessly testable).
-pub type ColorRun = (String, (u8, u8, u8));
+/// The fully-resolved rendition of one terminal cell: the colours [`Theme::cell_colors`]
+/// produced plus the SGR attribute bits the core parsed. This is the ONLY colour
+/// carrier the paint layer sees — the renderer never re-derives a colour, it just
+/// draws what the core resolved (one source of truth, per the theme API contract).
+///
+/// `bg` is `Option` exactly as [`Theme::cell_colors`] returns it: `None` means
+/// "the window default background", which the renderer SKIPS painting a quad for
+/// (the overwhelmingly common case — a default-background cell needs no quad).
+/// A `Some(_)` background is what makes `grep --color`, `ls` directory colours,
+/// `git diff`, fzf's selected row and every TUI's selected row show their block.
+///
+/// Plain data (no egui / glyphon types) so this module stays headlessly testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunStyle {
+    /// Effective foreground RGB (inverse already applied by `Theme::cell_colors`).
+    pub fg: (u8, u8, u8),
+    /// Effective background RGB, or `None` for the window default (skip the quad).
+    pub bg: Option<(u8, u8, u8)>,
+    /// SGR `1` — render with a bold face (or faux-bold when none is installed).
+    pub bold: bool,
+    /// SGR `3` — render italic/oblique.
+    pub italic: bool,
+    /// SGR `4` / `4:0..5` — the styled-underline selection.
+    pub underline: c0pl4nd_core::grid::UnderlineStyle,
+    /// SGR `58`/`59` — the underline's own colour, or `None` to use [`Self::fg`].
+    pub underline_color: Option<(u8, u8, u8)>,
+    /// SGR `9` — crossed-out.
+    pub strikeout: bool,
+}
+
+impl RunStyle {
+    /// A plain run in `fg` on the default background with no attributes — the
+    /// shape the dead-session mono fallback and the pure-colour tests want.
+    pub const fn plain(fg: (u8, u8, u8)) -> Self {
+        RunStyle {
+            fg,
+            bg: None,
+            bold: false,
+            italic: false,
+            underline: c0pl4nd_core::grid::UnderlineStyle::None,
+            underline_color: None,
+            strikeout: false,
+        }
+    }
+
+    /// Whether this run draws any line decoration (underline / strikeout), i.e.
+    /// whether the renderer's decoration pass has anything to do for it.
+    pub fn has_decoration(&self) -> bool {
+        self.strikeout || self.underline != c0pl4nd_core::grid::UnderlineStyle::None
+    }
+}
+
+/// A colour run: a string of consecutive glyphs that share one fully-resolved
+/// [`RunStyle`], and that style. The egui paint layer turns each run into
+/// background quads, glyph galleys, and line decorations; keeping the payload a
+/// plain data struct keeps this module free of any egui/glyphon dependency.
+pub type ColorRun = (String, RunStyle);
+
+/// One contiguous horizontal span of grid CELLS that share a [`RunStyle`]:
+/// `col..col + width` on a single row. Produced by [`row_cell_spans`] and
+/// consumed by the renderer's background-quad and line-decoration passes, both
+/// of which want per-span rectangles rather than per-glyph positions.
+///
+/// Unlike [`row_glyph_cells`], BLANK cells are INCLUDED — a run of spaces with a
+/// coloured background is precisely the highlighted block a terminal must draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellSpan {
+    /// First grid column of the span (0-based).
+    pub col: usize,
+    /// Span width in grid CELLS (a wide glyph contributes 2).
+    pub width: usize,
+    /// The rendition every cell in the span shares.
+    pub style: RunStyle,
+}
+
+/// Project one row's runs onto contiguous [`CellSpan`]s, MERGING neighbouring
+/// runs that resolved to the same [`RunStyle`].
+///
+/// Merging matters for correctness, not just batching: two adjacent quads that
+/// meet at a fractional-pixel boundary can leave a visible hairline seam, so the
+/// renderer wants the widest possible span. `build_color_runs` already splits a
+/// wide glyph into its own run even when its style matches its neighbours, and
+/// this re-joins those — a coloured background behind CJK text is one solid
+/// block, not one quad per glyph.
+pub fn row_cell_spans(runs: &[ColorRun]) -> Vec<CellSpan> {
+    let mut out: Vec<CellSpan> = Vec::new();
+    let mut col = 0usize;
+    for (text, style) in runs {
+        let width: usize = text.chars().map(cell_render_width).sum();
+        if width == 0 {
+            continue;
+        }
+        match out.last_mut() {
+            // Merge with the previous span when the style matches AND the spans
+            // actually touch (they always do here, but the check keeps the
+            // function total for hand-built inputs).
+            Some(prev) if prev.style == *style && prev.col + prev.width == col => {
+                prev.width += width;
+            }
+            _ => out.push(CellSpan {
+                col,
+                width,
+                style: *style,
+            }),
+        }
+        col += width;
+    }
+    out
+}
 
 /// The number of terminal CELLS a glyph occupies: 2 for an East-Asian wide /
 /// fullwidth glyph (and wide emoji), 1 otherwise. Mirrors the core VT layer's
@@ -87,13 +191,13 @@ fn copy_row_text(row: &[c0pl4nd_core::Cell], lo: usize, hi: usize) -> String {
 /// another cell — the failure mode that reverted the per-run approach). Pulling
 /// it out as a pure function makes wide-glyph alignment unit-testable WITHOUT a
 /// live display.
-pub fn row_glyph_cells(runs: &[ColorRun]) -> Vec<(char, (u8, u8, u8), usize)> {
+pub fn row_glyph_cells(runs: &[ColorRun]) -> Vec<(char, RunStyle, usize)> {
     let mut out = Vec::new();
     let mut col = 0usize;
-    for (text, rgb) in runs {
+    for (text, style) in runs {
         for c in text.chars() {
             if c != ' ' {
-                out.push((c, *rgb, col));
+                out.push((c, *style, col));
             }
             col += cell_render_width(c);
         }
@@ -124,33 +228,37 @@ fn build_color_runs(
     cells: &[c0pl4nd_core::Cell],
     cols: usize,
     default_cell: &c0pl4nd_core::Cell,
-    mut color_of: impl FnMut(&c0pl4nd_core::Cell) -> (u8, u8, u8),
+    mut style_of: impl FnMut(&c0pl4nd_core::Cell) -> RunStyle,
 ) -> Vec<ColorRun> {
     let mut runs: Vec<ColorRun> = Vec::new();
     let mut run = String::new();
-    let mut run_color: Option<(u8, u8, u8)> = None;
+    let mut run_style: Option<RunStyle> = None;
     let mut col = 0;
     while col < cols {
         let cell = cells.get(col).unwrap_or(default_cell);
-        let fg = color_of(cell);
+        let style = style_of(cell);
         if cell_render_width(cell.c) >= 2 {
-            if let Some(pc) = run_color.take() {
+            if let Some(pc) = run_style.take() {
                 runs.push((std::mem::take(&mut run), pc));
             }
-            runs.push((cell.c.to_string(), fg));
+            runs.push((cell.c.to_string(), style));
             col += 2; // skip the trailing continuation spacer cell
             continue;
         }
-        if run_color != Some(fg) {
-            if let Some(pc) = run_color.take() {
+        // Break the run on ANY rendition change — background included. Breaking
+        // only on foreground (the pre-background behaviour) would merge a
+        // highlighted cell into its unhighlighted neighbour's run and lose the
+        // background boundary entirely.
+        if run_style != Some(style) {
+            if let Some(pc) = run_style.take() {
                 runs.push((std::mem::take(&mut run), pc));
             }
-            run_color = Some(fg);
+            run_style = Some(style);
         }
         run.push(cell.c);
         col += 1;
     }
-    if let Some(pc) = run_color {
+    if let Some(pc) = run_style {
         runs.push((run, pc));
     }
     runs
@@ -1167,7 +1275,27 @@ impl PaneTerm {
         let mut rows_out: Vec<Vec<ColorRun>> = Vec::with_capacity(grid_rows);
         guard.for_visible_rows(|_, row| {
             let mut runs = build_color_runs(row, cols, &default_cell, |cell| {
-                self.theme.cell_colors(cell, default_fg, default_bg).0
+                // ONE colour authority: `Theme::cell_colors` resolves fg AND the
+                // optional bg (applying SGR inverse). Both halves are kept — the
+                // background used to be thrown away here, which is why every
+                // highlighted cell (grep matches, ls dir colours, TUI selected
+                // rows) rendered as plain text, and why an inverse cell painted
+                // its background colour ONTO the unchanged background, i.e.
+                // invisibly.
+                let (fg, bg) = self.theme.cell_colors(cell, default_fg, default_bg);
+                RunStyle {
+                    fg,
+                    bg,
+                    bold: cell.flags.bold,
+                    italic: cell.flags.italic,
+                    underline: cell.flags.underline_style,
+                    // SGR 58/59: resolved through the SAME core colour API (never
+                    // re-derived); `None` leaves the decoration in the run's fg.
+                    underline_color: cell
+                        .underline_color
+                        .map(|c| self.theme.resolve_color(c, fg)),
+                    strikeout: cell.flags.strikeout,
+                }
             });
             // BiDi (F3-2): reorder this row's logical-order runs into VISUAL
             // order for right-to-left scripts (Arabic/Hebrew). The fast path
@@ -1279,15 +1407,15 @@ mod tests {
         };
         // Grid: 'a', '漢' (wide), ' ' (continuation spacer the core wrote), 'b'.
         let cells = vec![c('a'), c('漢'), c(' '), c('b')];
-        let runs = build_color_runs(&cells, 4, &Cell::default(), |_| (1, 2, 3));
+        let runs = build_color_runs(&cells, 4, &Cell::default(), |_| RunStyle::plain((1, 2, 3)));
         // The wide glyph is its OWN run and the spacer is NOT emitted, so the run
         // column accounting never double-counts the wide glyph's width.
         assert_eq!(
             runs,
             vec![
-                ("a".to_string(), (1, 2, 3)),
-                ("漢".to_string(), (1, 2, 3)),
-                ("b".to_string(), (1, 2, 3)),
+                ("a".to_string(), RunStyle::plain((1, 2, 3))),
+                ("漢".to_string(), RunStyle::plain((1, 2, 3))),
+                ("b".to_string(), RunStyle::plain((1, 2, 3))),
             ]
         );
     }
@@ -1302,16 +1430,16 @@ mod tests {
         let cells = vec![c('a'), c('b'), c('c')];
         let runs = build_color_runs(&cells, 3, &Cell::default(), |cell| {
             if cell.c == 'c' {
-                (0, 255, 0)
+                RunStyle::plain((0, 255, 0))
             } else {
-                (255, 0, 0)
+                RunStyle::plain((255, 0, 0))
             }
         });
         assert_eq!(
             runs,
             vec![
-                ("ab".to_string(), (255, 0, 0)),
-                ("c".to_string(), (0, 255, 0))
+                ("ab".to_string(), RunStyle::plain((255, 0, 0))),
+                ("c".to_string(), RunStyle::plain((0, 255, 0)))
             ]
         );
     }
@@ -1366,16 +1494,16 @@ mod tests {
         // shifts 'b' by two cells. THIS is the property that makes CJK/emoji
         // render cell-accurately; it is verified here without a live display.
         let runs = vec![
-            ("a".to_string(), (1, 1, 1)),
-            ("漢".to_string(), (2, 2, 2)),
-            ("b".to_string(), (3, 3, 3)),
+            ("a".to_string(), RunStyle::plain((1, 1, 1))),
+            ("漢".to_string(), RunStyle::plain((2, 2, 2))),
+            ("b".to_string(), RunStyle::plain((3, 3, 3))),
         ];
         assert_eq!(
             row_glyph_cells(&runs),
             vec![
-                ('a', (1, 1, 1), 0),
-                ('漢', (2, 2, 2), 1),
-                ('b', (3, 3, 3), 3),
+                ('a', RunStyle::plain((1, 1, 1)), 0),
+                ('漢', RunStyle::plain((2, 2, 2)), 1),
+                ('b', RunStyle::plain((3, 3, 3)), 3),
             ]
         );
     }
@@ -1384,27 +1512,30 @@ mod tests {
     fn row_glyph_cells_skips_blanks_but_still_advances_the_column() {
         // A blank is not painted (background is drawn separately) but still
         // advances the cell column, so 'b' lands at cell 2.
-        let runs = vec![("a b".to_string(), (9, 9, 9))];
+        let runs = vec![("a b".to_string(), RunStyle::plain((9, 9, 9)))];
         assert_eq!(
             row_glyph_cells(&runs),
-            vec![('a', (9, 9, 9), 0), ('b', (9, 9, 9), 2)]
+            vec![
+                ('a', RunStyle::plain((9, 9, 9)), 0),
+                ('b', RunStyle::plain((9, 9, 9)), 2)
+            ]
         );
     }
 
     #[test]
     fn row_glyph_cells_handles_two_adjacent_wide_glyphs() {
         let runs = vec![
-            ("漢".to_string(), (1, 1, 1)),
-            ("字".to_string(), (2, 2, 2)),
-            ("x".to_string(), (3, 3, 3)),
+            ("漢".to_string(), RunStyle::plain((1, 1, 1))),
+            ("字".to_string(), RunStyle::plain((2, 2, 2))),
+            ("x".to_string(), RunStyle::plain((3, 3, 3))),
         ];
         // 漢@0, 字@2 (after the first wide glyph), x@4 (after the second).
         assert_eq!(
             row_glyph_cells(&runs),
             vec![
-                ('漢', (1, 1, 1), 0),
-                ('字', (2, 2, 2), 2),
-                ('x', (3, 3, 3), 4)
+                ('漢', RunStyle::plain((1, 1, 1)), 0),
+                ('字', RunStyle::plain((2, 2, 2)), 2),
+                ('x', RunStyle::plain((3, 3, 3)), 4)
             ]
         );
     }

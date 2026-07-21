@@ -3426,7 +3426,9 @@ mod tests {
             // open paren is the section name, in both rustfmt layouts.
             let Some(open) = rest.find('"') else { continue };
             let tail = &rest[open + 1..];
-            let Some(close) = tail.find('"') else { continue };
+            let Some(close) = tail.find('"') else {
+                continue;
+            };
             rendered.push(&tail[..close]);
         }
 

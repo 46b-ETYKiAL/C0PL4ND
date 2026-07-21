@@ -1395,4 +1395,408 @@ mod tests {
             Some(b"\x1b[97;5:2;97u".to_vec())
         );
     }
+
+    // ---- legacy xterm modifier encoding (CSI 1 ; <param> <letter>) ----
+
+    fn alt() -> KeyModifiers {
+        KeyModifiers {
+            alt: true,
+            ..KeyModifiers::NONE
+        }
+    }
+    fn ctrl_alt() -> KeyModifiers {
+        KeyModifiers {
+            ctrl: true,
+            alt: true,
+            ..KeyModifiers::NONE
+        }
+    }
+    fn logo() -> KeyModifiers {
+        KeyModifiers {
+            logo: true,
+            ..KeyModifiers::NONE
+        }
+    }
+
+    /// The modifier parameter formula, pinned independently of the encoder so a
+    /// mutation of `xterm_mod_param` cannot pass unnoticed.
+    #[test]
+    fn xterm_modifier_parameter_formula() {
+        assert_eq!(xterm_mod_param(KeyModifiers::NONE), 1);
+        assert_eq!(xterm_mod_param(shift()), 2);
+        assert_eq!(xterm_mod_param(alt()), 3);
+        assert_eq!(xterm_mod_param(ctrl()), 5);
+        assert_eq!(xterm_mod_param(ctrl_shift()), 6);
+        assert_eq!(xterm_mod_param(ctrl_alt()), 7);
+        assert_eq!(xterm_mod_param(logo()), 9);
+        assert!(!any_modifier(KeyModifiers::NONE));
+        for m in [shift(), alt(), ctrl(), ctrl_shift(), ctrl_alt(), logo()] {
+            assert!(any_modifier(m), "{m:?} must count as modified");
+        }
+    }
+
+    /// Every (modifier × cursor-key) pair, in both DECCKM modes: the modified
+    /// form is the CSI-with-parameter form and is INDEPENDENT of `app_cursor`.
+    #[test]
+    fn modified_cursor_keys_use_csi_parameter_form() {
+        let keys: [(LogicalKey, u8); 6] = [
+            (LogicalKey::ArrowUp, b'A'),
+            (LogicalKey::ArrowDown, b'B'),
+            (LogicalKey::ArrowRight, b'C'),
+            (LogicalKey::ArrowLeft, b'D'),
+            (LogicalKey::Home, b'H'),
+            (LogicalKey::End, b'F'),
+        ];
+        let mods: [(KeyModifiers, u8); 5] = [
+            (shift(), b'2'),
+            (alt(), b'3'),
+            (ctrl(), b'5'),
+            (ctrl_shift(), b'6'),
+            (ctrl_alt(), b'7'),
+        ];
+        for (key, letter) in &keys {
+            for (m, param) in &mods {
+                let want = vec![0x1b, b'[', b'1', b';', *param, *letter];
+                for app_cursor in [false, true] {
+                    assert_eq!(
+                        encode_key(key, app_cursor, *m),
+                        Some(want.clone()),
+                        "{key:?} + {m:?} (app_cursor={app_cursor})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The canonical case from the bug report: Ctrl+arrow must be the word-jump
+    /// sequence a shell line editor understands.
+    #[test]
+    fn ctrl_arrows_emit_word_jump_sequences() {
+        assert_eq!(
+            encode_key(&LogicalKey::ArrowLeft, false, ctrl()),
+            Some(b"\x1b[1;5D".to_vec())
+        );
+        assert_eq!(
+            encode_key(&LogicalKey::ArrowRight, false, ctrl()),
+            Some(b"\x1b[1;5C".to_vec())
+        );
+        assert_eq!(
+            encode_key(&LogicalKey::ArrowUp, false, ctrl()),
+            Some(b"\x1b[1;5A".to_vec())
+        );
+        assert_eq!(
+            encode_key(&LogicalKey::ArrowDown, false, ctrl()),
+            Some(b"\x1b[1;5B".to_vec())
+        );
+        assert_eq!(
+            encode_key(&LogicalKey::Home, false, ctrl()),
+            Some(b"\x1b[1;5H".to_vec())
+        );
+        assert_eq!(
+            encode_key(&LogicalKey::End, false, ctrl()),
+            Some(b"\x1b[1;5F".to_vec())
+        );
+    }
+
+    /// Regression pin: the UNMODIFIED cursor/Home/End encoding — including the
+    /// DECCKM SS3 form — is byte-identical to the pre-change behaviour.
+    #[test]
+    fn unmodified_cursor_keys_are_unchanged_in_both_decckm_modes() {
+        let cases: [(LogicalKey, &[u8], &[u8]); 6] = [
+            (LogicalKey::ArrowUp, b"\x1b[A", b"\x1bOA"),
+            (LogicalKey::ArrowDown, b"\x1b[B", b"\x1bOB"),
+            (LogicalKey::ArrowRight, b"\x1b[C", b"\x1bOC"),
+            (LogicalKey::ArrowLeft, b"\x1b[D", b"\x1bOD"),
+            (LogicalKey::Home, b"\x1b[H", b"\x1bOH"),
+            (LogicalKey::End, b"\x1b[F", b"\x1bOF"),
+        ];
+        for (key, csi, ss3) in &cases {
+            assert_eq!(
+                encode_key(key, false, KeyModifiers::NONE),
+                Some(csi.to_vec()),
+                "{key:?} normal mode"
+            );
+            assert_eq!(
+                encode_key(key, true, KeyModifiers::NONE),
+                Some(ss3.to_vec()),
+                "{key:?} application-cursor mode"
+            );
+        }
+    }
+
+    /// Every (modifier × tilde key) pair gains the `; <param>` field.
+    #[test]
+    fn modified_tilde_keys_carry_the_modifier_parameter() {
+        let keys: [(LogicalKey, &str); 4] = [
+            (LogicalKey::Insert, "2"),
+            (LogicalKey::Delete, "3"),
+            (LogicalKey::PageUp, "5"),
+            (LogicalKey::PageDown, "6"),
+        ];
+        let mods: [(KeyModifiers, &str); 5] = [
+            (shift(), "2"),
+            (alt(), "3"),
+            (ctrl(), "5"),
+            (ctrl_shift(), "6"),
+            (ctrl_alt(), "7"),
+        ];
+        for (key, n) in &keys {
+            for (m, param) in &mods {
+                assert_eq!(
+                    encode_key(key, false, *m),
+                    Some(format!("\x1b[{n};{param}~").into_bytes()),
+                    "{key:?} + {m:?}"
+                );
+            }
+        }
+        // The specific sequences named in the bug report.
+        assert_eq!(
+            encode_key(&LogicalKey::Delete, false, ctrl()),
+            Some(b"\x1b[3;5~".to_vec())
+        );
+        assert_eq!(
+            encode_key(&LogicalKey::PageUp, false, shift()),
+            Some(b"\x1b[5;2~".to_vec())
+        );
+        assert_eq!(
+            encode_key(&LogicalKey::PageDown, false, shift()),
+            Some(b"\x1b[6;2~".to_vec())
+        );
+    }
+
+    /// Regression pin: unmodified tilde keys are byte-identical to before, and
+    /// DECCKM does not affect them.
+    #[test]
+    fn unmodified_tilde_keys_are_unchanged() {
+        let cases: [(LogicalKey, &[u8]); 4] = [
+            (LogicalKey::Insert, b"\x1b[2~"),
+            (LogicalKey::Delete, b"\x1b[3~"),
+            (LogicalKey::PageUp, b"\x1b[5~"),
+            (LogicalKey::PageDown, b"\x1b[6~"),
+        ];
+        for (key, want) in &cases {
+            for app_cursor in [false, true] {
+                assert_eq!(
+                    encode_key(key, app_cursor, KeyModifiers::NONE),
+                    Some(want.to_vec()),
+                    "{key:?} (app_cursor={app_cursor})"
+                );
+            }
+        }
+    }
+
+    /// Regression pin: F1–F12 keep their legacy encoding with AND without
+    /// modifiers (the kitty path owns modified function keys).
+    #[test]
+    fn function_keys_are_unchanged_under_modifiers() {
+        let cases: [(u8, &[u8]); 12] = [
+            (1, b"\x1bOP"),
+            (2, b"\x1bOQ"),
+            (3, b"\x1bOR"),
+            (4, b"\x1bOS"),
+            (5, b"\x1b[15~"),
+            (6, b"\x1b[17~"),
+            (7, b"\x1b[18~"),
+            (8, b"\x1b[19~"),
+            (9, b"\x1b[20~"),
+            (10, b"\x1b[21~"),
+            (11, b"\x1b[23~"),
+            (12, b"\x1b[24~"),
+        ];
+        for (n, want) in &cases {
+            for m in [KeyModifiers::NONE, shift(), ctrl(), ctrl_shift(), alt()] {
+                assert_eq!(
+                    encode_key(&LogicalKey::Function(*n), false, m),
+                    Some(want.to_vec()),
+                    "F{n} + {m:?}"
+                );
+            }
+        }
+        assert_eq!(
+            encode_key(&LogicalKey::Function(0), false, ctrl()),
+            None,
+            "F0 is out of range"
+        );
+        assert_eq!(
+            encode_key(&LogicalKey::Function(13), false, ctrl()),
+            None,
+            "F13 is out of range"
+        );
+    }
+
+    #[test]
+    fn backspace_variants() {
+        // Plain Backspace is DEL, unchanged.
+        assert_eq!(
+            encode_key(&LogicalKey::Backspace, false, KeyModifiers::NONE),
+            Some(vec![0x7f])
+        );
+        // Shift+Backspace is still DEL (xterm default).
+        assert_eq!(
+            encode_key(&LogicalKey::Backspace, false, shift()),
+            Some(vec![0x7f])
+        );
+        // Ctrl+Backspace defaults to ^H (0x08), the spec-correct byte.
+        assert_eq!(
+            encode_key(&LogicalKey::Backspace, false, ctrl()),
+            Some(vec![0x08])
+        );
+        // Alt+Backspace is the Meta form: ESC DEL.
+        assert_eq!(
+            encode_key(&LogicalKey::Backspace, false, alt()),
+            Some(vec![0x1b, 0x7f])
+        );
+        // Ctrl+Alt+Backspace = Meta-prefixed Ctrl form.
+        assert_eq!(
+            encode_key(&LogicalKey::Backspace, false, ctrl_alt()),
+            Some(vec![0x1b, 0x08])
+        );
+    }
+
+    #[test]
+    fn ctrl_backspace_honours_the_configured_encoding() {
+        let ctrl_h = KeyEncodeOptions {
+            ctrl_backspace: CtrlBackspace::ControlH,
+        };
+        let ctrl_w = KeyEncodeOptions {
+            ctrl_backspace: CtrlBackspace::ControlW,
+        };
+        assert_eq!(
+            KeyEncodeOptions::default().ctrl_backspace,
+            CtrlBackspace::ControlH,
+            "the spec-correct encoding is the default"
+        );
+        assert_eq!(
+            encode_key_with(&LogicalKey::Backspace, false, ctrl(), ctrl_h),
+            Some(vec![0x08])
+        );
+        assert_eq!(
+            encode_key_with(&LogicalKey::Backspace, false, ctrl(), ctrl_w),
+            Some(vec![0x17]),
+            "^W is readline/PSReadLine backward-kill-word"
+        );
+        // The option only affects Ctrl+Backspace — plain Backspace is DEL under
+        // BOTH settings, and Alt+Backspace stays the Meta DEL form.
+        for opts in [ctrl_h, ctrl_w] {
+            assert_eq!(
+                encode_key_with(&LogicalKey::Backspace, false, KeyModifiers::NONE, opts),
+                Some(vec![0x7f])
+            );
+            assert_eq!(
+                encode_key_with(&LogicalKey::Backspace, false, alt(), opts),
+                Some(vec![0x1b, 0x7f])
+            );
+            assert_eq!(
+                encode_key_with(&LogicalKey::ArrowLeft, false, ctrl(), opts),
+                Some(b"\x1b[1;5D".to_vec()),
+                "the option must not perturb cursor-key encoding"
+            );
+        }
+        // Ctrl+Alt+Backspace picks up the configured byte too.
+        assert_eq!(
+            encode_key_with(&LogicalKey::Backspace, false, ctrl_alt(), ctrl_w),
+            Some(vec![0x1b, 0x17])
+        );
+    }
+
+    /// `encode_key` must be exactly `encode_key_with(.., default())`.
+    #[test]
+    fn encode_key_delegates_to_default_options() {
+        let keys = [
+            LogicalKey::Backspace,
+            LogicalKey::ArrowLeft,
+            LogicalKey::Delete,
+            LogicalKey::Enter,
+            LogicalKey::Text("x".into()),
+        ];
+        for key in &keys {
+            for m in [KeyModifiers::NONE, ctrl(), alt(), shift()] {
+                for app_cursor in [false, true] {
+                    assert_eq!(
+                        encode_key(key, app_cursor, m),
+                        encode_key_with(key, app_cursor, m, KeyEncodeOptions::default()),
+                        "{key:?} + {m:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Regression pin: the non-cursor, non-editing keys are untouched by the
+    /// modifier work (Ctrl+letter control bytes are produced by the front end's
+    /// text mapping, which arrives here as `Text`).
+    #[test]
+    fn simple_keys_are_unaffected_by_modifiers() {
+        assert_eq!(
+            encode_key(&LogicalKey::Enter, false, ctrl()),
+            Some(vec![b'\r'])
+        );
+        assert_eq!(
+            encode_key(&LogicalKey::Tab, false, ctrl()),
+            Some(vec![b'\t'])
+        );
+        assert_eq!(
+            encode_key(&LogicalKey::Escape, false, ctrl()),
+            Some(vec![0x1b])
+        );
+        assert_eq!(
+            encode_key(&LogicalKey::Space, false, ctrl()),
+            Some(vec![b' '])
+        );
+        // Ctrl+A arrives as the already-mapped control byte and passes through.
+        assert_eq!(
+            encode_key(&LogicalKey::Text("\u{1}".into()), false, ctrl()),
+            Some(vec![0x01])
+        );
+        assert_eq!(
+            encode_key(&LogicalKey::Text("\u{1a}".into()), false, ctrl()),
+            Some(vec![0x1a])
+        );
+        // Alt still Meta-prefixes plain text and Enter/Tab/Space.
+        assert_eq!(
+            encode_key(&LogicalKey::Enter, false, alt()),
+            Some(vec![0x1b, b'\r'])
+        );
+        assert_eq!(
+            encode_key(&LogicalKey::Tab, false, alt()),
+            Some(vec![0x1b, b'\t'])
+        );
+        assert_eq!(
+            encode_key(&LogicalKey::Space, false, alt()),
+            Some(vec![0x1b, b' '])
+        );
+        // Alt+Escape must NOT double-prefix.
+        assert_eq!(
+            encode_key(&LogicalKey::Escape, false, alt()),
+            Some(vec![0x1b])
+        );
+        // Empty text still encodes nothing regardless of modifiers.
+        assert_eq!(
+            encode_key(&LogicalKey::Text(String::new()), false, ctrl()),
+            None
+        );
+    }
+
+    /// The legacy modifier parameter must agree with the kitty encoder's, so the
+    /// two paths can never drift apart.
+    #[test]
+    fn legacy_and_kitty_modifier_parameters_agree() {
+        for m in [
+            KeyModifiers::NONE,
+            shift(),
+            alt(),
+            ctrl(),
+            ctrl_shift(),
+            ctrl_alt(),
+            logo(),
+        ] {
+            assert_eq!(xterm_mod_param(m), kitty_mod_value(m), "{m:?}");
+        }
+        // Ctrl+Left is byte-identical on both paths (kitty's cursor-key form IS
+        // the xterm CSI-1;<p><letter> form).
+        assert_eq!(
+            encode_key(&LogicalKey::ArrowLeft, false, ctrl()),
+            encode_key_kitty(&LogicalKey::ArrowLeft, ctrl(), DISAMB, KeyEventKind::Press)
+        );
+    }
 }

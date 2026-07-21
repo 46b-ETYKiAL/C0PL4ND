@@ -355,6 +355,65 @@ pub fn is_builtin_family(family: &str) -> bool {
 /// gracefully). Prefers a non-italic, ~regular-weight face so the grid renders
 /// upright text; falls back to the first match if no plain face exists.
 pub fn face_bytes_for_family(db: &fontdb::Database, family: &str) -> Option<(Vec<u8>, u32)> {
+    face_bytes_for_weight(db, family, REGULAR_WEIGHT)
+}
+
+/// The OpenType weight class of a normal face — the target [`face_bytes_for_weight`]
+/// scores against for the body text of the grid.
+const REGULAR_WEIGHT: u16 = 400;
+
+/// The OpenType weight class of a bold face (SGR `1`).
+const BOLD_WEIGHT: u16 = 700;
+
+/// The lowest weight class that still counts as a GENUINE bold cut. A family
+/// whose heaviest installed face is lighter than this has no bold at all, so the
+/// renderer must fall back to faux-bold rather than silently drawing SGR-1 text
+/// in the regular weight (which is what "no bold face is loaded" looked like).
+const MIN_BOLD_WEIGHT: u16 = 600;
+
+/// The synthetic egui family name the BOLD monospace face is registered under.
+/// A distinct family (rather than a weight on `FontFamily::Monospace`) is the
+/// only way to reach a second face in egui, whose `FontId` selects a family, not
+/// a weight.
+pub const BOLD_MONOSPACE_FAMILY: &str = "c0pl4nd-mono-bold";
+
+/// The egui font family the renderer uses for SGR-1 (bold) cells.
+///
+/// [`build_font_definitions`] always registers this family, so a `FontId` built
+/// from it is always resolvable: it holds the real bold faces when the machine
+/// has any, and otherwise mirrors the regular monospace stack (in which case
+/// [`bold_face_available`] reports `false` and the renderer applies faux-bold).
+pub fn bold_monospace_family() -> egui::FontFamily {
+    egui::FontFamily::Name(BOLD_MONOSPACE_FAMILY.into())
+}
+
+/// Whether the last [`build_font_definitions`] call found a GENUINE bold face.
+///
+/// When this is `false` the bold family is just the regular stack, so bold text
+/// would be indistinguishable from plain text — the renderer compensates by
+/// double-striking the glyph at a sub-pixel offset (faux bold). Stored as a
+/// process-global because the font stack is process-global: the renderer needs
+/// the answer per-glyph, deep inside the paint loop, where threading a font-load
+/// result through every call would add a parameter to the whole render path for
+/// a value that can only change when the fonts are re-installed.
+pub fn bold_face_available() -> bool {
+    BOLD_FACE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static BOLD_FACE_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Read the raw bytes of the face of `family` closest to `want_weight`.
+///
+/// Generalises [`face_bytes_for_family`] (which targets the regular weight) so
+/// the same matching logic serves the BOLD lookup — one implementation, so the
+/// upright preference and the `.ttc` face-index handling can never drift between
+/// the two weights. Returns the file bytes and the face's index WITHIN that file.
+pub fn face_bytes_for_weight(
+    db: &fontdb::Database,
+    family: &str,
+    want_weight: u16,
+) -> Option<(Vec<u8>, u32)> {
     let want = family.trim().to_lowercase();
     if want.is_empty() {
         return None;
@@ -365,18 +424,26 @@ pub fn face_bytes_for_family(db: &fontdb::Database, family: &str) -> Option<(Vec
             .map(|(name, _)| name.to_lowercase() == want)
             .unwrap_or(false)
     });
-    // Prefer an upright, regular-weight face; otherwise take whatever matched.
+    // Prefer an upright face at the wanted weight; otherwise take whatever matched.
     let mut best: Option<(&fontdb::FaceInfo, i32)> = None;
     for f in matches {
         let upright = matches!(f.style, fontdb::Style::Normal);
-        // Distance from the regular weight (400); smaller is better.
-        let weight_dist = (f.weight.0 as i32 - 400).abs();
+        // Distance from the wanted weight; smaller is better.
+        let weight_dist = (f.weight.0 as i32 - want_weight as i32).abs();
         let score = if upright { 0 } else { 10_000 } + weight_dist;
         if best.as_ref().map(|(_, s)| score < *s).unwrap_or(true) {
             best = Some((f, score));
         }
     }
-    let id = best?.0.id;
+    let best = best?;
+    // A bold REQUEST that only matched a light face is not a bold face. Reject it
+    // so the caller can fall back to faux-bold instead of registering the regular
+    // cut under the bold family (which renders SGR-1 identically to plain text —
+    // the bug this lookup exists to fix).
+    if want_weight >= MIN_BOLD_WEIGHT && best.0.weight.0 < MIN_BOLD_WEIGHT {
+        return None;
+    }
+    let id = best.0.id;
     // Return the raw file bytes AND the face's index WITHIN that file. Many
     // Windows system fonts (MS Gothic, Malgun Gothic, …) are TrueType Collections
     // (.ttc) holding multiple faces; `with_face_data` yields the whole-file bytes
@@ -532,7 +599,60 @@ pub fn build_font_definitions(
             mono.insert(0, key.clone());
         }
     }
+
+    // --- BOLD face (SGR `1`) ---------------------------------------------
+    // egui's `FontId` selects a FAMILY, not a weight, so the only way to reach a
+    // second (bold) cut is to register it under its own synthetic family. Without
+    // this the grid loaded no bold face at all and SGR-1 text drew identically to
+    // plain text — the "some text is more coloured / heavier in Windows Terminal"
+    // half of the reported gap.
+    let mut bold_keys: Vec<String> = Vec::new();
+    for name in &wanted {
+        if let Some((bytes, index)) = face_bytes_for_weight(db, name, BOLD_WEIGHT) {
+            let key = bold_font_data_key(name);
+            let mut face = egui::FontData::from_owned(bytes);
+            face.index = index;
+            base.font_data.insert(key.clone(), face.into());
+            bold_keys.push(key);
+            tracing::debug!(font = %name, index, "loaded bold monospace font face");
+        } else {
+            tracing::debug!(
+                font = %name,
+                "no bold cut installed for this family; bold cells fall back to faux-bold"
+            );
+        }
+    }
+    let bold_found = !bold_keys.is_empty();
+    BOLD_FACE_AVAILABLE.store(bold_found, std::sync::atomic::Ordering::Relaxed);
+
+    // The bold family is ALWAYS registered, so a `FontId` naming it always
+    // resolves. Real bold cuts come first; the whole regular monospace stack
+    // follows as the fallback chain, which keeps glyph COVERAGE identical to the
+    // regular family (a bold cut missing a CJK glyph still resolves it via the
+    // OS CJK fallback rather than drawing tofu). When no bold cut was found the
+    // family is exactly the regular stack and `bold_face_available()` is false,
+    // which is the renderer's signal to faux-bold instead.
+    let mono_chain = base
+        .families
+        .get(&egui::FontFamily::Monospace)
+        .cloned()
+        .unwrap_or_default();
+    let mut bold_chain = bold_keys;
+    for key in mono_chain {
+        if !bold_chain.contains(&key) {
+            bold_chain.push(key);
+        }
+    }
+    base.families.insert(bold_monospace_family(), bold_chain);
+
     (base, loaded_any)
+}
+
+/// The egui `font_data` key for a family's BOLD face. Distinct from
+/// [`font_data_key`] so a family's regular and bold cuts never collide on one
+/// key (which would silently overwrite one with the other).
+fn bold_font_data_key(family: &str) -> String {
+    format!("c0pl4nd-user-font-bold::{}", family.trim().to_lowercase())
 }
 
 #[cfg(test)]

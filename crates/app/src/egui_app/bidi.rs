@@ -32,7 +32,7 @@
 //!
 //! These boundaries are the DEFINED behaviour of F3-2, not deferred work.
 
-use super::pane_term::{cell_render_width, ColorRun};
+use super::pane_term::{cell_render_width, ColorRun, RunStyle};
 
 /// Reorder one row's logical-order colour runs into VISUAL order using the
 /// Unicode Bidirectional Algorithm, preserving each character's colour.
@@ -59,7 +59,7 @@ pub fn reorder_runs_visual(runs: &[ColorRun]) -> Option<Vec<ColorRun>> {
     // concatenated logical line. `char_colors[i]` is the colour of the i-th
     // character in `line` (by char index).
     let mut line = String::new();
-    let mut char_colors: Vec<(u8, u8, u8)> = Vec::new();
+    let mut char_colors: Vec<RunStyle> = Vec::new();
     for (text, color) in runs {
         for ch in text.chars() {
             line.push(ch);
@@ -92,10 +92,10 @@ pub fn reorder_runs_visual(runs: &[ColorRun]) -> Option<Vec<ColorRun>> {
 
     // Re-emit characters in visual order, then coalesce same-colour neighbours
     // back into runs (so the render path keeps its run-based galley batching).
-    let mut out_chars: Vec<(char, (u8, u8, u8))> = Vec::with_capacity(char_colors.len());
+    let mut out_chars: Vec<(char, RunStyle)> = Vec::with_capacity(char_colors.len());
     for run in vis_runs {
         let rtl = levels[run.start].is_rtl();
-        let mut seg: Vec<(char, (u8, u8, u8))> = line[run.clone()]
+        let mut seg: Vec<(char, RunStyle)> = line[run.clone()]
             .char_indices()
             .map(|(local_b, ch)| (ch, char_colors[byte_to_ci[run.start + local_b]]))
             .collect();
@@ -120,10 +120,10 @@ pub fn reorder_runs_visual(runs: &[ColorRun]) -> Option<Vec<ColorRun>> {
 /// have without reordering — no run-based consumer can desync on it.
 ///
 /// [`build_color_runs`]: super::pane_term
-fn coalesce(chars: &[(char, (u8, u8, u8))]) -> Vec<ColorRun> {
+fn coalesce(chars: &[(char, RunStyle)]) -> Vec<ColorRun> {
     let mut runs: Vec<ColorRun> = Vec::new();
     let mut cur = String::new();
-    let mut cur_color: Option<(u8, u8, u8)> = None;
+    let mut cur_color: Option<RunStyle> = None;
     for (ch, color) in chars {
         if cell_render_width(*ch) >= 2 {
             if let Some(pc) = cur_color.take() {
@@ -150,9 +150,9 @@ fn coalesce(chars: &[(char, (u8, u8, u8))]) -> Vec<ColorRun> {
 mod tests {
     use super::*;
 
-    const RED: (u8, u8, u8) = (255, 0, 0);
-    const GREEN: (u8, u8, u8) = (0, 255, 0);
-    const BLUE: (u8, u8, u8) = (0, 0, 255);
+    const RED: RunStyle = RunStyle::plain((255, 0, 0));
+    const GREEN: RunStyle = RunStyle::plain((0, 255, 0));
+    const BLUE: RunStyle = RunStyle::plain((0, 0, 255));
 
     /// The full row text, concatenated across runs (visual order helper).
     fn text_of(runs: &[ColorRun]) -> String {
@@ -160,7 +160,7 @@ mod tests {
     }
 
     /// Per-character (char, colour) pairs, for asserting colour preservation.
-    fn chars_of(runs: &[ColorRun]) -> Vec<(char, (u8, u8, u8))> {
+    fn chars_of(runs: &[ColorRun]) -> Vec<(char, RunStyle)> {
         runs.iter()
             .flat_map(|(s, c)| s.chars().map(move |ch| (ch, *c)))
             .collect()
@@ -236,14 +236,28 @@ mod tests {
         let visual = reorder_runs_visual(&row).expect("an RTL row reorders");
 
         let logical_pairs = chars_of(&row);
-        let mut visual_pairs = chars_of(&visual);
-        let mut logical_sorted = logical_pairs.clone();
-        logical_sorted.sort();
-        visual_pairs.sort();
+        let visual_pairs = chars_of(&visual);
+        // Multiset equality, compared by COUNTING rather than by sorting. The
+        // payload is a `RunStyle`, and there is no meaningful total order over a
+        // rendition — "is bold-red less than italic-blue?" has no answer, so
+        // deriving `Ord` just to canonicalise this comparison would bake an
+        // arbitrary field order into the type and invite someone to rely on it.
+        // Counting needs only `PartialEq`, which the type genuinely has.
         assert_eq!(
-            visual_pairs, logical_sorted,
-            "every (char, colour) pair must be preserved through the reorder"
+            visual_pairs.len(),
+            logical_pairs.len(),
+            "the reorder must not add or drop characters"
         );
+        let count_in = |hay: &[(char, RunStyle)], needle: &(char, RunStyle)| {
+            hay.iter().filter(|p| *p == needle).count()
+        };
+        for pair in &logical_pairs {
+            assert_eq!(
+                count_in(&visual_pairs, pair),
+                count_in(&logical_pairs, pair),
+                "every (char, colour) pair must be preserved through the reorder: {pair:?}"
+            );
+        }
 
         // Concretely: 'ש' was RED and 'ם' was GREEN in logical order; they must
         // remain RED and GREEN respectively after reordering.

@@ -91,29 +91,65 @@ impl GalleyCache {
 /// fallback fg). Two cells with the same glyph+colour+style share one galley.
 ///
 /// INVARIANT: the key must capture EVERY input that changes the laid-out galley
-/// produced by [`build_glyph_job`]. Today that function renders only `char` +
-/// `font` (size via `style_key`) + `color` — SGR attributes (bold / italic /
-/// underline) are intentionally NOT rendered, so they are correctly absent here.
-/// If [`build_glyph_job`] is ever extended to honour `CellFlags`, those flag bits
-/// MUST be added to this key, or two visually-different cells (e.g. bold vs
-/// regular `a`) would collide on one cached galley.
-pub(crate) fn glyph_cache_key(c: char, rgb: (u8, u8, u8), pass: RowPass, style_key: u64) -> u64 {
+/// produced by [`build_glyph_job`]. That function renders `char` + `font` (size
+/// via `style_key`, and the BOLD face via a distinct `FontId` family) + `color` +
+/// the italic bit — so `attrs` below carries exactly the rendition bits that
+/// change the galley. Without them, a bold `a` and a regular `a` in the same
+/// colour would collide on one cached galley and the bold one would draw thin.
+///
+/// Line decorations (underline / strikeout) are deliberately NOT part of the key:
+/// they are drawn analytically per-SPAN by the renderer, not baked into the
+/// per-glyph galley, so they cannot change it.
+pub(crate) fn glyph_cache_key(
+    c: char,
+    rgb: (u8, u8, u8),
+    pass: RowPass,
+    style_key: u64,
+    attrs: GlyphAttrs,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     style_key.hash(&mut h);
     c.hash(&mut h);
     rgb.hash(&mut h);
     (pass as u8).hash(&mut h);
+    attrs.bits().hash(&mut h);
     h.finish()
 }
 
-/// Build the [`egui::text::LayoutJob`] for a SINGLE glyph in `color`. Used on a
-/// glyph-cache miss; the resulting galley is painted at the cell's `col * cw`
-/// origin.
+/// The rendition bits that change a single glyph's laid-out galley: whether it
+/// is drawn with the bold face and whether it is italic. Kept as its own type so
+/// [`glyph_cache_key`] and [`build_glyph_job`] cannot drift apart — adding a bit
+/// here forces both to account for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct GlyphAttrs {
+    /// Draw with the bold font family (and faux-bold when no bold face exists).
+    pub(crate) bold: bool,
+    /// Draw italic/oblique.
+    pub(crate) italic: bool,
+}
+
+impl GlyphAttrs {
+    /// Pack the bits for hashing — a stable, exhaustive encoding of this type.
+    pub(crate) fn bits(self) -> u8 {
+        (self.bold as u8) | ((self.italic as u8) << 1)
+    }
+}
+
+/// Build the [`egui::text::LayoutJob`] for a SINGLE glyph in `color` with the
+/// rendition `attrs`. Used on a glyph-cache miss; the resulting galley is painted
+/// at the cell's `col * cw` origin.
+///
+/// `font` already selects the FAMILY (the caller passes the bold family for a
+/// bold cell — see `fonts::bold_monospace_family`), so boldness is carried by a
+/// real bold face wherever one is installed rather than by a synthetic effect.
+/// Italic is applied by egui's own oblique synthesis, which works for every
+/// monospace face including those shipping no italic cut.
 pub(crate) fn build_glyph_job(
     c: char,
     font: &egui::FontId,
     color: egui::Color32,
+    attrs: GlyphAttrs,
 ) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
@@ -124,6 +160,7 @@ pub(crate) fn build_glyph_job(
         egui::text::TextFormat {
             font_id: font.clone(),
             color,
+            italics: attrs.italic,
             ..Default::default()
         },
     );
@@ -213,8 +250,19 @@ mod tests {
     }
 
     fn job(c: char) -> egui::text::LayoutJob {
-        build_glyph_job(c, &egui::FontId::monospace(12.0), egui::Color32::WHITE)
+        build_glyph_job(
+            c,
+            &egui::FontId::monospace(12.0),
+            egui::Color32::WHITE,
+            GlyphAttrs::default(),
+        )
     }
+
+    /// Plain rendition — the attrs every pre-existing key assertion implies.
+    const PLAIN: GlyphAttrs = GlyphAttrs {
+        bold: false,
+        italic: false,
+    };
 
     // ---- glyph_cache_key ----
 
@@ -224,27 +272,27 @@ mod tests {
     /// paint the wrong glyph/colour.
     #[test]
     fn glyph_cache_key_distinguishes_every_input_that_changes_the_galley() {
-        let base = glyph_cache_key('a', WHITE, RowPass::Main, STYLE);
+        let base = glyph_cache_key('a', WHITE, RowPass::Main, STYLE, PLAIN);
         let variants = [
             (
                 "a different char",
-                glyph_cache_key('b', WHITE, RowPass::Main, STYLE),
+                glyph_cache_key('b', WHITE, RowPass::Main, STYLE, PLAIN),
             ),
             (
                 "a different colour",
-                glyph_cache_key('a', (255, 0, 0), RowPass::Main, STYLE),
+                glyph_cache_key('a', (255, 0, 0), RowPass::Main, STYLE, PLAIN),
             ),
             (
                 "the red ghost pass",
-                glyph_cache_key('a', WHITE, RowPass::GhostRed, STYLE),
+                glyph_cache_key('a', WHITE, RowPass::GhostRed, STYLE, PLAIN),
             ),
             (
                 "the blue ghost pass",
-                glyph_cache_key('a', WHITE, RowPass::GhostBlue, STYLE),
+                glyph_cache_key('a', WHITE, RowPass::GhostBlue, STYLE, PLAIN),
             ),
             (
                 "a different style (font size)",
-                glyph_cache_key('a', WHITE, RowPass::Main, STYLE + 1),
+                glyph_cache_key('a', WHITE, RowPass::Main, STYLE + 1, PLAIN),
             ),
         ];
         for (what, key) in variants {
@@ -252,12 +300,122 @@ mod tests {
         }
     }
 
+    /// Bold and italic change the laid-out galley (a different FACE and a
+    /// synthesised oblique), so they MUST be part of the key. Before the styled
+    /// attributes landed, `build_glyph_job` ignored `CellFlags` entirely and the
+    /// key correctly omitted them; now that it honours them, a missing bit here
+    /// would serve a regular `a` for a bold `a` — SGR 1 would silently render
+    /// thin, which is exactly the defect this pass fixes.
+    #[test]
+    fn glyph_cache_key_distinguishes_bold_and_italic() {
+        let plain = glyph_cache_key('a', WHITE, RowPass::Main, STYLE, PLAIN);
+        let bold = glyph_cache_key(
+            'a',
+            WHITE,
+            RowPass::Main,
+            STYLE,
+            GlyphAttrs {
+                bold: true,
+                italic: false,
+            },
+        );
+        let italic = glyph_cache_key(
+            'a',
+            WHITE,
+            RowPass::Main,
+            STYLE,
+            GlyphAttrs {
+                bold: false,
+                italic: true,
+            },
+        );
+        let both = glyph_cache_key(
+            'a',
+            WHITE,
+            RowPass::Main,
+            STYLE,
+            GlyphAttrs {
+                bold: true,
+                italic: true,
+            },
+        );
+        for (what, key) in [("bold", bold), ("italic", italic), ("bold+italic", both)] {
+            assert_ne!(plain, key, "{what} must not collide with the plain glyph");
+        }
+        assert_ne!(bold, italic, "bold and italic are distinct renditions");
+        assert_ne!(bold, both, "bold+italic is distinct from bold alone");
+        assert_ne!(italic, both, "bold+italic is distinct from italic alone");
+    }
+
+    /// The packed bits are an exhaustive, collision-free encoding of the type —
+    /// the property `glyph_cache_key` relies on to hash the rendition.
+    #[test]
+    fn glyph_attrs_bits_are_unique_per_combination() {
+        let all = [
+            GlyphAttrs {
+                bold: false,
+                italic: false,
+            },
+            GlyphAttrs {
+                bold: true,
+                italic: false,
+            },
+            GlyphAttrs {
+                bold: false,
+                italic: true,
+            },
+            GlyphAttrs {
+                bold: true,
+                italic: true,
+            },
+        ];
+        let bits: Vec<u8> = all.iter().map(|a| a.bits()).collect();
+        let mut sorted = bits.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            bits.len(),
+            "every combination packs distinctly"
+        );
+    }
+
+    /// The italic bit must actually reach the layout job — a key that
+    /// distinguishes italic while the job ignores it would cache two entries
+    /// that render identically (the inverse failure: a silent no-op attribute).
+    #[test]
+    fn build_glyph_job_applies_the_italic_bit() {
+        let plain = build_glyph_job(
+            'a',
+            &egui::FontId::monospace(12.0),
+            egui::Color32::WHITE,
+            GlyphAttrs {
+                bold: false,
+                italic: false,
+            },
+        );
+        let italic = build_glyph_job(
+            'a',
+            &egui::FontId::monospace(12.0),
+            egui::Color32::WHITE,
+            GlyphAttrs {
+                bold: false,
+                italic: true,
+            },
+        );
+        assert!(!plain.sections[0].format.italics, "plain text is upright");
+        assert!(
+            italic.sections[0].format.italics,
+            "the italic bit must reach TextFormat::italics, not be silently dropped"
+        );
+    }
+
     /// The three passes are mutually distinct — a ghost galley (drawn in one
     /// override colour) must never be served for the crisp pass, or vice versa.
     #[test]
     fn glyph_cache_key_keeps_all_three_passes_distinct() {
         let keys = [RowPass::Main, RowPass::GhostRed, RowPass::GhostBlue]
-            .map(|p| glyph_cache_key('a', WHITE, p, STYLE));
+            .map(|p| glyph_cache_key('a', WHITE, p, STYLE, PLAIN));
         assert_ne!(keys[0], keys[1]);
         assert_ne!(keys[1], keys[2]);
         assert_ne!(keys[0], keys[2]);
@@ -268,8 +426,8 @@ mod tests {
     #[test]
     fn glyph_cache_key_is_stable_for_the_same_glyph() {
         assert_eq!(
-            glyph_cache_key('a', WHITE, RowPass::Main, STYLE),
-            glyph_cache_key('a', WHITE, RowPass::Main, STYLE),
+            glyph_cache_key('a', WHITE, RowPass::Main, STYLE, PLAIN),
+            glyph_cache_key('a', WHITE, RowPass::Main, STYLE, PLAIN),
             "the same glyph must reuse one cached galley"
         );
     }
@@ -400,7 +558,7 @@ mod tests {
     #[test]
     fn build_glyph_job_renders_one_glyph_in_the_requested_colour() {
         let font = egui::FontId::monospace(13.0);
-        let j = build_glyph_job('Z', &font, egui::Color32::RED);
+        let j = build_glyph_job('Z', &font, egui::Color32::RED, GlyphAttrs::default());
 
         assert_eq!(j.text, "Z", "the job must carry exactly the one glyph");
         assert_eq!(
@@ -418,7 +576,13 @@ mod tests {
     #[test]
     fn build_glyph_job_handles_a_multi_byte_char() {
         assert_eq!(
-            build_glyph_job('🦀', &egui::FontId::monospace(12.0), egui::Color32::WHITE).text,
+            build_glyph_job(
+                '🦀',
+                &egui::FontId::monospace(12.0),
+                egui::Color32::WHITE,
+                GlyphAttrs::default(),
+            )
+            .text,
             "🦀"
         );
     }

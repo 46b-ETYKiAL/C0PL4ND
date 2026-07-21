@@ -14,7 +14,7 @@ use zeroize::{Zeroize, Zeroizing};
 mod charset;
 pub mod keys;
 pub mod osc;
-mod palette;
+pub(crate) mod palette;
 
 use charset::{dec_line_draw, is_variation_selector, Charset};
 pub use keys::{encode_key, encode_key_kitty, KeyEventKind, KeyModifiers, LogicalKey};
@@ -1271,6 +1271,7 @@ impl Screen {
             match codes[i] {
                 0 => self.pen = Pen::default(),
                 1 => self.pen.flags.bold = true,
+                2 => self.pen.flags.dim = true,
                 3 => self.pen.flags.italic = true,
                 4 => {
                     // C20 — styled underline. `4` alone = single. The colon
@@ -1287,13 +1288,27 @@ impl Screen {
                     };
                     self.pen.flags.underline_style = style;
                 }
+                5 => self.pen.flags.blink = true,
+                6 => self.pen.flags.rapid_blink = true,
                 7 => self.pen.flags.inverse = true,
+                8 => self.pen.flags.conceal = true,
                 9 => self.pen.flags.strikeout = true,
                 21 => self.pen.flags.underline_style = UnderlineStyle::Double,
-                22 => self.pen.flags.bold = false,
+                22 => {
+                    // ECMA-48: "normal intensity" cancels BOTH bold (1) and
+                    // faint (2) — there is no separate dim-off code.
+                    self.pen.flags.bold = false;
+                    self.pen.flags.dim = false;
+                }
                 23 => self.pen.flags.italic = false,
                 24 => self.pen.flags.underline_style = UnderlineStyle::None,
+                25 => {
+                    // "Blink off" cancels both the slow (5) and rapid (6) rates.
+                    self.pen.flags.blink = false;
+                    self.pen.flags.rapid_blink = false;
+                }
                 27 => self.pen.flags.inverse = false,
+                28 => self.pen.flags.conceal = false,
                 29 => self.pen.flags.strikeout = false,
                 30..=37 => self.pen.fg = Color::Indexed((codes[i] - 30) as u8),
                 40..=47 => self.pen.bg = Color::Indexed((codes[i] - 40) as u8),
@@ -1310,6 +1325,8 @@ impl Screen {
                         self.pen.underline_color = Some(color);
                     }
                 }
+                53 => self.pen.flags.overline = true,
+                55 => self.pen.flags.overline = false,
                 59 => self.pen.underline_color = None,
                 38 | 48 => {
                     let target_is_fg = codes[i] == 38;

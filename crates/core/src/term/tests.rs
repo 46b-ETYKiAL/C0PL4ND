@@ -3492,6 +3492,84 @@ fn rep_with_no_prior_print_is_noop() {
 
 // ---- SGR attribute combinations + reset arms ----
 
+/// SGR 2/5/6/8/53 previously fell into the parser's catch-all `_ => {}` arm and
+/// were silently dropped. Each must now land on its own flag, and each must have
+/// its own reset arm (22 dim, 25 blink, 28 conceal, 55 overline).
+#[test]
+fn sgr_dim_blink_conceal_overline_are_parsed_and_reset() {
+    let mut t = Terminal::new(2, 40);
+    t.advance(b"\x1b[2;5;6;8;53mX");
+    let c = t.grid().cell(0, 0).unwrap();
+    assert!(c.flags.dim, "SGR 2 -> dim");
+    assert!(c.flags.blink, "SGR 5 -> blink");
+    assert!(c.flags.rapid_blink, "SGR 6 -> rapid blink");
+    assert!(c.flags.conceal, "SGR 8 -> conceal");
+    assert!(c.flags.overline, "SGR 53 -> overline");
+
+    // 25 cancels BOTH blink rates; 28 conceal-off; 55 overline-off.
+    t.advance(b"\x1b[25;28;55mY");
+    let c = t.grid().cell(0, 1).unwrap();
+    assert!(!c.flags.blink, "SGR 25 clears slow blink");
+    assert!(!c.flags.rapid_blink, "SGR 25 also clears rapid blink");
+    assert!(!c.flags.conceal, "SGR 28 clears conceal");
+    assert!(!c.flags.overline, "SGR 55 clears overline");
+    assert!(c.flags.dim, "SGR 25/28/55 must not touch dim");
+}
+
+/// ECMA-48 SGR 22 is "normal intensity": it cancels BOTH bold (1) and faint (2).
+/// There is no separate dim-off code, so a 22 that only cleared bold would leave
+/// text permanently dim.
+#[test]
+fn sgr_22_cancels_both_bold_and_dim() {
+    let mut t = Terminal::new(2, 40);
+    t.advance(b"\x1b[1;2mA");
+    let c = t.grid().cell(0, 0).unwrap();
+    assert!(c.flags.bold && c.flags.dim);
+    t.advance(b"\x1b[22mB");
+    let c = t.grid().cell(0, 1).unwrap();
+    assert!(!c.flags.bold, "SGR 22 clears bold");
+    assert!(!c.flags.dim, "SGR 22 also clears dim");
+}
+
+/// SGR 0 must clear the newly-parsed attributes too — a reset that only knew
+/// about the old flag set would leak dim/blink/conceal/overline forever.
+#[test]
+fn sgr_0_clears_the_extended_attributes() {
+    let mut t = Terminal::new(2, 40);
+    t.advance(b"\x1b[2;5;6;8;53mA\x1b[0mB");
+    let c = t.grid().cell(0, 1).unwrap();
+    assert!(!c.flags.dim && !c.flags.blink && !c.flags.rapid_blink);
+    assert!(!c.flags.conceal && !c.flags.overline);
+}
+
+/// SGR 39/49 must restore the TAGGED `Color::Default` — not palette slot 7/0.
+/// Storing a resolved index here would break live theme switching and would
+/// paint "default" text as ANSI white.
+#[test]
+fn sgr_39_and_49_restore_tagged_default_not_palette_slots() {
+    let mut t = Terminal::new(2, 40);
+    t.advance(b"\x1b[37;40mA"); // explicitly white-on-black from the palette
+    let c = t.grid().cell(0, 0).unwrap();
+    assert_eq!(c.fg, Color::Indexed(7));
+    assert_eq!(c.bg, Color::Indexed(0));
+    t.advance(b"\x1b[39;49mB");
+    let c = t.grid().cell(0, 1).unwrap();
+    assert_eq!(c.fg, Color::Default, "39 must be Default, never Indexed(7)");
+    assert_eq!(c.bg, Color::Default, "49 must be Default, never Indexed(0)");
+}
+
+/// The 256-colour operand must survive the parser as a TAGGED index all the way
+/// into the cell, so the theme (not the parser) owns resolution.
+#[test]
+fn sgr_extended_index_reaches_the_cell_untagged_by_the_parser() {
+    let mut t = Terminal::new(2, 40);
+    t.advance(b"\x1b[38;5;208mO");
+    assert_eq!(t.grid().cell(0, 0).unwrap().fg, Color::Indexed(208));
+    // And it resolves to the canonical xterm orange through the theme.
+    let theme = crate::theme::Theme::builtin_void();
+    assert_eq!(theme.ansi(208), (255, 135, 0));
+}
+
 #[test]
 fn sgr_all_attributes_and_individual_resets() {
     let mut t = Terminal::new(2, 30);

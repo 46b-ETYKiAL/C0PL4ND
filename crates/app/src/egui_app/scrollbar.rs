@@ -80,14 +80,21 @@ pub(crate) fn thumb_height(m: &ScrollMetrics, track_h: f32) -> f32 {
     raw.clamp(MIN_THUMB.min(track_h), track_h)
 }
 
-/// The thumb rect within `track`: top at `window_start/total` of the track,
-/// clamped so the thumb always stays inside the track.
+/// The thumb rect within `track`. The thumb TOP is positioned over its TRAVEL
+/// range (`track_height − thumb_height`) by the fraction-scrolled-back, so it is
+/// the EXACT inverse of [`view_offset_for_pointer_y`]: fully scrolled up
+/// (`view_offset == scrollback_len`) → track top; live (`view_offset == 0`) →
+/// track bottom. Using the travel range rather than the full track height is what
+/// keeps the thumb sitting under the pointer during a drag even when the thumb is
+/// floored to `MIN_THUMB` on a long scrollback (the imperfect-tracking nit the
+/// earlier full-track positioning left).
 pub(crate) fn thumb_rect(m: &ScrollMetrics, track: egui::Rect) -> egui::Rect {
     let h = thumb_height(m, track.height());
-    let total = m.total().max(1) as f32;
-    let top_frac = m.window_start() as f32 / total;
-    let top = (track.top() + top_frac * track.height())
-        .clamp(track.top(), (track.bottom() - h).max(track.top()));
+    let denom = m.scrollback_len.max(1) as f32;
+    let scrolled_back = m.scrollback_len - m.view_offset.min(m.scrollback_len);
+    let frac = (scrolled_back as f32 / denom).clamp(0.0, 1.0);
+    let travel = (track.height() - h).max(0.0);
+    let top = track.top() + frac * travel;
     egui::Rect::from_min_size(egui::pos2(track.left(), top), egui::vec2(track.width(), h))
 }
 
@@ -106,16 +113,16 @@ pub(crate) fn view_offset_for_pointer_y(
     let h = thumb_height(m, track.height());
     let top = (pointer_y - h * 0.5).clamp(track.top(), (track.bottom() - h).max(track.top()));
     // Normalize by the thumb's actual TRAVEL range (track height minus the thumb's
-    // own height), not the full track height. The thumb TOP can only move over
+    // own height), not the full track height — the thumb TOP can only move over
     // `track.height() - h`, so dividing by the full height meant the pointer could
-    // never reach frac == 1.0 — dragging to the very bottom left a residual offset
-    // instead of following live output (offset 0). Guard the degenerate case where
-    // the thumb fills the track (nothing to scroll → offset 0).
+    // never reach frac == 1.0 (dragging to the very bottom left a residual offset
+    // instead of following live output). `frac` is the fraction SCROLLED BACK, over
+    // `scrollback_len` — the exact inverse of `thumb_rect`. Guard the degenerate
+    // case where the thumb fills the track (nothing to scroll → offset 0).
     let travel = (track.height() - h).max(f32::EPSILON);
     let frac = ((top - track.top()) / travel).clamp(0.0, 1.0);
-    let total = m.total().max(1) as f32;
-    let window_start = ((frac * total).round() as usize).min(m.scrollback_len);
-    m.scrollback_len - window_start
+    let scrolled_back = (frac * m.scrollback_len as f32).round() as usize;
+    m.scrollback_len - scrolled_back.min(m.scrollback_len)
 }
 
 /// The track y (screen points) of an absolute content line — where a mark sits.
@@ -311,6 +318,48 @@ mod tests {
             mid > 0 && mid < 300,
             "mid-track maps to a mid offset: {mid}"
         );
+    }
+
+    /// `thumb_rect` and `view_offset_for_pointer_y` must be inverses: dropping the
+    /// pointer on the CENTRE of the thumb drawn for an offset must recover that
+    /// same offset. This is what makes the thumb sit under the pointer during a
+    /// drag; the earlier full-track positioning failed it in the floored-thumb
+    /// regime (a long scrollback where the thumb is clamped to MIN_THUMB).
+    #[test]
+    fn thumb_and_pointer_map_are_inverses_including_floored_thumb() {
+        let t = track(); // 200 px tall
+        for &(scrollback_len, rows) in &[(300usize, 40usize), (100_000, 40), (40, 40)] {
+            for &offset in &[
+                0usize,
+                1,
+                rows,
+                scrollback_len / 3,
+                scrollback_len - 1,
+                scrollback_len,
+            ] {
+                if offset > scrollback_len {
+                    continue;
+                }
+                let m = ScrollMetrics {
+                    scrollback_len,
+                    view_offset: offset,
+                    rows,
+                };
+                let thumb = thumb_rect(&m, t);
+                let recovered = view_offset_for_pointer_y(&m, t, thumb.center().y);
+                // Rounding through pixel space costs at most one scrollback line
+                // per track pixel; assert it round-trips within that tolerance.
+                let tol = (scrollback_len as f32 / (t.height() - thumb.height()).max(1.0)).ceil()
+                    as usize
+                    + 1;
+                let diff = recovered.abs_diff(offset);
+                assert!(
+                    diff <= tol,
+                    "offset {offset} (sb={scrollback_len}, rows={rows}) recovered as \
+                     {recovered} (diff {diff} > tol {tol})"
+                );
+            }
+        }
     }
 
     #[test]

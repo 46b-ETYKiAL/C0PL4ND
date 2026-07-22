@@ -58,6 +58,9 @@ pub struct RunStyle {
     pub underline_color: Option<(u8, u8, u8)>,
     /// SGR `9` — crossed-out.
     pub strikeout: bool,
+    /// SGR `53` — a line ABOVE the cell (overline). Parsed into `CellFlags` but
+    /// previously dropped at this boundary, so `\e[53m` had no visible effect.
+    pub overline: bool,
 }
 
 impl RunStyle {
@@ -72,13 +75,16 @@ impl RunStyle {
             underline: c0pl4nd_core::grid::UnderlineStyle::None,
             underline_color: None,
             strikeout: false,
+            overline: false,
         }
     }
 
-    /// Whether this run draws any line decoration (underline / strikeout), i.e.
-    /// whether the renderer's decoration pass has anything to do for it.
+    /// Whether this run draws any line decoration (underline / strikeout /
+    /// overline), i.e. whether the renderer's decoration pass has anything to do.
     pub fn has_decoration(&self) -> bool {
-        self.strikeout || self.underline != c0pl4nd_core::grid::UnderlineStyle::None
+        self.strikeout
+            || self.overline
+            || self.underline != c0pl4nd_core::grid::UnderlineStyle::None
     }
 }
 
@@ -1295,6 +1301,7 @@ impl PaneTerm {
                         .underline_color
                         .map(|c| self.theme.resolve_color(c, fg)),
                     strikeout: cell.flags.strikeout,
+                    overline: cell.flags.overline,
                 }
             });
             // BiDi (F3-2): reorder this row's logical-order runs into VISUAL
@@ -1387,6 +1394,53 @@ mod tests {
 
     fn void_theme() -> Theme {
         Theme::builtin_void()
+    }
+
+    /// SGR 53 (overline) must reach the renderer's decoration pass. `has_decoration`
+    /// is the gate that pass consults per span, so an overline-only run MUST report
+    /// `true` — otherwise the pass skips it and `\e[53m` stays invisible (the exact
+    /// dormancy this wires: the flag was parsed into `CellFlags` but dropped here).
+    #[test]
+    fn overline_only_run_reports_a_decoration() {
+        let mut s = RunStyle::plain((200, 200, 200));
+        assert!(!s.has_decoration(), "a plain run has nothing to decorate");
+        s.overline = true;
+        assert!(
+            s.has_decoration(),
+            "an overline-only run must be decorated, or the paint pass skips it"
+        );
+    }
+
+    /// The cell → RunStyle mapping must carry `CellFlags::overline` through, not
+    /// drop it. Builds a real overline cell and asserts the run it produces is
+    /// overlined — would fail if the build site forgot the field.
+    #[test]
+    fn cell_overline_flag_reaches_the_run_style() {
+        use c0pl4nd_core::Cell;
+        let mut cell = Cell {
+            c: 'x',
+            ..Cell::default()
+        };
+        cell.flags.overline = true;
+        let theme = void_theme();
+        let (fg, bg) = theme.cell_colors(&cell, (255, 255, 255), (0, 0, 0));
+        // The same construction the render path uses (kept in sync with the
+        // `grid_rows` build site).
+        let style = RunStyle {
+            fg,
+            bg,
+            bold: cell.flags.bold,
+            italic: cell.flags.italic,
+            underline: cell.flags.underline_style,
+            underline_color: None,
+            strikeout: cell.flags.strikeout,
+            overline: cell.flags.overline,
+        };
+        assert!(
+            style.overline,
+            "the overline flag was dropped building the run"
+        );
+        assert!(style.has_decoration());
     }
 
     #[test]

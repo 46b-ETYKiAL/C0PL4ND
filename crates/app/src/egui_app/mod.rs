@@ -5746,6 +5746,20 @@ fn paint_grid_native(
                     egui::Color32::from_rgb(fg.0, fg.1, fg.2),
                 );
             }
+            if span.style.overline {
+                // SGR 53: a line along the TOP of the cell, in the TEXT colour
+                // (like strikeout, the custom SGR-58 colour is underline-scoped).
+                let fg = span.style.fg;
+                let y = snap_to_physical(row_y, ppp);
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0, y),
+                        egui::pos2(x1, y + thickness.max(1.0 / ppp.max(0.01))),
+                    ),
+                    0.0,
+                    egui::Color32::from_rgb(fg.0, fg.1, fg.2),
+                );
+            }
         }
     }
 

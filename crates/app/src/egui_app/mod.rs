@@ -46,6 +46,7 @@ mod theme;
 pub(crate) use crt::*;
 pub(crate) use motion_fx::*;
 mod grid_interaction;
+mod scrollbar;
 pub(crate) use grid_interaction::*;
 mod config_load;
 pub(crate) use config_load::*;
@@ -1870,11 +1871,95 @@ impl C0pl4ndApp {
             }
         }
 
+        // --- right-side scrollbar (overlay; auto-hides when everything fits) ---
+        // The terminal grid is custom-painted (no `egui::ScrollArea`), so the bar
+        // owns its rect + hit-testing. It reflects the scrollback position and
+        // viewport size, is draggable to scrub, click-in-trough pages, and marks
+        // the focused pane's search hits. Painted LAST so it sits over the grid.
+        let mut scrollbar_grabbed = false;
+        {
+            let (scrollback_len, view_offset, rows) = terms
+                .get(&pane_id)
+                .map(|t| (t.scrollback_len(), t.view_offset(), t.size().1 as usize))
+                .unwrap_or((0, 0, 0));
+            let metrics = scrollbar::ScrollMetrics {
+                scrollback_len,
+                view_offset,
+                rows,
+            };
+            if metrics.scrollable() {
+                let track = scrollbar::track_rect(rect);
+                let sb_resp = ui.interact(
+                    track,
+                    egui::Id::new(("c0pl4nd_scrollbar", pane_id.raw())),
+                    egui::Sense::click_and_drag(),
+                );
+                // Grabbing the bar must NOT also start an egui_tiles pane-rearrange.
+                scrollbar_grabbed = sb_resp.dragged() || sb_resp.drag_started();
+                let thumb = scrollbar::thumb_rect(&metrics, track);
+                // A drag scrubs (thumb centres on the pointer); a trough click
+                // above/below the thumb pages by a viewport.
+                let mut target: Option<usize> = None;
+                if sb_resp.dragged() {
+                    if let Some(p) = sb_resp.interact_pointer_pos() {
+                        target = Some(scrollbar::view_offset_for_pointer_y(&metrics, track, p.y));
+                    }
+                } else if sb_resp.clicked() {
+                    if let Some(p) = sb_resp.interact_pointer_pos() {
+                        if p.y < thumb.top() {
+                            target = Some((view_offset + rows).min(scrollback_len));
+                        } else if p.y > thumb.bottom() {
+                            target = Some(view_offset.saturating_sub(rows));
+                        }
+                    }
+                }
+                if let Some(off) = target {
+                    if let Some(t) = terms.get_mut(&pane_id) {
+                        // `scroll_view(+n)` goes BACK into history (more offset).
+                        let delta = off as i32 - view_offset as i32;
+                        if delta != 0 {
+                            t.scroll_view(delta);
+                        }
+                    }
+                    // The mutated view repaints next frame — request it so a click
+                    // (which does not hold the pointer) still redraws immediately.
+                    ui.ctx().request_repaint();
+                }
+                // Marks: the focused pane's search hits, mapped from their visible
+                // display row to an absolute content line via `window_start`.
+                let mut marks: Vec<scrollbar::ScrollMark> = Vec::new();
+                if let Some(hl) = search {
+                    let ws = metrics.window_start();
+                    let last = metrics.total().saturating_sub(1);
+                    for (i, span) in hl.spans.iter().enumerate() {
+                        marks.push(scrollbar::ScrollMark {
+                            abs_line: (ws + span.line).min(last),
+                            selected: i == hl.selected,
+                        });
+                    }
+                }
+                let cursor_color = c0pl4nd_core::theme::parse_hex(&theme.cursor)
+                    .map(|(r, g, b)| egui::Color32::from_rgb(r, g, b))
+                    .unwrap_or(pane_colors.accent);
+                let active = sb_resp.hovered() || sb_resp.dragged();
+                scrollbar::paint(
+                    &painter,
+                    track,
+                    &metrics,
+                    &pane_colors,
+                    cursor_color,
+                    active,
+                    &marks,
+                );
+            }
+        }
+
         PaneBodyOutcome {
             // A body-drag normally tells egui_tiles to REARRANGE the pane. When a
             // program grabbed the mouse and we reported the drag to its PTY, the
             // gesture belongs to the program — never rearrange panes underneath it.
-            drag_started: resp.drag_started() && !mouse_captured,
+            // A scrollbar grab is likewise NOT a pane-rearrange.
+            drag_started: resp.drag_started() && !mouse_captured && !scrollbar_grabbed,
             clicked: resp.clicked(),
             size: rect.size(),
             opened_url,
@@ -3710,23 +3795,13 @@ impl C0pl4ndApp {
         if self.live_window {
             self.wire_pane_wakes(ctx);
         }
-        // Live font apply: when the user changes the Family (or a Fallback) in
-        // settings, the configured font stack changed since the last install —
-        // re-install it THIS frame so the new typeface shows without a relaunch.
-        // The `applied_font_family` key folds the family + fallbacks into one
-        // string so the (expensive) re-install runs ONLY on an actual change,
-        // never every frame. A re-install changes the font atlas, so the cached
-        // galleys (which reference the old atlas) must be dropped (audit #2).
-        else {
-            let want = font_apply_key(&self.config.font);
-            if want != self.applied_font_family {
-                install_chrome_fonts(ctx, &self.config.font);
-                self.applied_font_family = want;
-                self.galley_cache.clear();
-                // A settings re-install supersedes any in-flight startup load.
-                self.pending_fonts = None;
-            }
-        }
+        // Live font apply runs in BOTH the live window AND headless — it must NOT
+        // be gated on `live_window`. Previously this lived in the `else` of the
+        // `if self.live_window` above, so a Family/Fallback change was INERT in the
+        // real window (`live_window == true` took the `wire_pane_wakes` arm and
+        // never the font apply); only headless tests ever exercised it. That made
+        // the font dropdown a no-op in production. It is now an unconditional call.
+        self.apply_live_font_change(ctx);
         // Off-thread startup font load (audit #3): when the worker thread that
         // enumerated the system font DB has finished, swap in the custom stack.
         // Until then the window painted with the built-in mono. `try_recv` is
@@ -4808,6 +4883,29 @@ impl C0pl4ndApp {
                 let ctx = ctx.clone();
                 std::sync::Arc::new(move || ctx.request_repaint())
             });
+        }
+    }
+
+    /// Re-install the configured font stack when the user changes the Family (or a
+    /// Fallback) in settings, so the new typeface shows THIS frame without a
+    /// relaunch. The `applied_font_family` key folds the family + fallbacks into
+    /// one string so the (expensive) re-install runs ONLY on an actual change,
+    /// never every frame. A re-install changes the font atlas, so the cached
+    /// galleys (which reference the old atlas) must be dropped (audit #2).
+    ///
+    /// This MUST run in both the live window AND headless: it previously lived in
+    /// the `else` of `if self.live_window`, so in the real window the
+    /// `live_window == true` arm took `wire_pane_wakes` and the font apply never
+    /// ran — the font dropdown was a silent no-op in production, exercised only by
+    /// headless tests. It is now called unconditionally.
+    fn apply_live_font_change(&mut self, ctx: &egui::Context) {
+        let want = font_apply_key(&self.config.font);
+        if want != self.applied_font_family {
+            install_chrome_fonts(ctx, &self.config.font);
+            self.applied_font_family = want;
+            self.galley_cache.clear();
+            // A settings re-install supersedes any in-flight startup load.
+            self.pending_fonts = None;
         }
     }
 

@@ -29,6 +29,15 @@ mod panic_hook;
 #[path = "update/mod.rs"]
 mod update;
 
+// Additive Win32 caption subclass for the Windows 11 Snap Layouts flyout. It
+// lives physically under `egui_app/` (a sibling of the lib-owned chrome modules)
+// but is a BINARY-local module of the shipping `c0pl4nd` binary — declared here,
+// compiled only into egui_main, never into the `#[path]`-included kittest lib
+// harnesses (which have no real HWND). It quarantines the raw Win32 FFI behind its
+// own `#![allow(unsafe_code)]`, so this binary's `#![deny(unsafe_code)]` holds.
+#[path = "egui_app/win_chrome.rs"]
+mod win_chrome;
+
 // The egui shell lives in this crate's lib target so `tests/` links THIS
 // compilation instead of `#[path]`-including a private second copy — which made
 // llvm-cov attribute the kittest suites' coverage to an object the report never
@@ -238,6 +247,27 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             let app = egui_app::C0pl4ndApp::new(cc);
+            // Windows 11 Snap Layouts: prime the additive `win_chrome` caption
+            // subclass with the REAL eframe HWND (same handle `caption_close` /
+            // `win_foreground` use), then drive its per-frame maximize-button-rect
+            // publish + one-shot subclass install from a begin-pass hook. The hook
+            // runs every pass on the winit/main thread; `win_chrome::tick` reads the
+            // live `content_rect()` + `pixels_per_point()` so the published rect
+            // tracks window resize and DPI. Additive over winit's frame; a no-op off
+            // Windows and when `C0PL4ND_DISABLE_SNAP_CHROME` is set.
+            #[cfg(windows)]
+            {
+                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                if let Ok(handle) = cc.window_handle() {
+                    if let RawWindowHandle::Win32(w) = handle.as_raw() {
+                        win_chrome::prime_hwnd(w.hwnd.get());
+                    }
+                }
+            }
+            cc.egui_ctx.on_begin_pass(
+                "win_chrome_snap_layouts",
+                std::sync::Arc::new(|ui: &mut egui::Ui| win_chrome::tick(ui.ctx())),
+            );
             // On-launch update check. Drives the SHARED in-app updater that powers
             // the persistent, dismissible NOTIFICATION BANNER (and the Settings →
             // Updates page): a found update surfaces a one-click "Update now" strip
@@ -617,6 +647,36 @@ fn load_app_icon() -> Option<egui::IconData> {
 #[cfg(test)]
 mod tests {
     use super::resolve_power_preference;
+
+    /// Reachability + correctness guard for the `win_chrome` Snap-Layouts wiring.
+    ///
+    /// `main` registers a begin-pass hook (`cc.egui_ctx.on_begin_pass(...)`) whose
+    /// body is `win_chrome::tick(ui.ctx())`, and `tick` calls
+    /// `win_chrome::publish_from_geometry(content_right, ppp)`. This test drives
+    /// that EXACT published-rect function (the one the shipping binary calls every
+    /// frame) and asserts it produces the maximize-button rect the un-editable
+    /// `chrome.rs` caption cluster paints — so the module is proven reachable from
+    /// egui_main and geometrically correct, not merely defined. The compiled live
+    /// call site above (plus `-D warnings` dead-code) is the wiring; this is its
+    /// behavioural assertion.
+    #[test]
+    fn win_chrome_publish_is_wired_and_matches_the_caption_layout() {
+        crate::win_chrome::publish_from_geometry(1100.0, 1.0);
+        let r = crate::win_chrome::published_rect()
+            .expect("the shipping-path publish must produce a non-empty maximize rect");
+        // right_edge = 1100 - 8 = 1092; maximize right = 1092 - 44 = 1048; left 1006.
+        assert_eq!(
+            (r.left, r.right),
+            (1006, 1048),
+            "maximize-button x mirrors chrome.rs"
+        );
+        // titlebar 40px, button 28px tall, centred → top 6, bottom 34.
+        assert_eq!(
+            (r.top, r.bottom),
+            (6, 34),
+            "maximize-button y mirrors chrome.rs"
+        );
+    }
 
     #[test]
     fn gpu_preference_maps_and_env_wins() {

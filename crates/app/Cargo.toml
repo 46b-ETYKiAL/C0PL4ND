@@ -165,6 +165,7 @@ windows = { version = "0.62", features = [
     "Win32_System_LibraryLoader", # SetDefaultDllDirectories / SetDllDirectoryW — DLL-planting defence
     "Win32_System_JobObjects",    # KILL_ON_JOB_CLOSE — kill every PTY child on app exit (no orphans)
     "Win32_System_Threading",     # OpenProcess — resolve a child PID to a handle to assign to the job
-    "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse", # TrackMouseEvent — WM_NCMOUSELEAVE hover tracking for the Snap-Layouts caption subclass
+    "Win32_UI_Shell",             # SetWindowSubclass / DefSubclassProc — the additive win_chrome caption subclass
     "Win32_UI_WindowsAndMessaging",
 ] }

@@ -136,21 +136,27 @@ fn main() -> eframe::Result<()> {
         // `ViewportCommand::Focus` and, on Windows 11 (foreground-lock), runs the
         // `win_foreground` AttachThreadInput nudge ONCE on the first frame as a
         // backstop (see `egui_app::win_foreground`).
-        .with_active(true)
-        // Suppress the native min/max caption buttons at CREATION. winit leaves
-        // WS_MINIMIZEBOX | WS_MAXIMIZEBOX set on an undecorated window (winit
-        // #2754), and Win11 DWM draws native min/max caption buttons from those
-        // style bits — which, once a translucent backdrop (mica/acrylic) is
-        // applied, composite THROUGH as a second, offset set over our own custom
-        // titlebar (the reported "doubled caption buttons"). Clearing the bits at
-        // creation stops winit from ever setting them, so DWM draws no native
-        // min/max buttons — with ZERO runtime style manipulation (a runtime
-        // SetWindowLongPtr/SWP_FRAMECHANGED fights winit's frameless composition
-        // and repaints a stray native frame). WS_SYSMENU is left intact, so
-        // Alt+F4, the taskbar right-click Close, and the window system menu all
-        // keep working; our own titlebar draws the min/max/close the user clicks.
-        .with_minimize_button(false)
-        .with_maximize_button(false);
+        .with_active(true);
+    // RESTORE the native minimize/maximize STYLE BITS (do NOT clear them at
+    // creation). egui-winit maps the min/max "enabled buttons" to
+    // WS_MINIMIZEBOX | WS_MAXIMIZEBOX on the (undecorated) window, and Windows
+    // gates ALL of Aero Snap on those bits: WS_MAXIMIZEBOX gates
+    // drag-to-top-maximize, drag-to-edge, Win+Left/Right/Up, Snap Assist AND the
+    // Windows 11 Snap Layouts flyout; WS_MINIMIZEBOX gates Win+Down and the
+    // taskbar minimize/restore animation. An earlier revision cleared both bits at
+    // creation (`.with_minimize_button(false)` / `.with_maximize_button(false)`) to
+    // stop DWM compositing a second native min/max set over the custom titlebar —
+    // but that ALSO disabled every snap gesture (the reported "drag-to-top doesn't
+    // maximize, no Snap Layouts"). winit 0.30.13 already hides the native
+    // non-client frame via a `WM_NCCALCSIZE`-returns-0 handler on the undecorated
+    // window, so keeping the style bits SET restores snap WITHOUT re-admitting a
+    // doubled native frame (real-Win11 verification of the transparent-window case
+    // is noted in `win_chrome`). The Win11 Snap Layouts FLYOUT additionally needs a
+    // `WM_NCHITTEST` -> `HTMAXBUTTON` reply over the maximize button; that is added
+    // by the additive `win_chrome` Win32 subclass (see the `win_chrome` module),
+    // which layers on top of winit's frame and never touches WM_NCCALCSIZE.
+    // (WS_SYSMENU's residual native close "x" is still stripped per-frame by
+    // `egui_app::caption_close`; that is orthogonal to these snap bits.)
     // Runtime window + taskbar icon (the sigil). The exe's embedded icon
     // resource (build.rs) covers the Start-menu shortcut / Explorer /
     // Add-Remove-Programs; this covers the live window. Best-effort — a decode

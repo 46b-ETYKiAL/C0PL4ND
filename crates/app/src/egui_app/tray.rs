@@ -48,24 +48,66 @@ const MENU_HIDE_ID: &str = "c0pl4nd.tray.hide";
 const MENU_QUIT_ID: &str = "c0pl4nd.tray.quit";
 
 /// What a single tray LEFT-click should do, given whether the window is
-/// currently hidden or minimized.
+/// currently hidden or minimized and whether minimize-to-tray is enabled.
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ToggleAction {
     /// The window is out of view (minimized or tray-hidden) → bring it back.
     Restore,
-    /// The window is visible → send it to the taskbar.
+    /// The window is visible → send it to the taskbar (normal minimize).
     Minimize,
+    /// The window is visible and minimize-to-tray is on → hide it to the tray.
+    HideToTray,
 }
 
-/// The toggle decision: restore when the window is out of view, else minimize.
+/// The toggle decision: restore when the window is out of view; otherwise
+/// hide-to-tray when that preference is enabled, else a normal taskbar minimize.
 #[cfg(any(windows, test))]
 #[must_use]
-pub fn toggle_action(is_hidden_or_minimized: bool) -> ToggleAction {
+pub fn toggle_action(is_hidden_or_minimized: bool, minimize_to_tray: bool) -> ToggleAction {
     if is_hidden_or_minimized {
         ToggleAction::Restore
+    } else if minimize_to_tray {
+        ToggleAction::HideToTray
     } else {
         ToggleAction::Minimize
+    }
+}
+
+/// What the OS-driven minimize (`WM_SIZE`/`SIZE_MINIMIZED`) or close (`WM_CLOSE`)
+/// message should do when intercepted by the window subclass.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SysAction {
+    /// Let the default window procedure handle it (normal minimize / close).
+    PassThrough,
+    /// Divert to the tray: hide the window instead.
+    HideToTray,
+}
+
+/// Minimize-to-tray decision for an intercepted minimize: hide to tray only when
+/// the (default-OFF) preference is enabled, otherwise pass through to a normal
+/// taskbar minimize.
+#[cfg(any(windows, test))]
+#[must_use]
+pub fn on_sys_minimize(minimize_to_tray: bool) -> SysAction {
+    if minimize_to_tray {
+        SysAction::HideToTray
+    } else {
+        SysAction::PassThrough
+    }
+}
+
+/// Close-to-tray decision for an intercepted OS close: hide to tray only when the
+/// (default-OFF) preference is enabled, otherwise pass through to the normal
+/// close path (which runs the graceful shutdown).
+#[cfg(any(windows, test))]
+#[must_use]
+pub fn on_sys_close(close_to_tray: bool) -> SysAction {
+    if close_to_tray {
+        SysAction::HideToTray
+    } else {
+        SysAction::PassThrough
     }
 }
 
@@ -119,13 +161,40 @@ pub fn prime_hwnd(hwnd: isize) {
 ///
 /// Call this AFTER the window exists (from the eframe creation closure) and after
 /// [`prime_hwnd`], on the event-loop thread.
-pub fn init(ctx: &eframe::egui::Context, icon_rgba: Vec<u8>, width: u32, height: u32) {
+///
+/// `minimize_to_tray` / `close_to_tray` are the minimize-to-tray and
+/// close-to-tray preferences. Both ship **DEFAULT-OFF** (hiding a user's window
+/// on minimize/close is more surprising than no feature); these two parameters
+/// are the seam a future `c0pl4nd-core::Config` key flips.
+pub fn init(
+    ctx: &eframe::egui::Context,
+    icon_rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    minimize_to_tray: bool,
+    close_to_tray: bool,
+) {
     #[cfg(windows)]
-    imp::init(ctx, icon_rgba, width, height);
+    imp::init(ctx, icon_rgba, width, height, minimize_to_tray, close_to_tray);
     #[cfg(not(windows))]
     {
-        let _ = (ctx, icon_rgba, width, height);
+        let _ = (ctx, icon_rgba, width, height, minimize_to_tray, close_to_tray);
     }
+}
+
+/// Per-frame tick (from `egui_main`'s begin-pass hook): install the
+/// minimize/close-to-tray window subclass exactly once, on the first frame the
+/// real window is ready. The subclass is pure PASS-THROUGH while both
+/// preferences are off (the default), so this is inert until a future config
+/// flips a flag. A no-op off Windows.
+pub fn tick(ctx: &eframe::egui::Context) {
+    #[cfg(windows)]
+    {
+        let _ = ctx;
+        imp::ensure_subclassed();
+    }
+    #[cfg(not(windows))]
+    let _ = ctx;
 }
 
 // ---------------------------------------------------------------------------

@@ -158,6 +158,18 @@ winresource = "=0.1.31"
 # D4 (Windows-only): Win32 custom-frame Aero Snap on the frameless window.
 # Used solely by the `#[cfg(windows)]` `win_snap` module; not linked elsewhere.
 [target.'cfg(windows)'.dependencies]
+# System-tray icon (Windows). `tray-icon` posts click/menu events that are
+# pumped through winit's existing message loop and delivered to a global handler
+# on the event-loop thread (so a tray click restores the window even while it is
+# minimized/hidden and egui has stopped repainting). `muda` is its context-menu
+# backend, re-exported by tray-icon as `tray_icon::menu` — pinned to the SAME
+# exact version tray-icon resolves so the two see one identical `Menu` type.
+# `default-features = false` drops the Linux gtk/libxdo backends; Windows uses
+# the modern `common-controls-v6` menu backend. Exact-pinned per
+# dependency-management.md (production). MIT/Apache-2.0, actively maintained
+# (tao/wry ecosystem, 20M+ downloads).
+tray-icon = { version = "=0.24.1", default-features = false, features = ["common-controls-v6"] }
+muda = { version = "=0.19.3", default-features = false, features = ["common-controls-v6"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

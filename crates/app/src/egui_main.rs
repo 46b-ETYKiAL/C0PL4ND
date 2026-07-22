@@ -38,6 +38,16 @@ mod update;
 #[path = "egui_app/win_chrome.rs"]
 mod win_chrome;
 
+// Additive system-tray icon (single-click minimize/restore + right-click menu).
+// A BINARY-local module of the shipping `c0pl4nd` binary, exactly like
+// `win_chrome`: it needs the real eframe HWND + the running winit event loop, so
+// it lives physically under `egui_app/` but is declared here and never compiled
+// into the `#[path]`-included kittest lib harnesses. Its raw Win32 FFI is
+// quarantined behind its own `#![allow(unsafe_code)]`, so this binary's
+// `#![deny(unsafe_code)]` holds.
+#[path = "egui_app/tray.rs"]
+mod tray;
+
 // The egui shell lives in this crate's lib target so `tests/` links THIS
 // compilation instead of `#[path]`-including a private second copy — which made
 // llvm-cov attribute the kittest suites' coverage to an object the report never
@@ -268,6 +278,27 @@ fn main() -> eframe::Result<()> {
                 "win_chrome_snap_layouts",
                 std::sync::Arc::new(|ui: &mut egui::Ui| win_chrome::tick(ui.ctx())),
             );
+            // System-tray icon. Created HERE — after the window exists and on the
+            // event-loop thread — so it can prime the real HWND (for
+            // minimize/restore) and register its click/menu handlers. A single
+            // LEFT click toggles minimize/restore; right click opens Show / Hide /
+            // Quit. Best-effort: `tray::init` never panics or blocks startup (a
+            // headless/session-0 shell simply gets no tray). The icon reuses the
+            // embedded sigil PNG (`load_app_icon`, re-decoded once). No-op off
+            // Windows. This is the tray's live creation call site — the wiring the
+            // whole feature depends on.
+            #[cfg(windows)]
+            {
+                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                if let Ok(handle) = cc.window_handle() {
+                    if let RawWindowHandle::Win32(w) = handle.as_raw() {
+                        tray::prime_hwnd(w.hwnd.get());
+                    }
+                }
+            }
+            if let Some(icon) = load_app_icon() {
+                tray::init(&cc.egui_ctx, icon.rgba, icon.width, icon.height);
+            }
             // On-launch update check. Drives the SHARED in-app updater that powers
             // the persistent, dismissible NOTIFICATION BANNER (and the Settings →
             // Updates page): a found update surfaces a one-click "Update now" strip

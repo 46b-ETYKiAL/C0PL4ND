@@ -57,9 +57,12 @@ mod caption_close;
 mod font_setup;
 mod win_foreground;
 pub(crate) use font_setup::*;
+mod actions;
 mod app_config;
 mod app_report_ui;
 mod app_search;
+
+pub use actions::{Action, PaletteEntry};
 
 use std::collections::{HashMap, HashSet};
 
@@ -179,13 +182,19 @@ pub struct C0pl4ndApp {
     /// Committed to `cmd_history` on Enter, reset on focus change. Best-effort:
     /// it models printable text + Backspace, not full shell line-editing.
     pub(crate) input_line: String,
-    /// A multi-line paste deferred for confirmation (paste-safety). When
-    /// `config.paste_warn_multiline` is on and a paste contains a newline, it is
-    /// parked here and a confirm overlay is shown instead of executing it
-    /// immediately (the embedded newline would otherwise run a command on land).
-    /// Enter in the overlay sends it (through the paste-injection guard); Esc
-    /// discards it.
+    /// A paste deferred for confirmation (paste-safety). Two gates park a paste
+    /// here instead of executing it immediately — a MULTI-LINE paste (whose
+    /// embedded newline would run a command the moment it lands) and an
+    /// oversized SINGLE-line paste (`config.paste_warn_bytes`, the flood /
+    /// hidden-tail half of the same footgun). The decision is
+    /// [`c0pl4nd_core::paste_guard::paste_confirm_reason`] so both halves share
+    /// one policy. Enter in the overlay sends it (through the paste-injection
+    /// guard); Esc discards it.
     pub(crate) pending_paste: Option<String>,
+    /// Which gate deferred [`Self::pending_paste`], so the confirm overlay can
+    /// explain the actual hazard rather than always claiming "multiple lines".
+    /// Set and cleared in lockstep with `pending_paste`.
+    pub(crate) pending_paste_reason: Option<c0pl4nd_core::paste_guard::PasteConfirmReason>,
     /// Incognito session: when `true`, NO typed commands are recorded into
     /// command history (regardless of `config.history_capture_enabled`). Runtime
     /// only — never persisted, so it always starts off and resets each launch.
@@ -209,6 +218,13 @@ pub struct C0pl4ndApp {
     /// pattern as [`Self::last_window_cmd`] (the PTY write itself is not
     /// observable in the headless harness).
     pub(crate) last_palette_run: Option<String>,
+    /// The [`Action`] most recently dispatched FROM the command palette (Enter or
+    /// click). Set in [`Self::run_palette_selection`] so an interaction test can
+    /// assert that driving the REAL palette routed through the shared dispatch
+    /// path — the action's own effect (pane count, `settings_open`, font size …)
+    /// is asserted separately, so this is a routing witness, never the only
+    /// evidence.
+    pub(crate) last_palette_action: Option<Action>,
     /// The most recent URL a Ctrl-click opened (most-recent-wins), or `None` if
     /// none this session. Observable so an interaction test can assert that a
     /// Ctrl-click on a URL in the grid opened it — the OS-opener side effect
@@ -667,6 +683,7 @@ impl C0pl4ndApp {
             cmd_history: c0pl4nd_core::command_history::CommandHistory::default(),
             input_line: String::new(),
             pending_paste: None,
+            pending_paste_reason: None,
             incognito: false,
             palette_open: false,
             history_open: false,
@@ -674,6 +691,7 @@ impl C0pl4ndApp {
             palette_query: String::new(),
             palette_sel: 0,
             last_palette_run: None,
+            last_palette_action: None,
             last_opened_url: None,
             search_open: false,
             search_query: String::new(),
@@ -2159,14 +2177,18 @@ impl C0pl4ndApp {
 
         // Paste handling — SECURITY: every paste goes through the core paste-
         // injection guard (`PaneTerm::write_paste` → `Terminal::frame_paste`),
-        // NEVER raw `write_bytes`. A multi-line paste can execute the instant its
-        // embedded newline lands, so when `paste_warn_multiline` is on we DEFER a
-        // multi-line paste to a confirm overlay (`pending_paste`) instead of
-        // pasting immediately. The config read / `pending_paste` set / `terms`
-        // borrow are sequential statements so they never alias `self`.
+        // NEVER raw `write_bytes`. Two hazards DEFER a paste to the confirm
+        // overlay (`pending_paste`) instead of pasting immediately: a MULTI-LINE
+        // paste (it executes the instant its embedded newline lands) and an
+        // oversized SINGLE-line paste (`paste_warn_bytes` — a hidden-tail
+        // command or an accidental whole-file flood, which the newline gate
+        // cannot see). Both are decided by ONE core policy function so the two
+        // halves can never drift apart. The config read / `pending_paste` set /
+        // `terms` borrow are sequential statements so they never alias `self`.
         for s in &pastes {
-            if self.config.paste_warn_multiline && (s.contains('\n') || s.contains('\r')) {
+            if let Some(reason) = c0pl4nd_core::paste_guard::paste_confirm_reason(&self.config, s) {
                 self.pending_paste = Some(s.clone());
+                self.pending_paste_reason = Some(reason);
             } else if let Some(term) = self.terms.get_mut(&self.focused_pane) {
                 term.write_paste(s);
             }
@@ -2819,28 +2841,38 @@ impl C0pl4ndApp {
     // exact production path (the same observation-accessor discipline the other
     // public accessors above follow).
 
-    /// Whether a multi-line paste is currently awaiting confirmation. (Test /
-    /// observation API for the paste-safety overlay.)
+    /// Whether a paste is currently awaiting confirmation. (Test / observation
+    /// API for the paste-safety overlay.)
     #[allow(dead_code)]
     pub fn has_pending_paste(&self) -> bool {
         self.pending_paste.is_some()
     }
 
-    /// Send the deferred multi-line paste to the focused pane through the core
+    /// Which gate deferred the pending paste (multi-line vs oversized), or
+    /// `None` when nothing is pending. Observation API so a test can assert the
+    /// SIZE gate fired rather than merely that *something* was deferred.
+    #[allow(dead_code)]
+    pub fn pending_paste_reason(&self) -> Option<c0pl4nd_core::paste_guard::PasteConfirmReason> {
+        self.pending_paste_reason
+    }
+
+    /// Send the deferred paste to the focused pane through the core
     /// paste-injection guard, then clear it. Returns the text that was sent (for
     /// tests; `None` if nothing was pending). The OS side effect aside, this is
     /// the same path a non-deferred paste takes.
     pub fn confirm_pending_paste(&mut self) -> Option<String> {
         let text = self.pending_paste.take()?;
+        self.pending_paste_reason = None;
         if let Some(term) = self.terms.get_mut(&self.focused_pane) {
             term.write_paste(&text);
         }
         Some(text)
     }
 
-    /// Discard the deferred multi-line paste without sending it.
+    /// Discard the deferred paste without sending it.
     pub fn cancel_pending_paste(&mut self) {
         self.pending_paste = None;
+        self.pending_paste_reason = None;
     }
 
     /// Whether a just-typed line should be recorded in command history. PRIVACY:
@@ -2988,10 +3020,50 @@ impl C0pl4ndApp {
         }
     }
 
-    /// The palette's filtered results for the current query — every history entry
-    /// (most-recent-first) when the query is empty, fuzzy-filtered otherwise.
-    fn palette_results(&self) -> Vec<String> {
-        self.cmd_history.search(&self.palette_query)
+    /// The palette's filtered rows for the current query.
+    ///
+    /// The palette lists BOTH previously-run shell commands and the shell's own
+    /// [`Action`]s, so it can actually DO things (new tab, split, settings, font
+    /// size, theme-independent view flip …) rather than only re-run history:
+    ///
+    /// - a query starting with `>` filters to ACTIONS ONLY (the VS Code
+    ///   convention), so the action list is one keystroke away no matter how
+    ///   long the history is;
+    /// - otherwise the history matches come first (the palette's original job,
+    ///   most-recent-first / fuzzy-filtered) followed by the matching actions,
+    ///   so a fresh session with no history opens straight onto the actions.
+    fn palette_results(&self) -> Vec<PaletteEntry> {
+        if let Some(rest) = self.palette_query.trim_start().strip_prefix('>') {
+            return Self::matching_actions(rest.trim_start())
+                .into_iter()
+                .map(PaletteEntry::Action)
+                .collect();
+        }
+        let mut rows: Vec<PaletteEntry> = self
+            .cmd_history
+            .search(&self.palette_query)
+            .into_iter()
+            .map(PaletteEntry::History)
+            .collect();
+        rows.extend(
+            Self::matching_actions(&self.palette_query)
+                .into_iter()
+                .map(PaletteEntry::Action),
+        );
+        rows
+    }
+
+    /// The actions whose labels fuzzy-match `query`, best-scoring first with
+    /// declaration order as the stable tiebreak. An empty query scores every
+    /// action 0, so the list keeps [`Action::ALL`] order.
+    fn matching_actions(query: &str) -> Vec<Action> {
+        let mut scored: Vec<(i32, usize, Action)> = Action::ALL
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| c0pl4nd_core::fuzzy::score(a.label(), query).map(|s| (s, i, *a)))
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.into_iter().map(|(_, _, a)| a).collect()
     }
 
     /// Move the palette selection by `delta` rows, clamped to the result range.
@@ -3012,14 +3084,32 @@ impl C0pl4ndApp {
     /// move it to the front of the history, and close the palette. Returns the
     /// command run (for tests). Closes the palette with no command when the
     /// result set is empty.
-    fn run_palette_selection(&mut self) -> Option<String> {
-        let cmd = self.palette_results().get(self.palette_sel).cloned();
-        if let Some(ref c) = cmd {
-            self.run_command_in_focused(c);
-        }
-        self.last_palette_run = cmd.clone();
+    fn run_palette_selection(&mut self, ctx: &egui::Context) -> Option<String> {
+        let entry = self.palette_results().get(self.palette_sel).cloned();
+        let ran = match &entry {
+            Some(PaletteEntry::History(cmd)) => {
+                self.run_command_in_focused(cmd);
+                self.last_palette_run = Some(cmd.clone());
+                Some(cmd.clone())
+            }
+            Some(PaletteEntry::Action(action)) => {
+                // The SAME dispatch path the keybinding dispatcher uses — the
+                // palette is a second surface onto one action layer, never a
+                // second implementation of it.
+                self.dispatch_action(*action, ctx);
+                self.last_palette_run = None;
+                self.last_palette_action = Some(*action);
+                Some(action.label().to_string())
+            }
+            None => {
+                self.last_palette_run = None;
+                None
+            }
+        };
+        // Closing AFTER the dispatch means the "Command palette" action itself
+        // (which toggles the flag) still ends with the palette closed.
         self.palette_open = false;
-        cmd
+        ran
     }
 
     /// Write `cmd` followed by a carriage return (what the shell sees for Enter)
@@ -3282,6 +3372,24 @@ impl C0pl4ndApp {
         self.last_palette_run.clone()
     }
 
+    /// The action most recently dispatched from the palette, if any. Observation
+    /// accessor for the palette-dispatch interaction tests.
+    #[allow(dead_code)]
+    pub fn last_palette_action(&self) -> Option<Action> {
+        self.last_palette_action
+    }
+
+    /// The command-palette rows for the current query, as display strings.
+    /// Observation accessor for the interaction tests (asserts the `>` filter and
+    /// the history/action ordering through the real result builder).
+    #[allow(dead_code)]
+    pub fn palette_row_labels(&self) -> Vec<String> {
+        self.palette_results()
+            .iter()
+            .map(|e| e.display(&self.config.keybindings))
+            .collect()
+    }
+
     /// The most recent URL a Ctrl-click opened, or `None`. Observable accessor
     /// for the hyperlink interaction test.
     #[allow(dead_code)]
@@ -3370,6 +3478,12 @@ impl C0pl4ndApp {
         }
         let sel = self.palette_sel;
         let history_empty = self.cmd_history.is_empty();
+        // Render text is resolved BEFORE the window closure so the closure's
+        // `&mut palette_query` does not collide with the `keybindings` read.
+        let rows: Vec<String> = results
+            .iter()
+            .map(|e| e.display(&self.config.keybindings))
+            .collect();
         let query = &mut self.palette_query;
         let mut clicked: Option<usize> = None;
 
@@ -3381,16 +3495,16 @@ impl C0pl4ndApp {
             .show(ctx, |ui| {
                 let resp = ui.add(
                     egui::TextEdit::singleline(query)
-                        .hint_text("Search previously-run commands…")
+                        .hint_text("Search commands and actions — type > for actions only…")
                         .desired_width(f32::INFINITY),
                 );
                 // Keep the search box focused for the palette's whole lifetime so
                 // typed characters always populate the query, never the PTY.
                 resp.request_focus();
                 ui.separator();
-                if results.is_empty() {
+                if rows.is_empty() {
                     ui.weak(if history_empty {
-                        "No commands run yet — run something, then reopen with Ctrl+Shift+P."
+                        "No matches — type > to list every action."
                     } else {
                         "No matches."
                     });
@@ -3399,22 +3513,22 @@ impl C0pl4ndApp {
                         .max_height(280.0)
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            for (i, cmd) in results.iter().enumerate() {
-                                if ui.selectable_label(i == sel, cmd).clicked() {
+                            for (i, row) in rows.iter().enumerate() {
+                                if ui.selectable_label(i == sel, row).clicked() {
                                     clicked = Some(i);
                                 }
                             }
                         });
                 }
                 ui.separator();
-                ui.weak("Up/Down select · Enter run · Esc close");
+                ui.weak("Up/Down select · Enter run · Esc close · > actions only");
             });
         // Exclude the palette from the whole-window motion overlays this frame.
         self.note_overlay_rect(win.map(|w| w.response.rect));
 
         if let Some(i) = clicked {
             self.palette_sel = i;
-            self.run_palette_selection();
+            self.run_palette_selection(ctx);
         }
     }
 }
@@ -3835,209 +3949,72 @@ impl C0pl4ndApp {
         // Surface an opt-in launch update check result (if one arrived) as a
         // toast. No-op when no check was attached (every headless test).
         self.poll_update_check();
-        // 0a) command palette: Ctrl+Shift+P (Cmd+Shift+P on macOS) toggles it. The
-        //     matching key-press is removed from the event stream so it never
-        //     reaches the PTY — without this, on the close frame (palette already
-        //     open) the `P` would fall through to `forward_input_to_focused` and
-        //     be encoded as the Ctrl+P control byte. Done explicitly rather than
-        //     via `consume_key` so the ctrl-OR-command match is unambiguous on
-        //     every platform.
-        let toggle_palette = ctx.input_mut(|i| {
-            let mut found = false;
-            i.events.retain(|ev| {
-                let hit = matches!(
-                    ev,
-                    egui::Event::Key { key: egui::Key::P, pressed: true, modifiers, .. }
-                    if modifiers.shift && (modifiers.ctrl || modifiers.command)
-                );
-                found |= hit;
-                !hit
-            });
-            found
-        });
-        if toggle_palette {
-            self.toggle_palette();
-        }
+        // 0a) KEYBOARD SHORTCUTS — the single, config-driven dispatcher.
+        //
+        //     Every shortcut the shell has is resolved HERE from the live
+        //     `config.keybindings` (see `egui_app::actions`): the chord strings
+        //     are parsed by the SAME `Chord` code `Keybindings::validate` uses,
+        //     matched EXACTLY on modifiers, consumed out of the event stream (so
+        //     a bound chord never also reaches the PTY as a control byte), and
+        //     dispatched through `dispatch_action` — the same entry point the
+        //     command palette uses. Rebinding an action in `config.toml` really
+        //     moves its chord because nothing else opens/closes/splits anything.
+        //
+        //     This replaced ~8 hand-rolled `events.retain` blocks that hard-wired
+        //     Ctrl+Shift+{P,F,H,T,W,D,E,Z,K,A}, Ctrl+{,}, F11, Ctrl+{+,-,0} and
+        //     Ctrl+Shift+{Home,End}; the defaults reproduce every one of them.
+        let fired_actions = self.dispatch_keybindings(ctx);
 
-        // 0a') find overlay: Ctrl+Shift+F (Cmd+Shift+F on macOS) toggles it —
-        //      matching the documented binding (KEYBINDINGS.md / config `search`)
-        //      and the palette's own Ctrl+Shift+P convention. Using the SHIFTED
-        //      chord deliberately leaves plain Ctrl+F free to reach the shell as
-        //      the Ctrl+F control byte (0x06, readline/emacs forward-char). The
-        //      matching key-press is removed from the event stream so it never
-        //      reaches the PTY. The ctrl-OR-command match is done explicitly (not
-        //      via `consume_key`) so it is unambiguous on every platform — the
-        //      same discipline the palette chord uses above.
-        let toggle_search = ctx.input_mut(|i| {
-            let mut found = false;
-            i.events.retain(|ev| {
-                let hit = matches!(
-                    ev,
-                    egui::Event::Key { key: egui::Key::F, pressed: true, modifiers, .. }
-                    if modifiers.shift && (modifiers.ctrl || modifiers.command) && !modifiers.alt
-                );
-                found |= hit;
-                !hit
-            });
-            found
-        });
-        if toggle_search {
-            self.toggle_search();
-        }
-
-        // 0a'') history sidebar: Ctrl+Shift+H (Cmd+Shift+H on macOS) toggles the
-        //       command-history quick-run sidebar. The matching key-press is
-        //       removed from the event stream so it never reaches the PTY — the
-        //       same chord-leak discipline the palette + find chords use above
-        //       (without this, `H` would fall through to the PTY as the Ctrl+H
-        //       control byte = backspace). Done explicitly (not `consume_key`) so
-        //       the ctrl-OR-command match is unambiguous on every platform.
-        let toggle_history = ctx.input_mut(|i| {
-            let mut found = false;
-            i.events.retain(|ev| {
-                let hit = matches!(
-                    ev,
-                    egui::Event::Key { key: egui::Key::H, pressed: true, modifiers, .. }
-                    if modifiers.shift && (modifiers.ctrl || modifiers.command)
-                );
-                found |= hit;
-                !hit
-            });
-            found
-        });
-        if toggle_history {
-            self.toggle_history_sidebar();
-        }
-
-        // 0a''') frameless fullscreen (#36): F11 toggles borderless OS fullscreen
-        //        (the window is already `decorations: false`, so `Fullscreen` —
-        //        not `Maximized` — is the right call; it covers the monitor with
-        //        no border and keeps DWM compositing so the acrylic/mica backdrop
-        //        still composites). The F11 key-press is removed from the event
-        //        stream so it never reaches the PTY as the F11 escape sequence —
-        //        the SAME chord-leak discipline the palette / find / history
-        //        chords use above. Esc ALSO exits fullscreen, but ONLY when no
-        //        overlay owns Esc (the palette + find consume Esc to close
-        //        themselves; handling it here too would fight them), and is left
-        //        in the stream otherwise so those overlays still see it.
-        let toggle_fullscreen = ctx.input_mut(|i| {
-            let mut found = false;
-            i.events.retain(|ev| {
-                let hit = matches!(
-                    ev,
-                    egui::Event::Key {
-                        key: egui::Key::F11,
-                        pressed: true,
-                        ..
-                    }
-                );
-                found |= hit;
-                !hit
-            });
-            found
-        });
+        // 0a') frameless fullscreen (#36): the `fullscreen` binding (F11 by
+        //      default) toggles borderless OS fullscreen through the dispatcher
+        //      above — the window is already `decorations: false`, so
+        //      `Fullscreen` (not `Maximized`) is the right call: it covers the
+        //      monitor with no border and keeps DWM compositing so the
+        //      acrylic/mica backdrop still composites.
+        //
+        //      Esc ALSO exits fullscreen, but ONLY when no overlay owns Esc (the
+        //      palette + find consume Esc to close themselves; handling it here
+        //      too would fight them), and is left in the stream otherwise so
+        //      those overlays still see it. Esc-exit stays here rather than
+        //      becoming a binding precisely because it is conditional on that
+        //      overlay state.
         let esc_exit_fullscreen = self.fullscreen
             && !self.palette_open
             && !self.search_open
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-        if toggle_fullscreen || esc_exit_fullscreen {
-            // F11 toggles; an Esc in fullscreen always EXITS. Read the OS-reported
-            // state so a fullscreen entered via another path is honoured.
-            let now = ctx.input(|i| i.viewport().fullscreen.unwrap_or(self.fullscreen));
-            let want = if esc_exit_fullscreen { false } else { !now };
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(want));
-            // Local mirror is the source of truth the panels read THIS frame —
-            // `i.viewport().fullscreen` updates a frame late (the OS reports back
-            // next frame), so a local mirror avoids a one-frame flash of the
-            // titlebar on enter / of the bare grid on exit.
-            self.fullscreen = want;
-        } else {
-            // Reconcile the mirror from the OS each frame so a fullscreen toggled
-            // via another path (e.g. a window-manager shortcut) stays honest.
+        if esc_exit_fullscreen {
+            self.set_fullscreen(ctx, false);
+        } else if !fired_actions.contains(&Action::ToggleFullscreen) {
+            // Reconcile the local mirror from the OS each frame so a fullscreen
+            // toggled via another path (e.g. a window-manager shortcut) stays
+            // honest — but NOT on a frame we just commanded a change, because
+            // `i.viewport().fullscreen` still reports the OLD state until the OS
+            // reports back next frame (that stale read would undo the toggle).
             if let Some(os) = ctx.input(|i| i.viewport().fullscreen) {
                 self.fullscreen = os;
             }
         }
 
-        // 0a'''') font zoom (E-parity): Ctrl/Cmd with +/=/-/0, or Ctrl/Cmd+wheel.
-        //         Mutates config.font.size (the renderer reads it every frame),
-        //         clamped to [6, 48] like the legacy shell. The chords are
-        //         consumed so they never reach the PTY; the pane's local wheel
-        //         scrollback skips a Ctrl-held wheel (see render_pane_body) so a
-        //         Ctrl+wheel only zooms.
+        // 0a'') font zoom (E-parity): the increase/decrease/reset FONT bindings
+        //       (Ctrl/Cmd with +/=/- and 0 by default) run through the
+        //       dispatcher above. What stays here is the part that is NOT a key
+        //       chord: Ctrl/Cmd + wheel (and trackpad pinch) live zoom.
+        //
+        //       egui reroutes a zoom-modifier wheel into `zoom_delta()` (a
+        //       MULTIPLICATIVE factor) and ZEROES `smooth_scroll_delta` for that
+        //       frame, so the zoom MUST be read from `zoom_delta` — a
+        //       scroll-delta read never fires under a held Ctrl/Cmd. It is 1.0
+        //       with no zoom, > 1.0 zooming in (wheel up), < 1.0 out. Map that
+        //       onto an ADDITIVE point step so it feeds the SAME clamp + debounced
+        //       persist as the keyboard zoom (`nudge_font_size`): ~one wheel notch
+        //       ≈ ±1pt, clamped so a fast pinch cannot jump size in one frame.
+        //       The pane's local wheel scrollback skips a Ctrl-held wheel (see
+        //       `render_pane_body`) so a Ctrl+wheel only zooms.
         {
-            let mut dz = 0.0_f32;
-            let mut reset = false;
-            ctx.input_mut(|i| {
-                i.events.retain(|ev| {
-                    if let egui::Event::Key {
-                        key,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } = ev
-                    {
-                        // Accept either `command` (macOS ⌘, and egui-winit maps
-                        // this to Ctrl on Windows/Linux) OR the raw `ctrl` bit, so
-                        // the chord fires on every platform AND under synthetic
-                        // test events (which set `ctrl` but not `command`) — the
-                        // same `ctrl || command` discipline the palette/find chords
-                        // above use.
-                        if (modifiers.command || modifiers.ctrl) && !modifiers.alt {
-                            match key {
-                                egui::Key::Plus | egui::Key::Equals => {
-                                    dz += 1.0;
-                                    return false;
-                                }
-                                egui::Key::Minus => {
-                                    dz -= 1.0;
-                                    return false;
-                                }
-                                egui::Key::Num0 => {
-                                    reset = true;
-                                    return false;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    true
-                });
-            });
-            // Ctrl/Cmd + wheel (and trackpad pinch) live font zoom. egui reroutes
-            // a zoom-modifier wheel into `zoom_delta()` (a MULTIPLICATIVE factor)
-            // and ZEROES `smooth_scroll_delta` for that frame, so the zoom MUST be
-            // read from `zoom_delta` — a scroll-delta read never fires under a held
-            // Ctrl/Cmd. `zoom_delta` is 1.0 when there is no zoom, > 1.0 zooming in
-            // (wheel up), < 1.0 out. Map that onto an ADDITIVE point step so it
-            // feeds the same clamp as the keyboard zoom: ~one wheel notch ≈ ±1pt
-            // (matching Ctrl+=/-), clamped so a fast pinch can't jump size in one
-            // frame. This also covers `matches_any(COMMAND)`, so a synthetic
-            // ctrl-only wheel event (tests) triggers it just like real winit.
             let zoom = ctx.input(|i| i.zoom_delta());
             if (zoom - 1.0).abs() > f32::EPSILON {
-                dz += ((zoom - 1.0) * 4.0).clamp(-3.0, 3.0);
-            }
-            let before = self.config.font.size;
-            if reset {
-                self.config.font.size = c0pl4nd_core::Config::default().font.size;
-            } else if dz != 0.0 {
-                self.config.font.size = (self.config.font.size + dz).clamp(6.0, 48.0);
-            }
-            if self.config.font.size != before {
-                // The renderer reads `config.font.size` every frame, so the new
-                // size applies live immediately. The PERSIST is DEBOUNCED: writing
-                // the whole config file (atomic temp-write + rename + perms) on
-                // every wheel notch is wasteful under a fast zoom, so we schedule a
-                // single save `FONT_SAVE_DEBOUNCE` after the LAST change instead.
-                // `frame_tick` flushes it; a repaint is scheduled for the deadline
-                // so an otherwise-idle app still wakes to write it.
-                ctx.request_repaint();
-                let now = ctx.input(|i| i.time);
-                self.pending_font_save_at = Some(now + FONT_SAVE_DEBOUNCE_SECS);
-                ctx.request_repaint_after(std::time::Duration::from_secs_f64(
-                    FONT_SAVE_DEBOUNCE_SECS,
-                ));
+                let dz = ((zoom - 1.0) * 4.0).clamp(-3.0, 3.0);
+                self.nudge_font_size(ctx, dz);
             }
         }
 
@@ -4106,53 +4083,6 @@ impl C0pl4ndApp {
             }
         }
 
-        // 0a'''''')b scroll-to-edge (best-in-class parity): Ctrl+Shift+Home jumps
-        //           the scrollback to the oldest retained line; Ctrl+Shift+End
-        //           snaps back to live output. The chord is removed from the event
-        //           stream so Home/End don't also reach the PTY as cursor-motion
-        //           bytes. Explicit ctrl-OR-command match via events.retain (NOT
-        //           consume_key), same cross-platform discipline as jump-to-prompt
-        //           above.
-        let scroll_edge = ctx.input_mut(|i| {
-            let mut to_top: Option<bool> = None;
-            i.events.retain(|ev| {
-                if let egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } = ev
-                {
-                    let cmd = modifiers.ctrl || modifiers.command;
-                    if cmd && modifiers.shift && !modifiers.alt {
-                        if *key == egui::Key::Home {
-                            to_top = Some(true); // to top (oldest)
-                            return false;
-                        } else if *key == egui::Key::End {
-                            to_top = Some(false); // to bottom (live)
-                            return false;
-                        }
-                    }
-                }
-                true
-            });
-            to_top
-        });
-        if let Some(to_top) = scroll_edge {
-            if let Some(term) = self.terms.get_mut(&self.focused_pane) {
-                let moved = if to_top {
-                    term.scroll_to_top()
-                } else {
-                    let was = term.view_offset();
-                    term.scroll_to_bottom();
-                    was != 0
-                };
-                if moved {
-                    ctx.request_repaint();
-                }
-            }
-        }
-
         // 0a''''''') DEC ?1004 focus reporting (E-parity): on a window focus-in/out
         //            EDGE, tell the focused pane's program (so vim/tmux see
         //            FocusGained/FocusLost). report_focus is a no-op unless the
@@ -4163,113 +4093,6 @@ impl C0pl4ndApp {
                 term.report_focus(focused_now);
             }
             self.was_focused = focused_now;
-        }
-
-        // 0a'''''''') window-management keyboard shortcuts (F-parity): the egui
-        //            shell offered new/close/split ONLY as chrome buttons. Add
-        //            Ctrl/Cmd+Shift+{T,W,D,E} = new-pane / close-pane / split-right
-        //            / split-down, and Ctrl/Cmd+, = settings. Matched + consumed
-        //            via events.retain (the proven cross-platform chord-leak
-        //            discipline the find/history chords use) so the letters never
-        //            reach the PTY as control bytes.
-        let mut act_new = false;
-        let mut act_close = false;
-        let mut act_split_h = false;
-        let mut act_split_v = false;
-        let mut act_zoom = false;
-        let mut act_settings = false;
-        let mut act_clear_scrollback = false;
-        let mut act_copy_all = false;
-        ctx.input_mut(|i| {
-            i.events.retain(|ev| {
-                if let egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } = ev
-                {
-                    let cmd = modifiers.command || modifiers.ctrl;
-                    if cmd && modifiers.shift && !modifiers.alt {
-                        match key {
-                            egui::Key::T => {
-                                act_new = true;
-                                return false;
-                            }
-                            egui::Key::W => {
-                                act_close = true;
-                                return false;
-                            }
-                            egui::Key::D => {
-                                act_split_h = true;
-                                return false;
-                            }
-                            egui::Key::E => {
-                                act_split_v = true;
-                                return false;
-                            }
-                            egui::Key::Z => {
-                                act_zoom = true;
-                                return false;
-                            }
-                            egui::Key::K => {
-                                // Clear scrollback (WezTerm's Ctrl+Shift+K).
-                                act_clear_scrollback = true;
-                                return false;
-                            }
-                            egui::Key::A => {
-                                // Copy the whole buffer (Windows Terminal / Ghostty
-                                // "Select all" → copy).
-                                act_copy_all = true;
-                                return false;
-                            }
-                            _ => {}
-                        }
-                    }
-                    if cmd && !modifiers.shift && !modifiers.alt && *key == egui::Key::Comma {
-                        act_settings = true;
-                        return false;
-                    }
-                }
-                true
-            });
-        });
-        if act_new {
-            self.new_terminal();
-        }
-        if act_split_h {
-            self.split(egui_tiles::LinearDir::Horizontal);
-        }
-        if act_split_v {
-            self.split(egui_tiles::LinearDir::Vertical);
-        }
-        if act_close {
-            self.close_pane(self.focused_pane);
-        }
-        if act_zoom {
-            self.toggle_zoom_pane();
-        }
-        if act_settings {
-            self.settings_open = !self.settings_open;
-        }
-        if act_clear_scrollback {
-            // Ctrl/Cmd+Shift+K: clear the focused pane's scrollback (same effect
-            // as the right-click "Clear scrollback" item), then repaint so the
-            // now-shorter scrollbar reflects it this frame.
-            if let Some(term) = self.terms.get_mut(&self.focused_pane) {
-                term.clear_scrollback();
-            }
-            ctx.request_repaint();
-        }
-        if act_copy_all {
-            // Ctrl/Cmd+Shift+A: copy the focused pane's WHOLE buffer (scrollback +
-            // screen) to the clipboard — the no-selection companion to
-            // Ctrl/Cmd+Shift+C. An empty buffer copies nothing.
-            if let Some(term) = self.terms.get(&self.focused_pane) {
-                if let Some(text) = term.buffer_text() {
-                    ctx.copy_text(text);
-                }
-            }
         }
 
         // 0a''''''''') CLIPBOARD CHORDS — `Event::Copy` / `Event::Cut`, NOT `Event::Key`.
@@ -4402,7 +4225,7 @@ impl C0pl4ndApp {
                 self.palette_open = false;
             }
             if enter {
-                self.run_palette_selection();
+                self.run_palette_selection(ctx);
             }
         } else if self.search_open {
             // The find overlay owns input while open: its TextEdit captures the
@@ -4627,27 +4450,11 @@ impl C0pl4ndApp {
         if actions.report_issue {
             self.issue_intake.open_fresh();
         }
-        // View-mode toggle (#30): flip the pane shell layout (Grid ⇄ Tabs) and
-        // persist it. The disk write is real-window-only (the headless harness
-        // observes the in-memory flip; persisting there would pollute the user's
-        // real config.toml — the same discipline `settings_window` follows).
+        // View-mode toggle (#30): the chrome button and the `toggle_view_mode`
+        // action/binding share ONE method, so the flip + its persist behave
+        // identically however the user reached it.
         if actions.toggle_view_mode {
-            self.config.view_mode = self.config.view_mode.toggled();
-            if self.live_window {
-                if let Some(path) = c0pl4nd_core::Config::default_path() {
-                    // Surface a persist failure (read-only %APPDATA%, full disk,
-                    // permission error) instead of silently dropping the user's
-                    // settings change — mirrors the legacy shell (window.rs). A
-                    // GUI user never sees stderr, so a visible toast (the same
-                    // channel the config-LOAD error uses) is the real surface.
-                    if let Err(e) = self.config.save_to(&path) {
-                        self.toast = Some(crate::user_error::config_save_failed(
-                            e,
-                            "The layout change",
-                        ));
-                    }
-                }
-            }
+            self.toggle_view_mode();
         }
         // One-shot "make panes symmetrical": rebuild the layout as a UNIFORM grid
         // so all panes are equal-sized regardless of the prior (possibly nested /
@@ -4655,10 +4462,8 @@ impl C0pl4ndApp {
         // panes stayed uneven". Preserves pane order + every attached terminal
         // (panes carry only their id). No-op for a 0/1-pane tree.
         if actions.equalize_panes {
-            if let Some(grid) = grid::rebuild_as_uniform_grid(&self.grid_tree) {
-                self.grid_tree = grid;
-                ctx.request_repaint();
-            }
+            // Shared with the `equalize_panes` action/binding — one method.
+            self.equalize_panes(ctx);
         }
         // Caption command: issue the REAL OS viewport command AND record it so an
         // interaction test can assert the click had its effect.

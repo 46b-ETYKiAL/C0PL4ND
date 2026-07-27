@@ -17,6 +17,7 @@ pub mod image;
 pub mod layout;
 pub mod layout_persist;
 pub mod net_confine;
+pub mod paste_guard;
 pub mod plugin;
 pub mod pty;
 pub mod reduced_motion;

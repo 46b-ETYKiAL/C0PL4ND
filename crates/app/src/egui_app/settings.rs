@@ -112,6 +112,37 @@ const MOTION_SEARCH_LABELS: &[&str] = &[
     "boot glitch",
 ];
 
+/// Cross-category search labels for the **Keybindings** section: the label of
+/// every binding row, lowercased. Kept as a named const (like
+/// [`MOTION_SEARCH_LABELS`]) so `keybinding_search_labels_cover_every_binding`
+/// can pin it against the LIVE schema — a binding added to
+/// `Keybindings::entries` without a search label would be a row no query could
+/// ever reveal.
+const KEYBINDING_SEARCH_LABELS: &[&str] = &[
+    "copy selection",
+    "paste",
+    "new tab",
+    "close pane",
+    "focus next pane",
+    "split right",
+    "split down",
+    "find in terminal",
+    "command palette",
+    "command-history sidebar",
+    "increase font size",
+    "decrease font size",
+    "reset font size",
+    "zoom pane",
+    "equalize panes",
+    "toggle grid / tabs view",
+    "settings",
+    "fullscreen",
+    "clear scrollback",
+    "copy everything",
+    "scroll to top",
+    "scroll to bottom",
+];
+
 /// The release channels the Updates section offers. Mirrors the channels the
 /// `c0pl4nd update` checker understands; a free choice list, not invented.
 const UPDATE_CHANNELS: &[&str] = &["stable", "beta", "nightly"];
@@ -2583,72 +2614,67 @@ fn render_sections(
     }
 
     // --------------------------------------------------------------- Keybindings
-    if section_visible(
-        sel,
-        q,
-        "Keybindings",
-        &[
-            "copy",
-            "paste",
-            "new tab",
-            "close tab",
-            "next tab",
-            "split right",
-            "split down",
-            "search",
-            "command palette",
-            "increase font",
-            "decrease font",
-        ],
-    ) {
+    if section_visible(sel, q, "Keybindings", KEYBINDING_SEARCH_LABELS) {
         ui.heading("Keybindings");
         help(
             ui,
-            "Reference — the shell's shortcuts are currently FIXED (not yet \
-             user-rebindable in this shell). \"mod\" is Ctrl+Shift on \
-             Windows/Linux, Cmd on macOS.",
+            "Edit a shortcut by typing its combo. \"mod\" is the platform command \
+             modifier (Ctrl on Windows/Linux, Cmd on macOS); combine it with \
+             \"shift\" / \"alt\" and one key, e.g. \"mod+shift+t\". Changes apply \
+             immediately \u{2014} no restart.",
         );
-        // READ-ONLY: a configurable-keybinding dispatcher is not wired in the
-        // egui shell — the shortcuts are hardcoded in `frame_tick`. The rows are
-        // shown disabled (the active combo, for reference) rather than as
-        // editable fields that silently control nothing (the prior dead-editor
-        // state). Matches the ligatures / copy-on-select honest-disable pattern.
+        // These rows are LIVE: `C0pl4ndApp::dispatch_keybindings` resolves every
+        // shortcut from these exact strings on every frame, so an edit here really
+        // moves the chord. The rows are generated from `entries_mut()` so a
+        // binding added to the schema can never end up without an editor.
+        //
+        // Copy/Paste are the one honest exception: `egui-winit` intercepts the
+        // clipboard chords in its own window-event dispatcher and delivers them as
+        // `Event::Copy` / `Event::Cut` rather than `Event::Key`, so they never
+        // reach the dispatcher. They stay DISABLED (shown for reference) rather
+        // than pretending to be rebindable.
+        let dispatched: Vec<&'static str> = super::actions::Action::ALL
+            .iter()
+            .map(|a| a.binding())
+            .collect();
         grid("keybindings_grid").show(ui, |ui| {
-            macro_rules! keybind_row {
-                ($field:ident, $label:literal, $search:literal) => {
-                    if row_visible(q, $search) {
-                        ui.label($label);
-                        ui.add_enabled_ui(false, |ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut config.keybindings.$field)
-                                    .desired_width(180.0)
-                                    .font(egui::TextStyle::Monospace),
-                            )
-                            .on_hover_text(
-                                "Fixed shortcut — not yet user-rebindable in this shell.",
-                            );
-                        });
-                        ui.end_row();
+            for (name, combo) in config.keybindings.entries_mut() {
+                let label = c0pl4nd_core::config::action_label(name);
+                if !row_visible(q, label) {
+                    continue;
+                }
+                ui.label(label);
+                let editable = dispatched.contains(&name);
+                let before = combo.clone();
+                ui.add_enabled_ui(editable, |ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(combo)
+                            .desired_width(180.0)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    if editable {
+                        resp.on_hover_text("Live shortcut. Modifiers: mod (Ctrl/Cmd), shift, alt.");
+                    } else {
+                        resp.on_hover_text(
+                            "Handled by the platform clipboard integration, not the \
+                             shortcut dispatcher \u{2014} shown for reference.",
+                        );
                     }
-                };
+                });
+                if *combo != before {
+                    changed = true;
+                }
+                ui.end_row();
             }
-            keybind_row!(copy, "Copy", "copy");
-            keybind_row!(paste, "Paste", "paste");
-            keybind_row!(new_tab, "New tab", "new tab");
-            keybind_row!(close_tab, "Close tab", "close tab");
-            keybind_row!(next_tab, "Next tab", "next tab");
-            keybind_row!(split_right, "Split right", "split right");
-            keybind_row!(split_down, "Split down", "split down");
-            keybind_row!(search, "Search", "search");
-            keybind_row!(command_palette, "Command palette", "command palette");
-            keybind_row!(increase_font, "Increase font", "increase font");
-            keybind_row!(decrease_font, "Decrease font", "decrease font");
         });
-        // F5-1: surface keybinding conflicts + blank bindings inline. The combos
-        // are free-text, so two actions can collide on one combo (only one wins)
-        // or a binding can be left empty (the action becomes unreachable) — both
-        // silently. validate() makes that explicit right under the editor instead
-        // of the user wondering why a shortcut "does nothing".
+        // Surface conflicts, blank bindings, and unparseable combos inline. The
+        // combos are free text, so two actions can collide on one chord (only one
+        // wins), a binding can be left empty (the action becomes keyboard-
+        // unreachable), or a combo can be unreadable — all silently. `validate()`
+        // makes that explicit right under the editor instead of the user
+        // wondering why a shortcut "does nothing". Collisions are grouped by the
+        // CANONICAL chord, so "ctrl+shift+c" and "mod+shift+c" are correctly
+        // reported as one physical shortcut.
         for issue in config.keybindings.validate() {
             ui.colored_label(
                 egui::Color32::from_rgb(0xff, 0xb0, 0x00),
@@ -3538,6 +3564,40 @@ mod tests {
             // resolve. Mirror that condition by asserting the app-id constant
             // matches the `with_app_id` in egui_main.rs.
             None => assert_eq!(EFRAME_APP_ID, "com.itashacorp.c0pl4nd"),
+        }
+    }
+
+    #[test]
+    fn keybinding_search_labels_cover_every_binding() {
+        // A binding added to the schema without a matching search label would
+        // render a row that no search query can reveal (the phantom-section
+        // failure `every_rendered_section_is_reachable` guards elsewhere).
+        for (name, _) in c0pl4nd_core::config::Keybindings::default().entries() {
+            let label = c0pl4nd_core::config::action_label(name).to_lowercase();
+            assert!(
+                KEYBINDING_SEARCH_LABELS.contains(&label.as_str()),
+                "binding '{name}' (label {label:?}) has no Keybindings search label"
+            );
+        }
+    }
+
+    #[test]
+    fn every_dispatched_binding_is_editable_and_clipboard_rows_are_not() {
+        // The row loop enables an editor only for bindings the dispatcher
+        // actually resolves. If an action were dropped from `Action::ALL`, its
+        // row would silently become a dead editor again — the exact fakery this
+        // section was rewritten to remove.
+        let dispatched: Vec<&str> = super::super::actions::Action::ALL
+            .iter()
+            .map(|a| a.binding())
+            .collect();
+        for (name, _) in c0pl4nd_core::config::Keybindings::default().entries() {
+            let expected_editable = name != "copy" && name != "paste";
+            assert_eq!(
+                dispatched.contains(&name),
+                expected_editable,
+                "binding '{name}' editability does not match the dispatch table"
+            );
         }
     }
 

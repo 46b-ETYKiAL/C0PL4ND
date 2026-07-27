@@ -1410,3 +1410,94 @@ fn follow_os_theme_toggle_off_forgets_tracked_appearance() {
         "toggle off forgets the tracked appearance"
     );
 }
+
+// ---------------------------------------------------------------------------
+// OSC 9;4 taskbar-progress WIRING (pump -> taskbar seam)
+// ---------------------------------------------------------------------------
+// These drive the REAL `pump_pane_effects` and observe the taskbar seam through
+// `taskbar::test_spy`. A test that called `map_progress_state` / `apply_progress`
+// directly would pass forever even if the pump never called them — which is
+// exactly the dormant state this feature was in before the wiring landed (the
+// parsers surfaced `HostEffects::progress` and the app dropped it on the floor).
+
+/// Feed a pane two `OSC 9 ; 4` reports, pump ONE frame, and assert the taskbar
+/// seam received the LAST one, mapped. Fails if the pump stops draining
+/// `fx.progress`, stops calling `latest_progress` (it would apply 30% instead of
+/// 42%), or stops calling `map_progress_state`/`apply_progress` at all.
+#[test]
+fn pump_drives_taskbar_progress_from_osc_9_4() {
+    let _guard = taskbar::test_spy::serial();
+    taskbar::test_spy::reset();
+
+    let mut app = C0pl4ndApp::bootstrap();
+    let pane = PaneTerm::spawn(app.theme.clone(), 80, 24);
+    let term = pane
+        .terminal_for_test()
+        .expect("PTY spawn must succeed — a skipped wiring test proves nothing");
+    {
+        let mut t = term.lock().unwrap();
+        // Two reports in ONE frame: only the LAST is visible on a single button.
+        t.advance(b"\x1b]9;4;1;30\x07"); // Normal 30%
+        t.advance(b"\x1b]9;4;1;42\x07"); // Normal 42%  <- latest wins
+    }
+    app.terms.insert(PaneId(0), pane);
+
+    let ctx = egui::Context::default();
+    app.pump_pane_effects(&ctx);
+
+    assert_eq!(
+        taskbar::test_spy::take(),
+        Some((taskbar::TaskbarProgress::Normal, 42)),
+        "pump must map the LATEST drained OSC 9;4 report onto the taskbar seam"
+    );
+}
+
+/// The WARNING state must reach the taskbar as `Paused` (yellow) through the
+/// real pump — the arm most likely to be silently folded into `Normal`.
+#[test]
+fn pump_maps_warning_progress_to_paused() {
+    let _guard = taskbar::test_spy::serial();
+    taskbar::test_spy::reset();
+
+    let mut app = C0pl4ndApp::bootstrap();
+    let pane = PaneTerm::spawn(app.theme.clone(), 80, 24);
+    let term = pane
+        .terminal_for_test()
+        .expect("PTY spawn must succeed — a skipped wiring test proves nothing");
+    term.lock().unwrap().advance(b"\x1b]9;4;4;61\x07"); // state 4 = Warning
+    app.terms.insert(PaneId(0), pane);
+
+    app.pump_pane_effects(&egui::Context::default());
+
+    assert_eq!(
+        taskbar::test_spy::take(),
+        Some((taskbar::TaskbarProgress::Paused, 61)),
+        "OSC 9;4 state 4 (warning) must surface as Paused/yellow, not Normal"
+    );
+}
+
+/// A frame with NO progress reports must leave the taskbar button untouched —
+/// the pump must not spam a `None`/clear every frame (which would wipe a
+/// progress segment set by a previous frame and cost a COM call per frame).
+#[test]
+fn pump_leaves_taskbar_untouched_when_no_progress_drained() {
+    let _guard = taskbar::test_spy::serial();
+    taskbar::test_spy::reset();
+
+    let mut app = C0pl4ndApp::bootstrap();
+    let pane = PaneTerm::spawn(app.theme.clone(), 80, 24);
+    let term = pane
+        .terminal_for_test()
+        .expect("PTY spawn must succeed — a skipped wiring test proves nothing");
+    // Plain output + an unrelated OSC: no progress reports at all.
+    term.lock().unwrap().advance(b"hello\r\n\x1b]0;title\x07");
+    app.terms.insert(PaneId(0), pane);
+
+    app.pump_pane_effects(&egui::Context::default());
+
+    assert_eq!(
+        taskbar::test_spy::take(),
+        None,
+        "an empty progress drain must not touch the taskbar button"
+    );
+}

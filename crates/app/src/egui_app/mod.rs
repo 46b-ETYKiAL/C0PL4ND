@@ -47,6 +47,7 @@ pub(crate) use crt::*;
 pub(crate) use motion_fx::*;
 mod grid_interaction;
 mod scrollbar;
+mod taskbar;
 pub(crate) use grid_interaction::*;
 mod config_load;
 pub(crate) use config_load::*;
@@ -538,6 +539,9 @@ impl C0pl4ndApp {
                     // Prime the first-launch foreground raise with the SAME main
                     // window handle; `frame_tick` fires it once on frame 1.
                     win_foreground::set_main_hwnd(w.hwnd.get());
+                    // Prime the taskbar-progress consumer (OSC 9;4) with the SAME
+                    // handle so `ITaskbarList3` drives THIS window's button.
+                    taskbar::set_main_hwnd(w.hwnd.get());
                 }
             }
         }
@@ -4928,11 +4932,13 @@ impl C0pl4ndApp {
         let mut clipboard: Vec<String> = Vec::new();
         let mut colors: Vec<ColorSet> = Vec::new();
         let mut notified = false;
+        let mut progress: Vec<c0pl4nd_core::term::osc::Progress> = Vec::new();
         for pane in self.terms.values_mut() {
             let fx = pane.pump_host_effects();
             clipboard.extend(fx.clipboard_writes);
             colors.extend(fx.color_sets);
             notified |= fx.notified;
+            progress.extend(fx.progress);
         }
         // OSC 52 → OS clipboard (write only; reads stay default-off in core).
         for text in clipboard {
@@ -4951,12 +4957,22 @@ impl C0pl4ndApp {
         // OSC 9/777 desktop notification while the window is unfocused → request
         // user attention (taskbar flash). The notification TEXT is never read
         // here (privacy: it can carry a 2FA code / secret URL — never log it).
-        // `focused` is `None` before the first focus event; treat that as focused
-        // so a notification at startup does not spuriously flash.
-        if notified && !ctx.input(|i| i.viewport().focused.unwrap_or(true)) {
+        // The focused-suppression predicate lives in `taskbar` so it is unit-
+        // testable without a live window (`focused == None` at startup is
+        // treated as focused, so a startup notification does not flash).
+        let focused = ctx.input(|i| i.viewport().focused);
+        if taskbar::should_request_attention(notified, focused) {
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                 egui::UserAttentionType::Informational,
             ));
+        }
+        // OSC 9;4 taskbar progress → the Windows taskbar button's progress
+        // segment. Only the LAST report of the frame is visible on a single
+        // button, so `latest_progress` collapses the frame's stream to one
+        // apply; an empty drain leaves the button untouched (no needless COM
+        // call every frame).
+        if let Some(latest) = taskbar::latest_progress(&progress) {
+            taskbar::apply_progress(taskbar::map_progress_state(latest.state), latest.percent);
         }
     }
 

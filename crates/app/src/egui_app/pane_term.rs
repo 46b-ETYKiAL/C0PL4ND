@@ -26,7 +26,7 @@ use std::rc::Rc;
 
 use c0pl4nd_core::term::{
     encode_key, encode_key_kitty, ColorSet, KeyEventKind, KeyModifiers, LogicalKey, MouseButton,
-    MouseEventKind, MouseMode, MouseModifiers,
+    MouseEventKind, MouseMode, MouseModifiers, Progress,
 };
 use c0pl4nd_core::{Session, Theme};
 
@@ -347,6 +347,11 @@ pub struct HostEffects {
     /// The notification TEXT is deliberately not surfaced — it can carry 2FA
     /// codes / secret URLs and must never be logged (privacy).
     pub notified: bool,
+    /// `OSC 9 ; 4` taskbar-progress reports (C26) drained this frame, in emit
+    /// order. The app drives the Windows taskbar-button progress segment from
+    /// the LATEST one (`super::taskbar`). Empty in the common case; a build tool
+    /// streaming progress fills it.
+    pub progress: Vec<Progress>,
 }
 
 /// Write bytes to a pane's PTY, logging a failure ONLY when the session is
@@ -656,14 +661,16 @@ impl PaneTerm {
     ///   focus reports) are written STRAIGHT BACK to THIS pane's PTY — they are
     ///   answers this terminal owes the program running in it.
     /// - **Host-global effects** (OSC 52 clipboard writes, OSC 4/10/11/12/104
-    ///   color *sets*, OSC 9/777 notifications) are returned in [`HostEffects`]
-    ///   for the app shell to apply once.
+    ///   color *sets*, OSC 9/777 notifications, `OSC 9 ; 4` taskbar progress)
+    ///   are returned in [`HostEffects`] for the app shell to apply once.
     ///
-    /// Also drains the `OSC 9 ; 4` taskbar-progress queue (currently no UI) so
-    /// it cannot grow without bound while a build tool streams progress. Without
-    /// this whole drain the egui shell silently dropped every reply AND leaked
-    /// the unread queues — the legacy winit shell drained them but the egui
-    /// rewrite never ported the wiring.
+    /// The `OSC 9 ; 4` taskbar-progress reports are surfaced in
+    /// [`HostEffects::progress`] and consumed by the app's taskbar wiring
+    /// (`super::taskbar`) — previously this queue was drained-and-discarded
+    /// (bounded-growth guard only, no UI). Without this whole drain the egui
+    /// shell silently dropped every reply AND leaked the unread queues — the
+    /// legacy winit shell drained them but the egui rewrite never ported the
+    /// wiring.
     ///
     /// No-op (empty effects) for a failed-spawn pane or a poisoned terminal lock.
     pub fn pump_host_effects(&mut self) -> HostEffects {
@@ -691,10 +698,11 @@ impl PaneTerm {
             if !term.take_notifications().is_empty() {
                 out.notified = true;
             }
-            // Bounded-growth guard: drain the progress queue even though there is
-            // no taskbar-progress UI yet (matches the legacy shell, which also
-            // has none — but the legacy shell never let the queue accumulate).
-            let _ = term.take_progress();
+            // OSC 9 ; 4 taskbar progress → surfaced for the app's taskbar wiring
+            // (`super::taskbar`) to drive the Windows taskbar-button segment.
+            // Draining here also keeps the queue from growing unbounded while a
+            // build tool streams progress.
+            out.progress = term.take_progress();
             response
         };
         if !response.is_empty() {
@@ -1380,8 +1388,12 @@ impl PaneTerm {
     /// sequences (e.g. `?1000h`) directly into the parser — deterministically,
     /// without depending on the asynchronous PTY reader thread (which would make
     /// the test flaky). Returns `None` for a failed-spawn pane.
+    ///
+    /// `pub(super)` so the egui-shell wiring tests in `mod_tests.rs` can drive a
+    /// pane's parser directly (e.g. the OSC 9;4 -> taskbar pump wire); still
+    /// `#[cfg(test)]`, so it exists in no shipping build.
     #[cfg(test)]
-    fn terminal_for_test(
+    pub(super) fn terminal_for_test(
         &self,
     ) -> Option<std::sync::Arc<std::sync::Mutex<c0pl4nd_core::Terminal>>> {
         self.session.as_ref().map(Session::terminal)
@@ -1737,6 +1749,7 @@ mod tests {
             t.advance(b"\x1b]52;c;aGVsbG8=\x07"); // OSC 52 write "hello"
             t.advance(b"\x1b]4;1;rgb:ff/00/00\x07"); // OSC 4 set index 1 = red
             t.advance(b"\x1b]9;Build complete\x07"); // OSC 9 desktop notification
+            t.advance(b"\x1b]9;4;1;42\x07"); // OSC 9;4 taskbar progress: Normal 42%
         }
         let mut pane = pane;
         let fx = pane.pump_host_effects();
@@ -1754,6 +1767,14 @@ mod tests {
             "OSC 4 set must surface as an indexed color set"
         );
         assert!(fx.notified, "OSC 9 must mark a notification as received");
+        assert_eq!(
+            fx.progress,
+            vec![Progress {
+                state: c0pl4nd_core::term::ProgressState::Normal,
+                percent: 42,
+            }],
+            "OSC 9;4 progress must be SURFACED (not drained-and-discarded) for the taskbar"
+        );
         // The PTY reply and every other queue must now be drained.
         let mut t = term.lock().unwrap();
         assert!(
@@ -1769,6 +1790,7 @@ mod tests {
             t.take_notifications().is_empty(),
             "notification queue drained"
         );
+        assert!(t.take_progress().is_empty(), "progress queue drained");
     }
 
     /// [`PaneTerm::scroll_view`] drives local scrollback: after enough output to

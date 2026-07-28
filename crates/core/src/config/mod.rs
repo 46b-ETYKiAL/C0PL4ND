@@ -706,8 +706,8 @@ fn default_quake_hotkey() -> String {
 /// hides it again on the next press.
 ///
 /// **Every field is inert until [`enabled`](Self::enabled) is turned on, and
-/// `enabled` defaults to `false`.** A global hotkey is an OS-level privilege â€” it
-/// is claimed process-wide and denies the combo to every other application â€” so
+/// `enabled` defaults to `false`.** A global hotkey is an OS-level privilege — it
+/// is claimed process-wide and denies the combo to every other application — so
 /// it is strictly opt-in, registered only when this flag is set, and
 /// unregistered when the window is destroyed. Additive: an older config with no
 /// `[quake]` table loads with quake mode fully off.
@@ -715,16 +715,16 @@ fn default_quake_hotkey() -> String {
 #[serde(default)]
 pub struct QuakeConfig {
     /// Master ON/OFF for quake mode. **Default `false`.** While off, NO global
-    /// hotkey is registered at all â€” the combo stays available to other apps.
+    /// hotkey is registered at all — the combo stays available to other apps.
     pub enabled: bool,
     /// The global hotkey combo, as `Mod+Mod+Key`.
     ///
     /// Modifiers (case-insensitive, any order, at least ONE required):
-    /// `Ctrl`/`Control`, `Alt`, `Shift`, `Win`/`Super`/`Meta`. Keys: `A`â€“`Z`,
-    /// `0`â€“`9`, `F1`â€“`F24`, `Grave`/`` ` ``, `Space`, `Tab`, `Esc`, `Enter`.
+    /// `Ctrl`/`Control`, `Alt`, `Shift`, `Win`/`Super`/`Meta`. Keys: `A`–`Z`,
+    /// `0`–`9`, `F1`–`F24`, `Grave`/`` ` ``, `Space`, `Tab`, `Esc`, `Enter`.
     ///
     /// A combo with no modifier is REJECTED (it would swallow a bare keystroke
-    /// system-wide), as is an unparseable one â€” in both cases no hotkey is
+    /// system-wide), as is an unparseable one — in both cases no hotkey is
     /// registered and quake mode stays inert rather than claiming something
     /// unintended.
     pub hotkey: String,
@@ -749,7 +749,7 @@ impl Default for QuakeConfig {
 }
 
 impl QuakeConfig {
-    /// The lowest permitted drop-down height fraction â€” below this the window
+    /// The lowest permitted drop-down height fraction — below this the window
     /// would be too short to show a usable grid.
     pub const MIN_HEIGHT_FRACTION: f32 = 0.1;
     /// The highest permitted drop-down height fraction (the full work area).
@@ -779,24 +779,24 @@ impl QuakeConfig {
     }
 }
 
-/// `MOD_ALT` â€” the `RegisterHotKey` modifier bit for Alt. Spelled out here (core
+/// `MOD_ALT` — the `RegisterHotKey` modifier bit for Alt. Spelled out here (core
 /// is platform-independent and has no `windows` dependency); the app's `quake`
 /// module carries a windows-only drift-guard test asserting each of these equals
 /// the real Win32 constant.
 pub const MOD_ALT_BIT: u32 = 0x0001;
-/// `MOD_CONTROL` â€” the modifier bit for Ctrl.
+/// `MOD_CONTROL` — the modifier bit for Ctrl.
 pub const MOD_CONTROL_BIT: u32 = 0x0002;
-/// `MOD_SHIFT` â€” the modifier bit for Shift.
+/// `MOD_SHIFT` — the modifier bit for Shift.
 pub const MOD_SHIFT_BIT: u32 = 0x0004;
-/// `MOD_WIN` â€” the modifier bit for the Windows key.
+/// `MOD_WIN` — the modifier bit for the Windows key.
 pub const MOD_WIN_BIT: u32 = 0x0008;
-/// `MOD_NOREPEAT` â€” suppresses auto-repeat, so HOLDING the combo toggles ONCE
+/// `MOD_NOREPEAT` — suppresses auto-repeat, so HOLDING the combo toggles ONCE
 /// instead of machine-gunning at the keyboard repeat rate. Added at registration
 /// time by [`HotkeySpec::register_modifiers`], never by the parser, so a parsed
 /// spec compares cleanly against the user's combo.
 pub const MOD_NOREPEAT_BIT: u32 = 0x4000;
 
-/// `VK_OEM_3` â€” the grave/tilde key on a US layout.
+/// `VK_OEM_3` — the grave/tilde key on a US layout.
 pub const VK_GRAVE: u32 = 0xC0;
 /// `VK_SPACE`.
 pub const VK_SPACE_KEY: u32 = 0x20;
@@ -806,7 +806,7 @@ pub const VK_TAB_KEY: u32 = 0x09;
 pub const VK_ESCAPE_KEY: u32 = 0x1B;
 /// `VK_RETURN`.
 pub const VK_RETURN_KEY: u32 = 0x0D;
-/// `VK_F1` â€” the F-key block is contiguous, so `F<n>` is `VK_F1 + (n - 1)`.
+/// `VK_F1` — the F-key block is contiguous, so `F<n>` is `VK_F1 + (n - 1)`.
 pub const VK_F1_KEY: u32 = 0x70;
 /// The highest supported function key (`VK_F24` = `VK_F1 + 23`).
 const MAX_FUNCTION_KEY: u32 = 24;
@@ -814,15 +814,15 @@ const MAX_FUNCTION_KEY: u32 = 24;
 /// A parsed global-hotkey combo: the `RegisterHotKey` modifier bitmask and the
 /// virtual-key code.
 ///
-/// Lives in core (not the app's Win32 module) so the Settings UI â€” which is in
-/// the lib target and cannot reach the shipping binary's `quake` module â€” can
+/// Lives in core (not the app's Win32 module) so the Settings UI — which is in
+/// the lib target and cannot reach the shipping binary's `quake` module — can
 /// validate a combo the user types with the SAME parser that registers it. One
 /// implementation, no drift between "the UI says it is valid" and "the hotkey
 /// actually registers".
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct HotkeySpec {
     /// The OR of the `MOD_*` bits the user asked for (never includes
-    /// `MOD_NOREPEAT` â€” see [`register_modifiers`](Self::register_modifiers)).
+    /// `MOD_NOREPEAT` — see [`register_modifiers`](Self::register_modifiers)).
     pub modifiers: u32,
     /// The virtual-key code of the non-modifier key.
     pub vk: u32,
@@ -839,7 +839,7 @@ impl HotkeySpec {
 }
 
 /// Map one non-modifier token to a virtual-key code, or `None` when it names no
-/// key we support. Accepts `A`â€“`Z`, `0`â€“`9`, `` ` ``, `F1`â€“`F24`, and the named
+/// key we support. Accepts `A`–`Z`, `0`–`9`, `` ` ``, `F1`–`F24`, and the named
 /// keys `Grave`/`Tilde`/`Backtick`, `Space`, `Tab`, `Esc`/`Escape`,
 /// `Enter`/`Return`. Case-insensitive.
 #[must_use]
@@ -848,7 +848,7 @@ fn parse_key_token(token: &str) -> Option<u32> {
     if t.is_empty() {
         return None;
     }
-    // Single ASCII letter / digit / backtick â€” the common case. The VK codes for
+    // Single ASCII letter / digit / backtick — the common case. The VK codes for
     // letters and digits ARE their uppercase-ASCII codes (asserted against the
     // `windows` crate by the app's drift-guard test).
     if t.len() == 1 {
@@ -873,7 +873,7 @@ fn parse_key_token(token: &str) -> Option<u32> {
             }
             // An out-of-range F-key is a REFUSAL. Belt-and-braces: the name table
             // below holds no `f<digits>` entry today, so falling through would
-            // also yield `None` â€” this guards the day one is added. The RANGE
+            // also yield `None` — this guards the day one is added. The RANGE
             // BOUND above is what actually rejects `F0`/`F25` right now, and it
             // is the thing the wire-cut test pins.
             return None;
@@ -891,7 +891,7 @@ fn parse_key_token(token: &str) -> Option<u32> {
 
 /// Parse a `Mod+Mod+Key` combo string into a [`HotkeySpec`].
 ///
-/// Returns `None` â€” meaning **register nothing, stay inert** â€” for every input we
+/// Returns `None` — meaning **register nothing, stay inert** — for every input we
 /// cannot honour exactly:
 ///
 /// * no modifier (`"F12"`): a bare key would be swallowed system-wide, stealing it
@@ -922,7 +922,7 @@ pub fn parse_hotkey(spec: &str) -> Option<HotkeySpec> {
             "win" | "super" | "meta" | "cmd" => modifiers |= MOD_WIN_BIT,
             _ => {
                 if key.is_some() {
-                    // Two non-modifier keys â€” ambiguous, refuse rather than guess.
+                    // Two non-modifier keys — ambiguous, refuse rather than guess.
                     return None;
                 }
                 key = Some(parse_key_token(t)?);
@@ -1109,7 +1109,7 @@ pub struct Config {
     pub always_on_top: bool,
     /// Quake mode ("drop-down terminal"): a GLOBAL hotkey that drops the window
     /// in from the top of the monitor under the cursor and hides it again.
-    /// **Default OFF** â€” see [`QuakeConfig`]; a global hotkey is an OS-level
+    /// **Default OFF** — see [`QuakeConfig`]; a global hotkey is an OS-level
     /// privilege and is registered only while `quake.enabled` is true. Additive:
     /// an older config with no `[quake]` table loads with quake mode off.
     #[serde(default)]
@@ -2081,19 +2081,19 @@ mod tests {
         let c = Config::default();
         assert!(
             !c.quake.enabled,
-            "quake mode claims a GLOBAL hotkey â€” it must be opt-in (off by default)"
+            "quake mode claims a GLOBAL hotkey — it must be opt-in (off by default)"
         );
         assert_eq!(c.quake.hotkey, "Ctrl+Shift+Grave");
         assert!((c.quake.height_fraction - 0.5).abs() < f32::EPSILON);
 
-        // A pre-field config must still load with quake fully off â€” upgrading must
+        // A pre-field config must still load with quake fully off — upgrading must
         // never silently claim a system-wide hotkey.
         let p = PathBuf::from("test.toml");
         let old = Config::from_toml("theme = \"ghost-paper\"\n", &p)
             .expect("a pre-quake config must still load");
         assert!(!old.quake.enabled, "an older config must not enable quake");
 
-        // Enable + customise â†’ serialize â†’ deserialize â†’ preserved.
+        // Enable + customise → serialize → deserialize → preserved.
         let mut c2 = c.clone();
         c2.quake.enabled = true;
         c2.quake.hotkey = "Win+F12".to_string();
@@ -2157,7 +2157,7 @@ mod tests {
     #[test]
     fn parse_hotkey_refuses_a_modifier_less_combo() {
         // THE safety rule: a bare-key global hotkey would swallow that keystroke
-        // for the WHOLE desktop. Refuse it â€” quake mode stays inert instead.
+        // for the WHOLE desktop. Refuse it — quake mode stays inert instead.
         for spec in ["F12", "Grave", "q", "`", "Escape"] {
             assert_eq!(
                 parse_hotkey(spec),

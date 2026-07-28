@@ -109,6 +109,10 @@ fn the_read_gate_does_not_affect_clipboard_writes() {
     assert!(!t.clipboard_read_enabled());
     t.advance(b"\x1b]52;c;aGk=\x07"); // base64("hi")
     let writes = t.take_clipboard_writes();
-    assert_eq!(writes.len(), 1, "writes stay honoured while reads are denied");
+    assert_eq!(
+        writes.len(),
+        1,
+        "writes stay honoured while reads are denied"
+    );
     assert_eq!(writes[0].text, "hi");
 }

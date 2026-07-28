@@ -896,8 +896,8 @@ mod tests {
             "the drop-down must never overlap the taskbar"
         );
         // The default combo the same path would register.
-        let spec = crate::quake::parse_hotkey(&def.hotkey)
-            .expect("the shipped default combo must parse");
+        let spec =
+            crate::quake::parse_hotkey(&def.hotkey).expect("the shipped default combo must parse");
         assert_ne!(spec.modifiers, 0, "the default combo carries a modifier");
     }
 

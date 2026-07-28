@@ -51,6 +51,7 @@ mod taskbar;
 pub(crate) use grid_interaction::*;
 mod config_load;
 pub(crate) use config_load::*;
+mod config_watch;
 mod window_effects;
 pub(crate) use window_effects::*;
 mod caption_close;
@@ -256,6 +257,11 @@ pub struct C0pl4ndApp {
     pub(crate) search_test_corpus: Option<String>,
     /// A transient status-bar message (e.g. "max 6 panes").
     pub(crate) toast: Option<String>,
+    /// Watches the on-disk `config.toml` so an external edit takes effect LIVE
+    /// (see [`Self::config_hot_reload_tick`]). Points at
+    /// [`c0pl4nd_core::Config::default_path`] by default; a test repoints it
+    /// with [`Self::watch_config_at`].
+    pub(crate) config_watch: config_watch::ConfigWatcher,
     /// The `(font-family-key, size-bits, pixels-per-point-bits)` the grid glyph
     /// atlas was last PRE-WARMED for. When this differs from the live font stack
     /// (first frame, a system-font swap, a zoom, OR a DPI/`pixels_per_point`
@@ -701,6 +707,14 @@ impl C0pl4ndApp {
             search_sel: 0,
             search_test_corpus: None,
             toast: theme_notice,
+            // Watch the file this config came from, stamped as ALREADY-loaded so
+            // the first frame never reloads what we just read. Both constructors
+            // (`bootstrap` for tests, `new` for the shipping binary) route
+            // through here, so the hot-reload wire exists in exactly one place.
+            config_watch: match c0pl4nd_core::Config::default_path() {
+                Some(p) => config_watch::ConfigWatcher::watching(p),
+                None => config_watch::ConfigWatcher::default(),
+            },
             warmed_atlas: None,
             warmup_frames_left: 0,
             font_wait_frames: 0,
@@ -2776,43 +2790,12 @@ impl C0pl4ndApp {
         }
 
         if outcome.changed {
-            // Reload the terminal grid's color theme so a theme change shows in
-            // the live PTY panes immediately (the chrome Visuals are re-applied
-            // below; the grid glyph colours come from this `Theme`, not Visuals).
-            if outcome.theme_changed {
-                let (theme, theme_notice) = load_terminal_theme(&self.config);
-                self.theme = theme;
-                if let Some(notice) = theme_notice {
-                    // A user-authored theme file existed but failed to parse —
-                    // surface it instead of silently showing fallback colours.
-                    self.toast = Some(notice);
-                }
-                // Propagate to the LIVE panes: each PaneTerm holds its own theme
-                // clone (glyph + background colours resolve from it), so without
-                // this the picker would change `self.theme` but no visible pane.
-                for term in self.terms.values_mut() {
-                    term.set_theme(self.theme.clone());
-                }
-            }
-            // Re-apply the chrome Visuals DERIVED FROM the (possibly changed)
-            // terminal theme so the WHOLE app UI — titlebar, tabs, status bar,
-            // settings window, panel fills — follows the picked theme (a light
-            // theme flips the chrome light, a dark one dark) without waiting for
-            // a relaunch. `self.theme` was reloaded just above on a theme change.
-            let mut visuals = theme::visuals_from_theme(&self.theme);
-            window_effects::apply_window_opacity(&mut visuals, self.config.opacity);
-            ctx.set_visuals(visuals);
-            // Live-apply the always-on-top window level so flipping the toggle
-            // takes effect without a relaunch (mirrors the opacity live-apply
-            // just above). Setting the level to its current value is idempotent,
-            // so re-sending it on any settings change is harmless.
-            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                if self.config.always_on_top {
-                    egui::WindowLevel::AlwaysOnTop
-                } else {
-                    egui::WindowLevel::Normal
-                },
-            ));
+            // Live-apply the (possibly changed) config: reload + propagate the
+            // terminal theme, re-derive the chrome Visuals, re-assert the
+            // always-on-top level. Shared verbatim with the config HOT RELOAD
+            // path (`config_hot_reload_tick`) so an external `config.toml` edit
+            // and a Settings edit can never apply DIFFERENT subsets of a change.
+            self.apply_config_live(ctx, outcome.theme_changed);
             // Persist to the platform config file so the change survives a
             // relaunch — but ONLY in a real window. The headless `egui_kittest`
             // harness sets `live_window == false`; persisting there would write
@@ -2834,7 +2817,108 @@ impl C0pl4ndApp {
                             "Your settings change",
                         ));
                     }
+                    // Re-stamp the watcher so OUR write is not read back as an
+                    // external edit on the next poll (which would re-apply the
+                    // theme + visuals on every slider nudge).
+                    self.config_watch.mark_self_written();
                 }
+            }
+        }
+    }
+
+    /// Apply the LIVE `self.config` to everything that can change without a
+    /// relaunch. The single apply path shared by the Settings window and the
+    /// config hot reload, so the two can never diverge:
+    ///
+    /// 1. **Terminal theme** (only when `theme_changed`) — reloaded from disk /
+    ///    the built-in set and propagated to every live pane, because each
+    ///    `PaneTerm` holds its own `Theme` clone and the grid's glyph colours
+    ///    resolve from it, not from egui Visuals.
+    /// 2. **Chrome Visuals** — re-derived from the (possibly new) terminal theme
+    ///    plus the window opacity, so titlebar/tabs/status bar follow the theme.
+    /// 3. **Always-on-top** — re-asserted as a viewport command. Idempotent, so
+    ///    re-sending it on any change is harmless.
+    fn apply_config_live(&mut self, ctx: &egui::Context, theme_changed: bool) {
+        if theme_changed {
+            let (theme, theme_notice) = load_terminal_theme(&self.config);
+            self.theme = theme;
+            if let Some(notice) = theme_notice {
+                // A user-authored theme file existed but failed to parse —
+                // surface it instead of silently showing fallback colours.
+                self.toast = Some(notice);
+            }
+            for term in self.terms.values_mut() {
+                term.set_theme(self.theme.clone());
+            }
+        }
+        let mut visuals = theme::visuals_from_theme(&self.theme);
+        window_effects::apply_window_opacity(&mut visuals, self.config.opacity);
+        ctx.set_visuals(visuals);
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            if self.config.always_on_top {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            },
+        ));
+    }
+
+    /// Point the config watcher at `path` and treat that file's CURRENT contents
+    /// as already-loaded, so only edits made from now on hot-reload.
+    ///
+    /// The shipping binary watches [`c0pl4nd_core::Config::default_path`] (set
+    /// in `bootstrap_with`); this repoints the watcher, which is how the
+    /// hot-reload wiring test drives a temp config file instead of the user's
+    /// real one.
+    pub fn watch_config_at(&mut self, path: std::path::PathBuf) {
+        self.config_watch = config_watch::ConfigWatcher::watching(path);
+    }
+
+    /// One per-frame tick of config HOT RELOAD: when `config.toml` changed on
+    /// disk since we last read it, re-parse it and apply it live — no relaunch.
+    ///
+    /// Called from [`Self::frame_tick`]. The watcher throttles the actual
+    /// filesystem `stat` to one per [`config_watch::POLL_INTERVAL`], so the
+    /// per-frame cost of this call in the common (unchanged) case is a clock
+    /// comparison.
+    ///
+    /// A file that fails to PARSE never clobbers the running config: the app
+    /// keeps the settings it has and surfaces the error as a toast, exactly like
+    /// a bad config at launch. Reverting a user's whole live setup because they
+    /// saved a half-typed TOML line would be strictly worse than ignoring it.
+    /// The bad file's stamp is already recorded, so the app waits quietly for
+    /// the next save rather than re-toasting every 400 ms.
+    fn config_hot_reload_tick(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.config_watch.poll(std::time::Instant::now()) else {
+            return;
+        };
+        let src = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            // Vanished/locked between the stat and the read — nothing to apply.
+            Err(_) => return,
+        };
+        match c0pl4nd_core::Config::from_toml(&src, &path) {
+            Ok(new_config) => {
+                if new_config == self.config {
+                    // A touched-but-equivalent file (a comment edit, a
+                    // reformat, our own save on a path `mark_self_written`
+                    // missed). Nothing to apply, and re-theming would be a
+                    // visible flicker for no change.
+                    return;
+                }
+                let theme_changed = new_config.theme != self.config.theme;
+                self.config = new_config;
+                self.apply_config_live(ctx, theme_changed);
+                self.toast = Some("Reloaded config.toml".to_string());
+                ctx.request_repaint();
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "c0pl4nd::config",
+                    path = ?path,
+                    "config hot reload failed to parse; keeping the running config"
+                );
+                self.toast = Some(crate::user_error::config_reload_failed(e.to_string()));
             }
         }
     }
@@ -3698,6 +3782,9 @@ impl C0pl4ndApp {
             if let Err(e) = self.config.save_to(&path) {
                 self.toast = Some(crate::user_error::config_save_failed(e, what));
             }
+            // Our own write — re-stamp so the hot-reload watcher does not read
+            // it back as an external edit on its next poll.
+            self.config_watch.mark_self_written();
         }
     }
 
@@ -3764,6 +3851,12 @@ impl C0pl4ndApp {
             self.prepare_shutdown();
             std::process::exit(0);
         }
+        // Config HOT RELOAD: pick up an external `config.toml` edit live, with
+        // no relaunch. Runs BEFORE the theme/motion ticks below so a reloaded
+        // theme or motion setting takes effect on THIS frame rather than the
+        // next. Throttled inside the watcher to one filesystem stat per
+        // `config_watch::POLL_INTERVAL`.
+        self.config_hot_reload_tick(ctx);
         // Follow-OS dark/light (SCR1B3 parity): when enabled, track the OS
         // appearance and swap between the default dark/light themes to match.
         self.follow_os_theme_tick(ctx);

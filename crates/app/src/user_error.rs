@@ -89,6 +89,20 @@ pub fn config_load_failed(detail: impl Display) -> String {
     )
 }
 
+/// The settings file changed on disk while the app was running, but the new
+/// contents could not be parsed. Distinct from [`config_load_failed`]: nothing
+/// falls back to defaults here — the settings already running stay in force, so
+/// a half-typed TOML line never wipes a live session's setup.
+pub fn config_reload_failed(detail: impl Display) -> String {
+    logged(
+        "config_reload",
+        detail,
+        "Your settings file changed but couldn't be read, so the settings \
+         already running were kept. Fix the file and save again, or see \
+         TROUBLESHOOTING.",
+    )
+}
+
 /// A user-authored theme file exists but failed to parse; fallback colours are
 /// in use. `name` is the user's own theme name (their config value, not an
 /// internal identifier), so it is safe to echo. (Inventory C0-009.)

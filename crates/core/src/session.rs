@@ -452,8 +452,22 @@ mod tests {
         }
         let session = session.expect("spawn real PTY session (after retries)");
 
+        // Wait for the POSTCONDITION (the token reached the grid), not merely
+        // for the child to exit.
+        //
+        // The child exiting only means it finished WRITING. The PTY reader
+        // thread still has to pump that write through into the grid, so
+        // `!is_alive()` can become true a moment BEFORE the token is visible —
+        // and this loop used to stop exactly there. Under normal load the reader
+        // wins the race and the assert passes; under heavy parallel load it
+        // loses and the test fails with an empty snapshot. That is a race in the
+        // test, not a bug in the session, and it fails RED for the wrong reason.
+        //
+        // Polling the real postcondition removes the race and is strictly
+        // tighter: it still bounds at the same deadline, and a genuinely missing
+        // token still fails (it just costs the full 10s to prove it).
         let deadline = Instant::now() + Duration::from_secs(10);
-        while session.is_alive() && Instant::now() < deadline {
+        while !session.snapshot_text().contains(token) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(

@@ -25,6 +25,7 @@
 //! `frame_tick` the shipping binary runs each frame.
 
 use c0pl4nd::egui_app;
+use c0pl4nd_core::paste_guard::PasteConfirmReason;
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
@@ -302,6 +303,13 @@ fn multiline_paste_is_deferred_until_confirmed() {
         app.borrow().has_pending_paste(),
         "a multi-line paste must be deferred to the confirm overlay"
     );
+    // The overlay must be able to word WHICH hazard tripped, so the call site
+    // has to record the reason too — not merely "something was deferred".
+    assert_eq!(
+        app.borrow().pending_paste_reason(),
+        Some(PasteConfirmReason::MultiLine),
+        "the multi-line gate (not the size gate) must be recorded as the reason"
+    );
     // It must NOT have been forwarded to the PTY (so the shell can't run it yet).
     assert!(
         !app.borrow()
@@ -335,6 +343,137 @@ fn singleline_paste_reaches_the_pty() {
     assert!(
         poll_focused_contains(&mut h, &app, "PASTEPROBE42", Duration::from_secs(10)),
         "a single-line paste must reach the PTY and be echoed into the grid"
+    );
+}
+
+/// SECURITY (the load-bearing half of the paste gate): CANCELLING a deferred
+/// paste must DROP it — the text must never reach the PTY, not "reach it later".
+/// A gate that defers but leaks on cancel is worse than no gate at all, because
+/// the user believes they refused the payload.
+///
+/// The negative assertion is made non-vacuous by an ORDERING BARRIER: after the
+/// cancel we push a single-line paste (which takes the immediate path) and wait
+/// for it to be echoed back from the real shell. Once the barrier has completed
+/// its full PTY round-trip, any write the cancelled paste might have issued
+/// would already have landed too — so its continued absence is real evidence,
+/// not just impatience.
+#[test]
+fn cancelling_a_deferred_paste_never_reaches_the_pty() {
+    let app = RefCell::new(C0pl4ndApp::bootstrap());
+    let mut h = harness(&app);
+
+    {
+        let a = app.borrow();
+        let focused = a.focused_pane();
+        if a.pane_grid_text(focused).is_none() {
+            eprintln!("no live PTY on this platform; skipping cancelled-paste leak test");
+            return;
+        }
+    }
+
+    h.event(egui::Event::Paste("CANCELLEAK_A\nCANCELLEAK_B".to_string()));
+    h.step();
+    h.step();
+    assert!(
+        app.borrow().has_pending_paste(),
+        "the multi-line paste must be deferred before it can be cancelled"
+    );
+
+    app.borrow_mut().cancel_pending_paste();
+    assert!(
+        !app.borrow().has_pending_paste(),
+        "cancelling clears the pending paste"
+    );
+    assert_eq!(
+        app.borrow().pending_paste_reason(),
+        None,
+        "cancelling clears the reason in lockstep with the text"
+    );
+
+    // Ordering barrier: this later paste takes the immediate path, so once the
+    // shell has echoed it the cancelled text has had at least as long to appear.
+    h.event(egui::Event::Paste("CANCELBARRIER77".to_string()));
+    h.step();
+    assert!(
+        poll_focused_contains(&mut h, &app, "CANCELBARRIER77", Duration::from_secs(10)),
+        "the barrier paste must reach the PTY (otherwise the leak check is vacuous)"
+    );
+
+    assert!(
+        !app.borrow()
+            .focused_grid_text()
+            .is_some_and(|t| t.contains("CANCELLEAK_A")),
+        "a CANCELLED paste must never reach the PTY"
+    );
+}
+
+/// The call site must consult the LIVE config, not a compiled-in policy: with
+/// `paste_warn_multiline` off (and the size gate off), a multi-line paste is
+/// delivered immediately instead of being parked in the confirm overlay.
+#[test]
+fn a_disabled_gate_pastes_a_multiline_immediately() {
+    let config = c0pl4nd_core::Config {
+        paste_warn_multiline: false,
+        paste_warn_bytes: 0,
+        ..Default::default()
+    };
+
+    let app = RefCell::new(C0pl4ndApp::bootstrap_with(config));
+    let mut h = harness(&app);
+
+    h.event(egui::Event::Paste("GATEOFF_A\nGATEOFF_B".to_string()));
+    h.step();
+    h.step();
+
+    assert!(
+        !app.borrow().has_pending_paste(),
+        "with both gates disabled a multi-line paste must NOT be deferred"
+    );
+    assert_eq!(
+        app.borrow().pending_paste_reason(),
+        None,
+        "nothing was deferred, so there is no reason to report"
+    );
+}
+
+/// The SIZE gate reaches the app too: an oversized SINGLE-line paste (no
+/// newline, so the multi-line gate cannot see it) is deferred and reported as
+/// [`PasteConfirmReason::Large`]. Pins the app to the two-gate policy rather
+/// than to "contains a newline".
+#[test]
+fn oversized_single_line_paste_is_deferred_as_large() {
+    let app = RefCell::new(C0pl4ndApp::bootstrap());
+    let mut h = harness(&app);
+
+    let huge = "H".repeat(app.borrow().config.paste_warn_bytes + 1);
+    assert!(
+        !huge.contains('\n'),
+        "the size gate must fire with no newline"
+    );
+
+    h.event(egui::Event::Paste(huge.clone()));
+    h.step();
+    h.step();
+
+    assert!(
+        app.borrow().has_pending_paste(),
+        "an oversized single-line paste must be deferred"
+    );
+    assert_eq!(
+        app.borrow().pending_paste_reason(),
+        Some(PasteConfirmReason::Large),
+        "the SIZE gate (not the multi-line gate) must be recorded as the reason"
+    );
+
+    let sent = app.borrow_mut().confirm_pending_paste();
+    assert_eq!(
+        sent.as_deref(),
+        Some(huge.as_str()),
+        "confirming returns the exact deferred text"
+    );
+    assert!(
+        !app.borrow().has_pending_paste(),
+        "confirming clears the pending paste"
     );
 }
 

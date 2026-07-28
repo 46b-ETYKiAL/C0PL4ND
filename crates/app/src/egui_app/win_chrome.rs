@@ -282,6 +282,23 @@ pub fn tick(ctx: &eframe::egui::Context) {
 // Windows FFI (the audited unsafe boundary)
 // ---------------------------------------------------------------------------
 
+/// This module's window-subclass id, re-exported for collision assertions.
+///
+/// Two subclass entries share one HWND. A COLLIDING id makes the second
+/// `SetWindowSubclass` REPLACE this entry instead of chaining, which silently
+/// kills the caption/Snap-Layouts handling with no error anywhere. The sibling
+/// `quake` installer therefore asserts its own id differs — and it must assert
+/// against THIS constant, not a hard-coded copy of it, or the assertion goes
+/// stale the moment this value changes and the collision it exists to catch
+/// ships undetected.
+///
+/// Read only by that assertion, so it is genuinely unused in a non-test build —
+/// the allow is scoped to `not(test)` rather than blanket, so the dead-code lint
+/// still fires if the assertion is ever deleted and this anchor is left behind.
+#[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const SUBCLASS_ID: usize = imp::SUBCLASS_ID;
+
 #[cfg(windows)]
 mod imp {
     use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
@@ -310,7 +327,10 @@ mod imp {
     static BTN_PRESSED: AtomicBool = AtomicBool::new(false);
 
     /// A stable, arbitrary subclass id for our single subclass entry.
-    const SUBCLASS_ID: usize = 0x00C0_041D;
+    ///
+    /// `pub(super)` so the sibling `quake` subclass installer can assert against
+    /// THIS value rather than a copy of it — see the re-export below.
+    pub(super) const SUBCLASS_ID: usize = 0x00C0_041D;
 
     /// The non-client message set handed to `DwmDefWindowProc` FIRST, so DWM can
     /// run its own caption-button behaviour (hover/press visuals and, on Windows

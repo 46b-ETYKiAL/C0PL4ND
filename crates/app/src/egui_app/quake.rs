@@ -460,7 +460,8 @@ mod imp {
         // Position over the CURSOR's monitor work area. A failed monitor query or a
         // degenerate work area yields `None` and we simply do not move the window —
         // never a fling to (0,0) or a zero-height window.
-        if let Some(rect) = cursor_monitor_work_area().and_then(|w| quake_rect(w, height_fraction()))
+        if let Some(rect) =
+            cursor_monitor_work_area().and_then(|w| quake_rect(w, height_fraction()))
         {
             // SAFETY: own handle; a plain move/resize to a monitor-derived rect.
             // `SWP_NOACTIVATE` leaves activation to the explicit foreground dance
@@ -644,7 +645,15 @@ mod imp {
             // Two subclass entries share one window; a colliding id would REPLACE
             // the caption subclass instead of chaining, silently killing Snap
             // Layouts.
-            assert_ne!(SUBCLASS_ID, 0x00C0_041D, "win_chrome's subclass id");
+            //
+            // Compare against win_chrome's ACTUAL constant, never a copy of its
+            // literal: a copy keeps passing after win_chrome's id changes, so the
+            // one collision this test exists to catch would ship undetected.
+            assert_ne!(
+                SUBCLASS_ID,
+                crate::win_chrome::SUBCLASS_ID,
+                "quake and win_chrome must not share a subclass id"
+            );
         }
     }
 }
@@ -695,7 +704,11 @@ mod tests {
         assert_eq!(quake_rect(work, -2.0).map(|r| r.height()), Some(100));
         // A non-finite fraction or a degenerate work area means DO NOT MOVE.
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            assert_eq!(quake_rect(work, bad), None, "{bad} must not move the window");
+            assert_eq!(
+                quake_rect(work, bad),
+                None,
+                "{bad} must not move the window"
+            );
         }
         for empty in [
             ScreenRect::new(0, 0, 0, 0),

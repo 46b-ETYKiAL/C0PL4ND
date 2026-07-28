@@ -1012,14 +1012,21 @@ fn osc52_primary_selection() {
 }
 
 #[test]
-fn osc52_read_default_off_emits_nothing() {
+fn osc52_read_default_off_replies_empty_and_leaks_nothing() {
     let mut t = Terminal::new(4, 20);
-    // Read request: payload is '?'. Default-off -> no PTY response, no write.
+    // Read request: payload is '?'. Default-off -> the refusal is an OSC 52
+    // reply with an EMPTY payload: no clipboard data crosses to the PTY, and
+    // the asking program is not left blocking on a reply that never arrives.
     t.advance(b"\x1b]52;c;?\x07");
     assert!(t.take_clipboard_write().is_none());
+    assert_eq!(
+        t.take_pty_response(),
+        b"\x1b]52;c;\x07".to_vec(),
+        "must refuse with an empty payload, never host clipboard contents"
+    );
     assert!(
-        t.take_pty_response().is_empty(),
-        "must NOT auto-respond with host clipboard contents"
+        t.take_clipboard_reads().is_empty(),
+        "a denied read must not park a request the host could later answer"
     );
 }
 
@@ -1037,6 +1044,156 @@ fn osc52_read_opt_in_uses_app_provided_text() {
     t.respond_clipboard_read(ClipboardSelection::Clipboard, "hi");
     // "hi" base64 = aGk=
     assert_eq!(t.take_pty_response().as_slice(), b"\x1b]52;c;aGk=\x07");
+}
+
+/// THE negative test. With the shipping default (reads denied), a program that
+/// asks for the clipboard must never receive its contents — not from the parser,
+/// and not even if the host layer erroneously tries to answer. Asserted on the
+/// bytes that actually reach the PTY.
+#[test]
+fn osc52_read_denied_by_default_never_leaks_clipboard_bytes_to_pty() {
+    const SECRET: &str = "hunter2-api-token";
+    // base64("hunter2-api-token"); the exact substring that must never appear.
+    let secret_b64 = super::osc::base64_encode(SECRET.as_bytes());
+
+    let mut t = Terminal::new(4, 20);
+    assert!(
+        !t.clipboard_read_enabled(),
+        "the shipping default must deny clipboard reads"
+    );
+
+    // A hostile program asks for the clipboard, on both selections and via the
+    // empty-selection form (which defaults to the system clipboard).
+    t.advance(b"\x1b]52;c;?\x07");
+    t.advance(b"\x1b]52;p;?\x07");
+    t.advance(b"\x1b]52;;?\x07");
+
+    // The host has the secret on its clipboard and — simulating a wiring bug —
+    // tries to answer anyway. The core must refuse: `respond_clipboard_read` is
+    // gated on the same flag, so no amount of host-side eagerness can leak.
+    assert!(
+        t.take_clipboard_reads().is_empty(),
+        "a denied read must never be surfaced to the host as a servable request"
+    );
+    t.respond_clipboard_read(ClipboardSelection::Clipboard, SECRET);
+    t.respond_clipboard_read(ClipboardSelection::Primary, SECRET);
+
+    let wire = t.take_pty_response();
+    let wire_str = String::from_utf8(wire.clone()).expect("replies are ASCII");
+
+    // Only the three empty-payload refusals reached the PTY.
+    assert_eq!(
+        wire_str, "\x1b]52;c;\x07\x1b]52;p;\x07\x1b]52;c;\x07",
+        "only empty-payload refusals may reach the PTY"
+    );
+    // …and the secret is absent in every representation.
+    assert!(
+        !wire_str.contains(&secret_b64),
+        "base64 of the clipboard secret must never reach the PTY"
+    );
+    assert!(
+        !wire_str.contains(SECRET),
+        "the clipboard secret must never reach the PTY in plaintext either"
+    );
+}
+
+/// The refusal must not be silence: a program blocking on the reply has to be
+/// released. Distinguishes "denied" from "ignored" on the wire.
+#[test]
+fn osc52_denied_read_answers_rather_than_hanging_the_caller() {
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b]52;c;?\x07");
+    let wire = t.take_pty_response();
+    assert!(
+        !wire.is_empty(),
+        "silence would leave the requesting program blocked until its own timeout"
+    );
+    // A well-formed OSC 52 reply the caller can parse: OSC, 52, selection,
+    // empty data field, terminator.
+    assert!(wire.starts_with(b"\x1b]52;"), "must be an OSC 52 reply");
+    assert!(wire.ends_with(b"\x07"), "must be terminated");
+    assert_eq!(wire, b"\x1b]52;c;\x07".to_vec());
+}
+
+/// The refusal echoes the selection the program asked about, so a caller that
+/// queried the primary selection matches the reply to its own request.
+#[test]
+fn osc52_denied_read_echoes_the_requested_selection() {
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b]52;p;?\x07");
+    assert_eq!(t.take_pty_response(), b"\x1b]52;p;\x07".to_vec());
+}
+
+/// When opted in, the request is surfaced to the host with the selection the
+/// program asked for — that is what lets the host read the RIGHT selection.
+#[test]
+fn osc52_opt_in_surfaces_request_with_selection() {
+    let mut t = Terminal::new(4, 20);
+    t.set_clipboard_read_enabled(true);
+    t.advance(b"\x1b]52;p;?\x07");
+    t.advance(b"\x1b]52;c;?\x07");
+    let reqs = t.take_clipboard_reads();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0].selection, ClipboardSelection::Primary);
+    assert_eq!(reqs[1].selection, ClipboardSelection::Clipboard);
+    assert!(
+        t.take_clipboard_reads().is_empty(),
+        "drained once, like the write queue"
+    );
+}
+
+/// A program spamming read queries must not grow the pending queue without
+/// bound (same discipline as every other PTY-driven buffer).
+#[test]
+fn osc52_pending_reads_are_bounded() {
+    let mut t = Terminal::new(4, 20);
+    t.set_clipboard_read_enabled(true);
+    for _ in 0..500 {
+        t.advance(b"\x1b]52;c;?\x07");
+    }
+    let n = t.take_clipboard_reads().len();
+    assert!(
+        n <= 16,
+        "pending read queue must stay bounded, got {n} entries"
+    );
+    assert!(n > 0, "…while still retaining the most recent requests");
+}
+
+/// Turning the setting back OFF while a request is in flight must refuse it,
+/// not silently forget it — otherwise the blocked program never gets an answer.
+#[test]
+fn osc52_disabling_reads_refuses_requests_still_in_flight() {
+    let mut t = Terminal::new(4, 20);
+    t.set_clipboard_read_enabled(true);
+    t.advance(b"\x1b]52;c;?\x07");
+    let _ = t.take_pty_response(); // nothing yet; the request is parked
+
+    t.set_clipboard_read_enabled(false);
+    assert_eq!(
+        t.take_pty_response(),
+        b"\x1b]52;c;\x07".to_vec(),
+        "the in-flight request must be answered with an empty payload on disable"
+    );
+    assert!(
+        t.take_clipboard_reads().is_empty(),
+        "and must no longer be servable"
+    );
+}
+
+/// A hard reset (RIS) must likewise refuse rather than strand a parked request.
+#[test]
+fn hard_reset_refuses_pending_clipboard_reads() {
+    let mut t = Terminal::new(4, 20);
+    t.set_clipboard_read_enabled(true);
+    t.advance(b"\x1b]52;c;?\x07");
+    let _ = t.take_pty_response();
+    t.advance(b"\x1bc"); // RIS
+    assert_eq!(
+        t.take_pty_response(),
+        b"\x1b]52;c;\x07".to_vec(),
+        "RIS must answer, not strand, a pending read"
+    );
+    assert!(t.take_clipboard_reads().is_empty());
 }
 
 // ---- OSC 4 / 10 / 11 / 12 colors ----
@@ -3116,13 +3273,13 @@ fn osc52_primary_selection_recognised() {
 }
 
 #[test]
-fn osc52_read_request_dropped_when_disabled() {
+fn osc52_read_request_refused_when_disabled() {
     let mut t = Terminal::new(2, 10);
     assert!(!t.clipboard_read_enabled(), "reads off by default");
     t.advance(b"\x1b]52;c;?\x07");
-    // No write produced, no reply queued.
+    // No write produced; the reply carries an empty payload (refusal).
     assert!(t.take_clipboard_write().is_none());
-    assert!(t.take_pty_response().is_empty());
+    assert_eq!(t.take_pty_response(), b"\x1b]52;c;\x07".to_vec());
 }
 
 #[test]

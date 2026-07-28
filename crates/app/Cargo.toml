@@ -125,6 +125,17 @@ rfd = { version = "=0.16.0", default-features = false, features = ["xdg-portal",
 # grid-snapshot + paste/scroll allocation churn. Set as `#[global_allocator]` in
 # both binary roots. Pure-Rust-friendly vendored C, no runtime deps.
 mimalloc = "=0.1.52"
+# System-clipboard READ for OSC 52 clipboard queries (`crate::clipboard_read`).
+# egui exposes clipboard WRITES (`Context::copy_text`) but no read API — a paste
+# can only arrive as an OS-delivered `Event::Paste`, which needs a user
+# keystroke an OSC 52 query does not have. Already in the lock graph at this
+# exact version (egui-winit uses it for the write side), so no new
+# supply-chain surface. Exact-pinned per dependency-management.md. MIT/Apache-2.0.
+arboard = "=3.6.1"
+# Wipe the clipboard plaintext an OSC 52 read pulls (routinely a password or
+# token) from its allocation on drop, matching the write path's `ClipboardWrite`
+# discipline in core. Same exact version core pins; already in the lock graph.
+zeroize = "=1.9.0"
 
 [dev-dependencies]
 # Headless egui UI tests (kittest = AccessKit-driven). State-assertion tests run

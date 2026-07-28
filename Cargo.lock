@@ -1007,6 +1007,7 @@ version = "0.4.25"
 dependencies = [
  "ab_glyph",
  "anyhow",
+ "arboard",
  "c0pl4nd-core",
  "c0pl4nd-renderer",
  "eframe",
@@ -1044,6 +1045,7 @@ dependencies = [
  "windows",
  "winit",
  "winresource",
+ "zeroize",
  "zip",
 ]
 

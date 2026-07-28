@@ -382,6 +382,10 @@ struct Screen {
     /// DEFAULT-OFF (see `clipboard_read_enabled`) to avoid the canonical
     /// host-clipboard-exfiltration vulnerability.
     pending_clipboard_writes: Vec<ClipboardWrite>,
+    /// OSC 52 clipboard READ requests awaiting a host answer. Populated ONLY
+    /// while `clipboard_read_enabled` is true; a denied read is answered inline
+    /// with an empty payload and never lands here.
+    pending_clipboard_reads: Vec<osc::ClipboardReadRequest>,
     clipboard_read_enabled: bool,
     /// OSC 4 / 10 / 11 / 12 / 104 / 11x color-set requests, drained by the app
     /// so it can apply them to its live theme.
@@ -445,6 +449,7 @@ impl Screen {
             command_marks: Vec::new(),
             pty_response: Vec::new(),
             pending_clipboard_writes: Vec::new(),
+            pending_clipboard_reads: Vec::new(),
             clipboard_read_enabled: false,
             pending_color_sets: Vec::new(),
             pending_notifications: Vec::new(),
@@ -575,11 +580,22 @@ impl Screen {
 
     /// Handles `OSC 52 ; <selection> ; <base64|?>` (clipboard set/query).
     ///
-    /// WRITE-only by default. A `?` payload is a clipboard READ request and is
-    /// ignored unless [`Terminal::set_clipboard_read_enabled`] is opted into —
-    /// and even then the core does not read the host clipboard itself; the app
-    /// must call [`Terminal::respond_clipboard_read`]. This avoids the canonical
-    /// OSC 52 host-clipboard-exfiltration vulnerability.
+    /// WRITE-only by default. A `?` payload is a clipboard READ request, gated
+    /// on [`Terminal::set_clipboard_read_enabled`] (DEFAULT-OFF — an
+    /// on-by-default clipboard read is the canonical OSC 52 exfiltration hole:
+    /// anything with a handle on the tty could siphon whatever the user last
+    /// copied, passwords and tokens included).
+    ///
+    /// - **Denied (the default)** — the terminal answers the query ITSELF with
+    ///   an empty-payload OSC 52 reply and queues nothing. It never consults the
+    ///   host clipboard, so zero bytes leak; and because it still ANSWERS, a
+    ///   program blocking on the reply is released instead of hanging until its
+    ///   own timeout (see [`osc::format_clipboard_reply`]).
+    /// - **Allowed** — the request is queued as a
+    ///   [`osc::ClipboardReadRequest`] for the app to drain
+    ///   ([`Terminal::take_clipboard_reads`]). Even then the core never reads the
+    ///   host clipboard itself; the app supplies the text via
+    ///   [`Terminal::respond_clipboard_read`].
     fn handle_osc_52(&mut self, params: &[&[u8]]) {
         let sel_bytes = params.get(1).copied().unwrap_or(b"c");
         let payload = params.get(2).copied().unwrap_or(b"");
@@ -595,9 +611,24 @@ impl Screen {
             .unwrap_or(ClipboardSelection::Clipboard);
 
         if payload == b"?" {
-            // Clipboard READ request: DEFAULT-OFF; never auto-respond with host
-            // clipboard contents. Dropped; the app may later call
-            // respond_clipboard_read after opting in.
+            if self.clipboard_read_enabled {
+                // Opted in: surface the request so the host can answer it with
+                // real clipboard text. Bounded — a program spamming `?` must not
+                // grow this queue without limit (oldest dropped, matching every
+                // other PTY-driven buffer).
+                self.pending_clipboard_reads
+                    .push(osc::ClipboardReadRequest { selection });
+                while self.pending_clipboard_reads.len() > Self::CLIPBOARD_READS_MAX {
+                    self.pending_clipboard_reads.remove(0);
+                }
+            } else {
+                // DENIED (the default). Answer with an EMPTY payload: the host
+                // clipboard is never consulted, so nothing leaks — but the
+                // requesting program still gets a well-formed reply and resumes
+                // instead of blocking on a response that never comes.
+                let reply = osc::format_clipboard_reply(selection, "");
+                self.push_pty_response(reply.as_bytes());
+            }
             return;
         }
 
@@ -1229,6 +1260,25 @@ impl Screen {
             // so explicitly clearing the queue here scrubs sensitive plaintext
             // that the app had not yet drained.
             self.clear_pending_clipboard_writes();
+            // An un-drained OSC 52 read request is a program still blocking on a
+            // reply. A hard reset must not strand it, so refuse each with the
+            // empty-payload answer rather than silently forgetting it.
+            self.deny_pending_clipboard_reads();
+        }
+    }
+
+    /// Answer every un-drained OSC 52 read request with the empty-payload deny
+    /// reply, then clear the queue.
+    ///
+    /// Used wherever pending reads must be abandoned — a hard reset, or the user
+    /// switching `clipboard_read_allow` back off while a request is in flight.
+    /// Answering rather than dropping preserves the no-hang guarantee: the
+    /// requesting program gets a well-formed reply carrying zero clipboard bytes
+    /// instead of blocking forever on one that never arrives.
+    fn deny_pending_clipboard_reads(&mut self) {
+        for req in std::mem::take(&mut self.pending_clipboard_reads) {
+            let reply = osc::format_clipboard_reply(req.selection, "");
+            self.push_pty_response(reply.as_bytes());
         }
     }
 
@@ -2446,6 +2496,11 @@ impl Screen {
     /// occasional and the last write wins, so a small cap suffices; oldest
     /// dropped on overflow. (Each payload is already byte-capped on entry.)
     const CLIPBOARD_WRITES_MAX: usize = 64;
+    /// Max queued OSC 52 clipboard-READ requests between drains. Only ever
+    /// non-empty when reads are opted into; a program spamming `OSC 52 ; c ; ?`
+    /// must not grow this without bound, so the oldest is dropped on overflow.
+    /// Small — the app drains every frame and each request carries no payload.
+    const CLIPBOARD_READS_MAX: usize = 16;
     /// Max queued OSC 9;4 progress updates between drains. Only the latest state
     /// is meaningful, so a small cap bounds a flood; oldest dropped on overflow.
     const PROGRESS_MAX: usize = 256;
@@ -3150,13 +3205,40 @@ impl Terminal {
 
     /// Enables (or disables) responding to OSC 52 clipboard READ requests.
     ///
-    /// DEFAULT-OFF. When disabled (the default), an `OSC 52 ; c ; ?` query is
-    /// silently dropped — the terminal never leaks host clipboard contents back
-    /// to a program, which is the canonical OSC 52 read vulnerability. Even when
-    /// enabled, the core never reads the host clipboard itself; the host
-    /// supplies the text via [`Terminal::respond_clipboard_read`].
+    /// DEFAULT-OFF. While disabled (the default), an `OSC 52 ; c ; ?` query is
+    /// answered by the terminal itself with an EMPTY payload — the host
+    /// clipboard is never consulted, so nothing leaks (the canonical OSC 52 read
+    /// vulnerability), while the requesting program still receives a reply and
+    /// does not hang. Even when enabled, the core never reads the host clipboard
+    /// itself: it queues the request for
+    /// [`Terminal::take_clipboard_reads`] and the host supplies the text via
+    /// [`Terminal::respond_clipboard_read`].
+    ///
+    /// Switching this OFF also refuses any request still queued from while it
+    /// was on, so flipping the setting can never strand a blocked program.
     pub fn set_clipboard_read_enabled(&mut self, enabled: bool) {
         self.screen.clipboard_read_enabled = enabled;
+        if !enabled {
+            self.screen.deny_pending_clipboard_reads();
+        }
+    }
+
+    /// Drains the oldest pending OSC 52 clipboard READ request, if any.
+    ///
+    /// Always `None` unless clipboard reads were opted into — a denied read is
+    /// answered inline by the terminal and never queued. The host answers a
+    /// drained request with [`Terminal::respond_clipboard_read`].
+    pub fn take_clipboard_read(&mut self) -> Option<osc::ClipboardReadRequest> {
+        if self.screen.pending_clipboard_reads.is_empty() {
+            None
+        } else {
+            Some(self.screen.pending_clipboard_reads.remove(0))
+        }
+    }
+
+    /// Drains all pending OSC 52 clipboard READ requests at once.
+    pub fn take_clipboard_reads(&mut self) -> Vec<osc::ClipboardReadRequest> {
+        std::mem::take(&mut self.screen.pending_clipboard_reads)
     }
 
     /// Returns whether OSC 52 clipboard READ responses are enabled.
@@ -3174,12 +3256,8 @@ impl Terminal {
         if !self.screen.clipboard_read_enabled {
             return;
         }
-        let sel = match selection {
-            ClipboardSelection::Clipboard => 'c',
-            ClipboardSelection::Primary => 'p',
-        };
         let encoded = base64_encode(text.as_bytes());
-        let resp = format!("\x1b]52;{};{}\x07", sel, encoded);
+        let resp = osc::format_clipboard_reply(selection, &encoded);
         // Route through the capped sink so PTY_RESPONSE_MAX is honoured
         // uniformly (the cap's doc claims it is the single sink for every
         // reply). This path is host-gated (clipboard_read_enabled, default-off).

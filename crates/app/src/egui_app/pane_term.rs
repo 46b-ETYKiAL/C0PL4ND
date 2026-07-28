@@ -687,6 +687,20 @@ impl PaneTerm {
             let Ok(mut term) = term_arc.lock() else {
                 return out;
             };
+            // OSC 52 clipboard READ: answer any request the core PARKED for us.
+            // The core only ever parks one when the user opted in
+            // (`clipboard_read_allow`, default OFF) — a denied query was already
+            // refused inside the parser with an empty-payload reply and never
+            // reaches here, so this loop cannot leak a clipboard the user did
+            // not open. Runs BEFORE `take_pty_response` so the answer ships in
+            // the same drain rather than a frame later. A failed read yields
+            // `None` → an empty reply, which still releases a program blocking
+            // on the answer.
+            for req in term.take_clipboard_reads() {
+                let text = crate::clipboard_read::read_selection(req.selection);
+                let text = text.as_ref().map(|t| t.as_str()).unwrap_or("");
+                term.respond_clipboard_read(req.selection, text);
+            }
             let response = term.take_pty_response();
             for mut cw in term.take_clipboard_writes() {
                 // `ClipboardWrite` zeroizes its buffer on drop; take the text out
@@ -919,6 +933,25 @@ impl PaneTerm {
         if let Some(session) = self.session.as_ref() {
             if let Ok(mut term) = session.terminal().lock() {
                 term.set_max_scrollback(max_scrollback);
+            }
+        }
+    }
+
+    /// Apply the `clipboard_read_allow` setting to this pane's live terminal —
+    /// whether a program inside it may READ the system clipboard via
+    /// `OSC 52 ; c ; ?`. DEFAULT-DENY; without this call the terminal keeps its
+    /// own default (denied), so a wiring failure fails closed.
+    ///
+    /// Applied every frame like the scrollback cap, so flipping the setting takes
+    /// effect immediately — including turning it back OFF, which also refuses any
+    /// request still in flight rather than stranding the program that made it.
+    /// No-op for a dead pane / poisoned lock.
+    pub fn set_clipboard_read_allowed(&self, allowed: bool) {
+        if let Some(session) = self.session.as_ref() {
+            if let Ok(mut term) = session.terminal().lock() {
+                if term.clipboard_read_enabled() != allowed {
+                    term.set_clipboard_read_enabled(allowed);
+                }
             }
         }
     }
@@ -1791,6 +1824,99 @@ mod tests {
             "notification queue drained"
         );
         assert!(t.take_progress().is_empty(), "progress queue drained");
+    }
+
+    /// A freshly spawned pane must DENY OSC 52 clipboard reads, and the refusal
+    /// must be the empty-payload reply rather than silence. This is the
+    /// fail-closed half: a pane that is never told about the setting keeps the
+    /// safe default, so a wiring failure cannot open the hole.
+    #[test]
+    fn pane_denies_clipboard_reads_until_told_otherwise() {
+        let pane = PaneTerm::spawn(void_theme(), 80, 24);
+        let Some(term) = pane.terminal_for_test() else {
+            return;
+        };
+        let mut t = term.lock().unwrap();
+        assert!(
+            !t.clipboard_read_enabled(),
+            "a fresh pane must deny clipboard reads"
+        );
+        t.advance(b"\x1b]52;c;?\x07");
+        assert!(
+            t.take_clipboard_reads().is_empty(),
+            "a denied read must never be parked for the host to serve"
+        );
+        assert_eq!(
+            t.take_pty_response(),
+            b"\x1b]52;c;\x07".to_vec(),
+            "the refusal must be an empty-payload OSC 52 reply, not silence"
+        );
+    }
+
+    /// The config → terminal wire: `set_clipboard_read_allowed` must actually
+    /// move the emulator's gate in BOTH directions. Without this the Settings
+    /// checkbox would persist a value that changed nothing (a dead setting), and
+    /// — worse — turning it back off would not close the hole.
+    #[test]
+    fn set_clipboard_read_allowed_moves_the_terminal_gate_both_ways() {
+        let pane = PaneTerm::spawn(void_theme(), 80, 24);
+        let Some(term) = pane.terminal_for_test() else {
+            return;
+        };
+        assert!(!term.lock().unwrap().clipboard_read_enabled());
+
+        pane.set_clipboard_read_allowed(true);
+        assert!(
+            term.lock().unwrap().clipboard_read_enabled(),
+            "opting in must reach the emulator"
+        );
+
+        pane.set_clipboard_read_allowed(false);
+        assert!(
+            !term.lock().unwrap().clipboard_read_enabled(),
+            "opting back OUT must reach the emulator too"
+        );
+        // And a request parked while it was on must have been refused, not left
+        // to strand the program that made it.
+        let mut t = term.lock().unwrap();
+        assert!(t.take_clipboard_reads().is_empty());
+    }
+
+    /// `pump_host_effects` must SERVE a parked OSC 52 read in the same drain:
+    /// answer it, then ship the reply. Asserting the response queue is empty
+    /// afterwards is what pins the ordering — if the answer were produced AFTER
+    /// `take_pty_response`, the reply would sit here for a frame instead of
+    /// going out with this drain.
+    #[test]
+    fn pump_host_effects_serves_a_parked_clipboard_read() {
+        let pane = PaneTerm::spawn(void_theme(), 80, 24);
+        let Some(term) = pane.terminal_for_test() else {
+            return;
+        };
+        pane.set_clipboard_read_allowed(true);
+        {
+            let mut t = term.lock().unwrap();
+            t.advance(b"\x1b]52;c;?\x07");
+            assert_eq!(
+                t.take_clipboard_reads().len(),
+                1,
+                "precondition: an opted-in read parks a request"
+            );
+            // Re-park it for the pump to find (the assert above drained it).
+            t.advance(b"\x1b]52;c;?\x07");
+        }
+        let mut pane = pane;
+        let _ = pane.pump_host_effects();
+        let mut t = term.lock().unwrap();
+        assert!(
+            t.take_clipboard_reads().is_empty(),
+            "pump must consume the parked read request"
+        );
+        assert!(
+            t.take_pty_response().is_empty(),
+            "pump must answer BEFORE draining the response queue, so the reply \
+             ships in this drain rather than a frame later"
+        );
     }
 
     /// [`PaneTerm::scroll_view`] drives local scrollback: after enough output to

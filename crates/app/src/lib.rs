@@ -33,6 +33,10 @@
 /// the initial pane's PTY spawn consumes. In the lib (not a binary module) so
 /// the wiring suites in `tests/` drive the SAME store the shipping binary sets.
 pub mod cli_cwd;
+/// Host-side system-clipboard READ, the answering half of an opted-in OSC 52
+/// clipboard query. The only place in C0PL4ND that pulls text off the OS
+/// clipboard; always called behind the core's default-off gate.
+pub mod clipboard_read;
 pub mod egui_app;
 pub mod issue_intake;
 pub mod reporting;

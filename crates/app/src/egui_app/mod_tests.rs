@@ -1501,3 +1501,135 @@ fn pump_leaves_taskbar_untouched_when_no_progress_drained() {
         "an empty progress drain must not touch the taskbar button"
     );
 }
+
+/// The last link of the OSC 52 clipboard-READ chain: real frames must push
+/// `config.clipboard_read_allow` down onto EVERY live pane's emulator, in BOTH
+/// directions. Without this the Settings checkbox would persist a value that
+/// changed nothing (a dead setting), and — worse — turning it back OFF would
+/// leave the hole open for the rest of the session.
+///
+/// Drives the REAL `frame_tick` and observes the REAL emulator gate, re-reading
+/// the live panes after each frame, so it cannot pass on a stale handle or a
+/// test-only mirror of the propagation.
+///
+/// Note the ordering the assertions pin: a pane spawned DURING a frame is
+/// created after the propagation loop has already run, so it picks the setting
+/// up on the following frame. That lag is fail-closed by construction — a fresh
+/// emulator denies reads on its own — so the opt-IN is what is delayed, never
+/// the opt-OUT.
+#[test]
+fn frame_tick_propagates_the_clipboard_read_gate_to_every_pane() {
+    /// Every live pane's gate state, as the emulator itself reports it.
+    fn gates(app: &C0pl4ndApp) -> Vec<bool> {
+        app.terms
+            .values()
+            .filter_map(|p| p.terminal_for_test())
+            .map(|t| t.lock().unwrap().clipboard_read_enabled())
+            .collect()
+    }
+    fn frame(ctx: &egui::Context, app: &mut C0pl4ndApp) {
+        ctx.begin_pass(egui::RawInput::default());
+        app.frame_tick(ctx);
+        let _ = ctx.end_pass();
+    }
+
+    let ctx = egui::Context::default();
+    let mut app = C0pl4ndApp::bootstrap();
+    assert!(
+        !app.config.clipboard_read_allow,
+        "precondition: the shipping default denies clipboard reads"
+    );
+
+    // Opt in. The first frame spawns the pane; the pane must NOT come up already
+    // opened — it starts denied and is opened by the propagation, never before.
+    app.config.clipboard_read_allow = true;
+    frame(&ctx, &mut app);
+    let born = gates(&app);
+    assert!(
+        !born.is_empty(),
+        "the app must have at least one live pane to assert on"
+    );
+    assert!(
+        born.iter().all(|&g| !g),
+        "a newly spawned pane must start DENIED regardless of config, got {born:?}"
+    );
+
+    frame(&ctx, &mut app);
+    let on = gates(&app);
+    assert_eq!(on.len(), born.len(), "same panes still live");
+    assert!(
+        on.iter().all(|&g| g),
+        "a frame must push the opt-in down to every live pane's emulator, got {on:?}"
+    );
+
+    // Opt back out: the hole must close on the very next frame.
+    app.config.clipboard_read_allow = false;
+    frame(&ctx, &mut app);
+    let off = gates(&app);
+    assert_eq!(off.len(), on.len(), "same panes still live");
+    assert!(
+        off.iter().all(|&g| !g),
+        "turning the setting OFF must close the gate again, not leave it open, got {off:?}"
+    );
+}
+
+/// The Settings checkbox must be bound to the real field: clicking
+/// "Allow programs to read the clipboard (OSC 52)" has to flip
+/// `config.clipboard_read_allow` — and nothing else in the Clipboard group.
+///
+/// Drives the REAL widget by its accessible label through the REAL frame loop
+/// (open the gear → pick Terminal → click the row), so a checkbox wired to the
+/// wrong field, or rendered but inert, fails here rather than shipping as a
+/// security setting that does nothing.
+#[test]
+fn clicking_the_clipboard_read_checkbox_flips_the_live_config() {
+    use egui_kittest::kittest::Queryable;
+
+    let app = std::cell::RefCell::new(C0pl4ndApp::bootstrap());
+    assert!(
+        !app.borrow().config.clipboard_read_allow,
+        "precondition: clipboard reads default to DENIED"
+    );
+    // Neighbours in the same Clipboard group, to prove the click is targeted.
+    let copy_on_select_before = app.borrow().config.copy_on_select;
+    let paste_warn_before = app.borrow().config.paste_warn_multiline;
+
+    #[allow(deprecated)]
+    let mut h = egui_kittest::Harness::new(|ctx| app.borrow_mut().frame_tick(ctx));
+    h.set_size(egui::vec2(1200.0, 800.0));
+    h.run();
+
+    h.get_by_label("settings").click();
+    h.run();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Terminal")
+        .click();
+    h.run();
+
+    h.get_by_label("Allow programs to read the clipboard (OSC 52)")
+        .click();
+    h.run();
+
+    assert!(
+        app.borrow().config.clipboard_read_allow,
+        "clicking the OSC 52 row must opt the live config IN"
+    );
+    assert_eq!(
+        app.borrow().config.copy_on_select,
+        copy_on_select_before,
+        "the click must not disturb its neighbour rows"
+    );
+    assert_eq!(
+        app.borrow().config.paste_warn_multiline,
+        paste_warn_before,
+        "the click must not disturb its neighbour rows"
+    );
+
+    // And it must toggle back OFF — a one-way security switch would be a trap.
+    h.get_by_label("Allow programs to read the clipboard (OSC 52)")
+        .click();
+    h.run();
+    assert!(
+        !app.borrow().config.clipboard_read_allow,
+        "clicking again must opt back OUT"
+    );
+}

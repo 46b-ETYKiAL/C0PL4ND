@@ -3902,8 +3902,13 @@ impl C0pl4ndApp {
         // cheap (≤ MAX_PANES panes; the render path already locks each pane many
         // times per frame) and idempotent. Clamped to the Settings slider range.
         let scrollback = self.config.scrollback_lines.clamp(100, 1_000_000);
+        // Same per-frame, idempotent apply for the OSC 52 clipboard-READ gate
+        // (`clipboard_read_allow`, DEFAULT-DENY) so the setting takes effect —
+        // and so turning it back off takes effect just as promptly.
+        let clipboard_read_allow = self.config.clipboard_read_allow;
         for term in self.terms.values() {
             term.set_max_scrollback(scrollback);
+            term.set_clipboard_read_allowed(clipboard_read_allow);
         }
         // Wire each live pane's UI-wake callback (once) so live PTY output wakes
         // the render loop — the other half of the damage-tracked-redraw scheme

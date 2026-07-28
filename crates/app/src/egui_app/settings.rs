@@ -1546,7 +1546,7 @@ fn render_sections(
 
             if row_visible(q, "quake hotkey combo shortcut") {
                 ui.label("Quake hotkey").on_hover_text(
-                    "The combo, written as Mod+Mod+Key â€” e.g. Ctrl+Shift+Grave, \
+                    "The combo, written as Mod+Mod+Key — e.g. Ctrl+Shift+Grave, \
                      Win+F12, Alt+Space. Modifiers: Ctrl, Alt, Shift, Win. \
                      At least one modifier is required.",
                 );
@@ -1565,7 +1565,7 @@ fn render_sections(
                         ui.colored_label(egui::Color32::from_rgb(0xE0, 0x6C, 0x75), "invalid")
                             .on_hover_text(
                                 "Not a combo we can register. It needs at least one \
-                                 modifier plus one key â€” a bare key would be taken \
+                                 modifier plus one key — a bare key would be taken \
                                  from every other application. Quake mode stays off \
                                  until this parses.",
                             );
@@ -1902,6 +1902,8 @@ fn render_sections(
             "shell",
             "copy on select",
             "paste",
+            "clipboard read",
+            "osc 52",
         ],
     ) {
         ui.heading("Terminal");
@@ -2001,6 +2003,37 @@ fn render_sections(
                     ui,
                     &mut config.paste_warn_multiline,
                     &def.paste_warn_multiline,
+                );
+                ui.end_row();
+            }
+
+            if row_visible(q, "clipboard read osc 52 allow program security") {
+                // DEFAULT-DENY, and deliberately phrased as a risk rather than a
+                // feature. Clipboard WRITES from a program are always accepted
+                // (worst case: a clobbered clipboard); a READ is an exfiltration
+                // primitive — anything that can write to the tty could siphon
+                // whatever was last copied, which is routinely a password.
+                changed |= ui
+                    .checkbox(
+                        &mut config.clipboard_read_allow,
+                        "Allow programs to read the clipboard (OSC 52)",
+                    )
+                    .on_hover_text(
+                        "Security: OFF by default. When ON, any program running in \
+                         a pane can read your system clipboard — including one you \
+                         did not start, or output piped in over ssh/tmux. Whatever \
+                         you last copied (passwords, tokens) becomes readable. \
+                         Copying TO the clipboard from a program always works and \
+                         is unaffected. While OFF, a read request is refused with \
+                         an empty reply, so well-behaved programs continue rather \
+                         than hang.",
+                    )
+                    .changed();
+                ui.label("");
+                changed |= reset_to_default(
+                    ui,
+                    &mut config.clipboard_read_allow,
+                    &def.clipboard_read_allow,
                 );
                 ui.end_row();
             }

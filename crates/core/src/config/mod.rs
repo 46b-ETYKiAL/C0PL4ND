@@ -1193,6 +1193,24 @@ pub struct Config {
     /// the multi-line gate is independent and unaffected.
     #[serde(default = "default_paste_warn_bytes")]
     pub paste_warn_bytes: usize,
+    /// Allow a program running inside the terminal to READ the system clipboard
+    /// via an `OSC 52 ; c ; ?` query. **Default `false` (deny)** — this is the
+    /// security-relevant half of OSC 52.
+    ///
+    /// Clipboard *writes* (a program setting the clipboard) are always accepted:
+    /// the worst case is a clobbered clipboard. A *read* is an exfiltration
+    /// primitive — anything that can write to the tty (a compromised tool, a
+    /// hostile file dumped with `cat`, output relayed over ssh/tmux) could siphon
+    /// whatever the user last copied, which is routinely a password or an API
+    /// token. So the read direction is opt-in, never on by default.
+    ///
+    /// Denying does NOT mean staying silent: a query is answered with an
+    /// empty-payload OSC 52 reply, so the asking program resumes immediately
+    /// instead of blocking on a response that never comes, and zero clipboard
+    /// bytes are disclosed. `#[serde(default)]` keeps older config files (written
+    /// before this field existed) loading with reads denied.
+    #[serde(default)]
+    pub clipboard_read_allow: bool,
     /// Keep split-pane dividers LINKED so every sibling pane stays the same size.
     /// When `true`, the dividers are held at equal positions each frame — drag one
     /// and they hold equal ("move together"). Defaults to `false` so panes are
@@ -1309,6 +1327,10 @@ impl Default for Config {
             copy_on_select: false,
             paste_warn_multiline: true,
             paste_warn_bytes: default_paste_warn_bytes(),
+            // DEFAULT-DENY. An on-by-default OSC 52 clipboard read is an
+            // exfiltration hole; the user opts in explicitly (Settings →
+            // Terminal → Clipboard).
+            clipboard_read_allow: false,
             history_capture_enabled: true,
             reporting: ReportingConfig::default(),
             settings_win_w: None,

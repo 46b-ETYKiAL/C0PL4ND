@@ -150,9 +150,13 @@ fn image_and_base64_decoders_are_bounded_on_hostile_input() {
 }
 
 /// (c) OSC 52 clipboard READ must stay default-off: an `OSC 52 ; c ; ?` query
-/// must NOT emit a reply (the canonical host-clipboard-exfiltration vector).
+/// must NOT return any clipboard data (the canonical host-clipboard-
+/// exfiltration vector). The refusal is an EMPTY-payload OSC 52 reply rather
+/// than silence, so the asking program is released instead of blocking on an
+/// answer that never comes — the no-leak guarantee is unchanged, and asserted
+/// on the exact bytes.
 #[test]
-fn osc52_clipboard_read_is_default_off_and_silent() {
+fn osc52_clipboard_read_is_default_off_and_leaks_nothing() {
     let mut t = Terminal::new(10, 40);
     assert!(
         !t.clipboard_read_enabled(),
@@ -160,9 +164,11 @@ fn osc52_clipboard_read_is_default_off_and_silent() {
     );
     // A program requests the host clipboard contents.
     t.advance(b"\x1b]52;c;?\x07");
-    assert!(
-        t.take_pty_response().is_empty(),
-        "OSC 52 read query must never leak host clipboard back to the PTY when disabled"
+    assert_eq!(
+        t.take_pty_response(),
+        b"\x1b]52;c;\x07".to_vec(),
+        "a denied OSC 52 read must reply with an EMPTY payload — no clipboard \
+         bytes, but also not silence (silence hangs the caller)"
     );
 
     // A WRITE request is still honoured (that direction is safe / expected):
@@ -174,12 +180,18 @@ fn osc52_clipboard_read_is_default_off_and_silent() {
 
     // Even after opting in, a read only ever replies with host-SUPPLIED text —
     // never the terminal reading the clipboard itself. With no host text
-    // supplied, the bare query still produces nothing.
+    // supplied, the bare query still produces nothing on the wire; it only
+    // parks a request for the host to answer.
     t.set_clipboard_read_enabled(true);
     t.advance(b"\x1b]52;c;?\x07");
     assert!(
         t.take_pty_response().is_empty(),
         "an opted-in read still requires the HOST to supply text; the core never reads the clipboard"
+    );
+    assert_eq!(
+        t.take_clipboard_reads().len(),
+        1,
+        "an opted-in read parks a request for the host instead of answering it"
     );
 }
 

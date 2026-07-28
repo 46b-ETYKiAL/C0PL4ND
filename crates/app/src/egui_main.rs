@@ -48,6 +48,15 @@ mod win_chrome;
 #[path = "egui_app/tray.rs"]
 mod tray;
 
+// Quake mode: a DEFAULT-OFF global hotkey that drops the window down from the top
+// of the monitor under the cursor and hides it again. A BINARY-local module for
+// the same reason as `tray`/`win_chrome` — it needs the real eframe HWND and the
+// running winit message loop (it reads `WM_HOTKEY` through its own
+// `SetWindowSubclass` entry, chaining rather than competing with `win_chrome`'s).
+// Its raw Win32 FFI is quarantined behind its own `#![allow(unsafe_code)]`.
+#[path = "egui_app/quake.rs"]
+mod quake;
+
 // The egui shell lives in this crate's lib target so `tests/` links THIS
 // compilation instead of `#[path]`-including a private second copy — which made
 // llvm-cov attribute the kittest suites' coverage to an object the report never
@@ -326,6 +335,25 @@ fn main() -> eframe::Result<()> {
             if let Some(icon) = load_app_icon() {
                 tray::init(&cc.egui_ctx, icon.rgba, icon.width, icon.height);
             }
+            // Quake mode (drop-down terminal). Primed + armed HERE for the same
+            // reasons as the tray: the real HWND must exist and we must be on the
+            // event-loop thread, because `RegisterHotKey` targets that window's
+            // message queue and `quake` reads `WM_HOTKEY` off it via its own
+            // subclass. DEFAULT OFF — `quake::init` registers NOTHING unless
+            // `quake.enabled` is set in the config, and refuses an unparseable or
+            // modifier-less combo rather than claiming an unintended global hotkey.
+            // Applies at startup (a settings change takes effect on the next
+            // launch); best-effort — a busy combo logs a warning and never blocks.
+            #[cfg(windows)]
+            {
+                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                if let Ok(handle) = cc.window_handle() {
+                    if let RawWindowHandle::Win32(w) = handle.as_raw() {
+                        quake::prime_hwnd(w.hwnd.get());
+                    }
+                }
+            }
+            quake::init(&cc.egui_ctx, &launch_quake_config());
             // On-launch update check. Drives the SHARED in-app updater that powers
             // the persistent, dismissible NOTIFICATION BANNER (and the Settings →
             // Updates page): a found update surfaces a one-click "Update now" strip
@@ -411,6 +439,22 @@ fn launch_always_on_top() -> bool {
                 .and_then(|s| c0pl4nd_core::Config::from_toml(&s, &p).ok())
         })
         .map(|c| c.always_on_top)
+        .unwrap_or_default()
+}
+
+/// The persisted quake-mode block, read from the on-disk config at startup.
+/// Mirrors [`launch_always_on_top`]: a missing / unreadable / malformed config
+/// yields [`QuakeConfig::default`] — which is `enabled: false` — so a config
+/// problem can never accidentally claim a global hotkey.
+fn launch_quake_config() -> c0pl4nd_core::config::QuakeConfig {
+    c0pl4nd_core::Config::default_path()
+        .filter(|p| p.exists())
+        .and_then(|p| {
+            std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|s| c0pl4nd_core::Config::from_toml(&s, &p).ok())
+        })
+        .map(|c| c.quake)
         .unwrap_or_default()
 }
 
@@ -734,6 +778,127 @@ mod tests {
             (6, 34),
             "maximize-button y mirrors chrome.rs"
         );
+    }
+
+    /// Quake mode and the tray icon both toggle the SAME window, so they must
+    /// share one state model or they will fight: if quake kept a private "is it
+    /// dropped?" latch, a tray minimize would invalidate it and the next hotkey
+    /// press would retract an already-hidden window — the user presses the key and
+    /// nothing appears.
+    ///
+    /// Both decide from the live OS state instead. This pins the contract across
+    /// all eight `(visible, minimized, foreground)` combinations: whenever quake
+    /// reads the window as out-of-view it drops it DOWN (never retracts), and the
+    /// tray — fed the identical predicate — restores it. Only the one state where
+    /// the window is genuinely in view AND focused retracts, and the resulting
+    /// hidden window is exactly what the tray then reads as restorable.
+    ///
+    /// This is a genuine cross-module test: `quake` and `tray` are separate
+    /// `#[path]` modules that never import each other, so nothing but this
+    /// assertion keeps their state models aligned.
+    #[test]
+    fn quake_and_tray_agree_on_window_state() {
+        use crate::quake::{is_out_of_view, quake_action, QuakeAction};
+        use crate::tray::{toggle_action, ToggleAction};
+
+        for visible in [false, true] {
+            for minimized in [false, true] {
+                for foreground in [false, true] {
+                    // Derive the expectation INDEPENDENTLY rather than calling
+                    // `is_out_of_view` and feeding both sides from it — that would
+                    // make the test self-referential (cutting `is_out_of_view`
+                    // would move both sides together and the assertions would still
+                    // pass, proving nothing). Restating the predicate here is what
+                    // makes the check adversarial; the assert below then pins the
+                    // production function to this independent statement.
+                    let out = !visible || minimized;
+                    assert_eq!(
+                        is_out_of_view(visible, minimized),
+                        out,
+                        "the production out-of-view predicate must be `!visible || \
+                         minimized` ({visible},{minimized})"
+                    );
+                    let q = quake_action(visible, minimized, foreground);
+                    let t = toggle_action(out);
+                    if out {
+                        assert_eq!(
+                            q,
+                            QuakeAction::DropDown,
+                            "quake must SHOW an out-of-view window ({visible},{minimized},{foreground})"
+                        );
+                        assert_eq!(
+                            t,
+                            ToggleAction::Restore,
+                            "the tray must agree the window is out of view"
+                        );
+                    } else {
+                        assert_eq!(
+                            t,
+                            ToggleAction::Minimize,
+                            "the tray must agree the window is in view"
+                        );
+                        // In view: quake retracts only when it also has focus.
+                        let expected = if foreground {
+                            QuakeAction::Retract
+                        } else {
+                            QuakeAction::DropDown
+                        };
+                        assert_eq!(q, expected, "({visible},{minimized},{foreground})");
+                    }
+                }
+            }
+        }
+
+        // The hand-off itself: a quake retract HIDES the window (visible = false),
+        // and the tray's very next click must therefore restore it — the escape
+        // hatch stays correct after quake has run.
+        assert_eq!(quake_action(true, false, true), QuakeAction::Retract);
+        assert_eq!(
+            toggle_action(is_out_of_view(false, false)),
+            ToggleAction::Restore,
+            "after a quake retract the tray must restore, not minimize again"
+        );
+        // And symmetrically: after a tray minimize the next hotkey must drop down.
+        assert_eq!(toggle_action(false), ToggleAction::Minimize);
+        assert_eq!(quake_action(true, true, false), QuakeAction::DropDown);
+    }
+
+    /// Reachability + correctness guard for the quake wiring, mirroring the
+    /// `win_chrome` test above: `main` calls `quake::init(&ctx,
+    /// &launch_quake_config())`, so this drives that EXACT config reader and the
+    /// EXACT geometry function the hotkey path uses, and asserts the two
+    /// safety-critical properties — the shipped default claims no global hotkey,
+    /// and the drop-down rect the shipping path computes clears the taskbar.
+    #[test]
+    fn quake_launch_config_defaults_off_and_geometry_clears_the_taskbar() {
+        // `launch_quake_config` is what the live call site feeds `quake::init`. On
+        // a machine with no config (CI) it must yield the default; on a developer
+        // machine with one it must still not be *enabled* by accident, so assert
+        // the invariant that actually matters: a default-constructed block is off.
+        let def = c0pl4nd_core::config::QuakeConfig::default();
+        assert!(!def.enabled, "quake mode must ship OFF");
+        let launched = super::launch_quake_config();
+        // Reading it must never panic and must produce a usable fraction.
+        assert!(
+            (0.1..=1.0).contains(&launched.effective_height_fraction()),
+            "the launch-path height fraction must always be usable"
+        );
+
+        // The geometry the shipping hotkey path computes, on a 1920x1080 monitor
+        // with a 40px bottom taskbar.
+        let work = crate::quake::ScreenRect::new(0, 0, 1920, 1040);
+        let r = crate::quake::quake_rect(work, def.effective_height_fraction())
+            .expect("the shipping-path geometry must produce a rect for a real work area");
+        assert_eq!(r.top, 0, "anchored to the top of the work area");
+        assert_eq!(r.width(), 1920, "full work-area width");
+        assert!(
+            r.bottom <= work.bottom,
+            "the drop-down must never overlap the taskbar"
+        );
+        // The default combo the same path would register.
+        let spec = crate::quake::parse_hotkey(&def.hotkey)
+            .expect("the shipped default combo must parse");
+        assert_ne!(spec.modifiers, 0, "the default combo carries a modifier");
     }
 
     #[test]

@@ -77,6 +77,9 @@ const APPEARANCE_SEARCH_LABELS: &[&str] = &[
     "frost frosted glass",
     "grain",
     "always on top window level",
+    "quake mode drop down terminal global hotkey",
+    "quake hotkey combo shortcut",
+    "quake height fraction drop down size",
     "ui scale",
     "zoom",
     "accessibility",
@@ -1512,6 +1515,88 @@ fn render_sections(
                     .changed();
                 ui.label(""); // checkbox carries its own label
                 changed |= reset_to_default(ui, &mut config.always_on_top, &def.always_on_top);
+                ui.end_row();
+            }
+        });
+
+        group(
+            ui,
+            "Quake mode",
+            "A drop-down terminal: one global hotkey slides the window in from the \
+             top of whichever monitor the mouse is on, and hides it again.",
+        );
+        grid("appearance_quake").show(ui, |ui| {
+            // A global hotkey is claimed process-wide and denied to every other
+            // application, so this is strictly opt-in and takes effect on the next
+            // launch (the registration happens once, at window creation).
+            if row_visible(q, "quake mode drop down terminal global hotkey") {
+                changed |= ui
+                    .checkbox(&mut config.quake.enabled, "Quake mode (drop-down)")
+                    .on_hover_text(
+                        "Register a GLOBAL hotkey that drops C0PL4ND down from the \
+                         top of the monitor under the mouse and hides it again. \
+                         Off by default: a global hotkey is claimed system-wide and \
+                         taken away from every other app. Applies on restart.",
+                    )
+                    .changed();
+                ui.label(""); // checkbox carries its own label
+                changed |= reset_to_default(ui, &mut config.quake.enabled, &def.quake.enabled);
+                ui.end_row();
+            }
+
+            if row_visible(q, "quake hotkey combo shortcut") {
+                ui.label("Quake hotkey").on_hover_text(
+                    "The combo, written as Mod+Mod+Key â€” e.g. Ctrl+Shift+Grave, \
+                     Win+F12, Alt+Space. Modifiers: Ctrl, Alt, Shift, Win. \
+                     At least one modifier is required.",
+                );
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add_enabled(
+                            config.quake.enabled,
+                            egui::TextEdit::singleline(&mut config.quake.hotkey)
+                                .desired_width(140.0),
+                        )
+                        .changed();
+                    // Validate with the SAME parser that registers the hotkey, so
+                    // the user learns here that a combo is unusable instead of
+                    // restarting into a quake mode that silently never arms.
+                    if config.quake.parsed_hotkey().is_none() {
+                        ui.colored_label(egui::Color32::from_rgb(0xE0, 0x6C, 0x75), "invalid")
+                            .on_hover_text(
+                                "Not a combo we can register. It needs at least one \
+                                 modifier plus one key â€” a bare key would be taken \
+                                 from every other application. Quake mode stays off \
+                                 until this parses.",
+                            );
+                    }
+                });
+                changed |= reset_to_default(ui, &mut config.quake.hotkey, &def.quake.hotkey);
+                ui.end_row();
+            }
+
+            if row_visible(q, "quake height fraction drop down size") {
+                ui.label("Quake height").on_hover_text(
+                    "How much of the monitor's WORK AREA (the desktop minus the \
+                     taskbar) the drop-down covers. The window is always full \
+                     work-area width and never overlaps the taskbar.",
+                );
+                changed |= ui
+                    .add_enabled(
+                        config.quake.enabled,
+                        egui::Slider::new(
+                            &mut config.quake.height_fraction,
+                            c0pl4nd_core::config::QuakeConfig::MIN_HEIGHT_FRACTION
+                                ..=c0pl4nd_core::config::QuakeConfig::MAX_HEIGHT_FRACTION,
+                        )
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                    )
+                    .changed();
+                changed |= reset_to_default(
+                    ui,
+                    &mut config.quake.height_fraction,
+                    &def.quake.height_fraction,
+                );
                 ui.end_row();
             }
         });

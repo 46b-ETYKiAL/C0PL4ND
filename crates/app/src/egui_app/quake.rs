@@ -67,6 +67,15 @@
 //! drop-down geometry, and toggle decision live OUTSIDE the FFI and are
 //! unit-tested on every host.
 
+// Off Windows the `#[cfg(windows)] mod imp` FFI half is not compiled, so nothing
+// in the PRODUCTION build calls this module's pure logic — the unit tests do, and
+// they run on every host, but clippy also lints the non-test build and reports
+// every item here as dead. That is a property of the platform, not a dormancy
+// bug: on Windows the lint is FULLY ACTIVE, so a genuinely-unwired item is still
+// caught on the platform where it must be wired. Scoped to `not(windows)` rather
+// than a blanket allow for exactly that reason.
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
+
 // ---------------------------------------------------------------------------
 // PURE logic (compiled + tested on every host; used by the Windows imp)
 // ---------------------------------------------------------------------------

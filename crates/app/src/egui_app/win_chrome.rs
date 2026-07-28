@@ -49,6 +49,14 @@
 //! winit's plain frame behaviour (drag-to-top / Win+Arrow still work via the
 //! restored `WS_MAXIMIZEBOX`; only the flyout's `HTMAXBUTTON` reply is withheld).
 #![allow(unsafe_code)]
+// Off Windows the `#[cfg(windows)] mod imp` FFI half is not compiled, so nothing
+// in the PRODUCTION build calls this module's pure logic — the unit tests do, and
+// they run on every host, but clippy also lints the non-test build and reports
+// every item here as dead. That is a property of the platform, not a dormancy
+// bug: on Windows the lint is FULLY ACTIVE, so a genuinely-unwired item is still
+// caught on the platform where it must be wired. Scoped to `not(windows)` rather
+// than a blanket allow for exactly that reason.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use std::sync::atomic::{AtomicI32, Ordering};
 

@@ -72,10 +72,41 @@ fn require_gpu() {
 /// never silently degrades. See [`require_gpu`].
 fn build() -> Harness<'static, egui_app::C0pl4ndApp> {
     require_gpu();
+    isolate_config_dir();
     Harness::builder()
         .with_size(egui::vec2(HARNESS_W as f32, HARNESS_H as f32))
         .wgpu()
         .build_eframe(|cc| egui_app::C0pl4ndApp::new(cc))
+}
+
+/// Point `Config::default_path()` at a throwaway dir for this test process.
+///
+/// These scenes build the REAL `C0pl4ndApp`, which loads AND SAVES the user's
+/// config. Opening the Settings window persists its width, so simply RUNNING
+/// visual QA rewrote the developer's own `%APPDATA%/c0pl4nd/config.toml` —
+/// `settings_win_w` changed from 1001.0 to 1015.0 on a scene that only looked at
+/// a page. A diagnostic aid must not mutate the machine it is diagnosing, and a
+/// test that reads real user config is also not reproducible: two runs render
+/// different frames depending on what the developer last set.
+///
+/// `default_path()` resolves from `APPDATA` (Windows) / `XDG_CONFIG_HOME` /
+/// `HOME`, so overriding those redirects both the load and the save. Called from
+/// `build()` so every scene is covered, and idempotent so repeated calls in one
+/// process keep using the same dir.
+fn isolate_config_dir() {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("c0pl4nd-qa-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("create the QA config dir");
+        d
+    });
+    // Edition 2021: `set_var` is safe here. All these scenes run single-threaded
+    // (`--test-threads=1`, and the wgpu renders serialise anyway), and the value
+    // is constant per process, so there is no racing writer.
+    std::env::set_var("APPDATA", dir);
+    std::env::set_var("XDG_CONFIG_HOME", dir);
+    std::env::set_var("HOME", dir);
 }
 
 /// Render the current frame, ASSERT it is a real image, and save it to
@@ -244,6 +275,29 @@ fn qa_toolbar_settings_page() {
         h.step();
     }
     snapshot(&mut h, "toolbar-settings");
+}
+
+#[test]
+#[ignore = "visual-QA aid: needs a real GPU; run explicitly with --ignored"]
+fn qa_terminal_settings_page() {
+    let mut h = build();
+    for _ in 0..10 {
+        h.step();
+    }
+    h.get_by_label("settings").click();
+    for _ in 0..4 {
+        h.step();
+    }
+    // Select Terminal to render the Clipboard group — including the OSC 52
+    // "Allow programs to read the clipboard" row. That row ships DEFAULT-OFF and
+    // guards a real exfiltration path, so it must be visibly unchecked and
+    // legible: a security toggle nobody has ever looked at is a security toggle
+    // whose rendered state nobody has confirmed.
+    h.get_by_label("Terminal").click();
+    for _ in 0..4 {
+        h.step();
+    }
+    snapshot(&mut h, "terminal-settings");
 }
 
 #[test]

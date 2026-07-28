@@ -55,7 +55,7 @@ mod tray;
 // the binary's own modules: `panic_hook` reaches reporting this way.
 // W1TN3SS opt-in reporting glue (Tier-1 crash spool + manual issue intake).
 // Pure consumers of the pinned-tag `itasha-report-core` SDK; both default OFF.
-use c0pl4nd::{egui_app, user_error};
+use c0pl4nd::{cli_cwd, egui_app, user_error};
 
 // `reporting`'s only consumer in this binary is `panic_hook::capture_panic_w1tn3ss`,
 // which is itself `cfg(not(feature = "legacy-winit"))`. Carry the same gate here or
@@ -136,6 +136,33 @@ fn main() -> eframe::Result<()> {
             eprintln!("Couldn't check for updates: an unexpected problem occurred.");
         }
         return Ok(());
+    }
+
+    // `c0pl4nd --cwd <path>` (alias `-d <path>`, matching Windows Terminal) —
+    // the directory the INITIAL shell starts in. This is what the Explorer
+    // "Open C0PL4ND here" context-menu verb passes (`--cwd "%V"`), so the value
+    // is UNTRUSTED: a path that does not exist, or that names a file, is
+    // refused here with a clear message and a non-zero exit rather than
+    // silently ignored (which reads as "the menu entry is broken") or panicked.
+    //
+    // The validated directory is handed to the one-shot `cli_cwd` store, which
+    // the deferred first-pane spawn consumes and passes to
+    // `PaneTerm::spawn_in_with_term`. It is deliberately NOT applied with
+    // `std::env::set_current_dir`: `PtyProcess::spawn_program_in_with_term`
+    // always sets the child's directory explicitly (requested cwd, else the
+    // HOME fallback), so the child never inherits the process cwd and
+    // `set_current_dir` would be a silent no-op. Threading it to the spawn seam
+    // is the only wire that actually reaches the shell.
+    match cli_cwd::parse_startup_cwd(&args) {
+        Ok(Some(dir)) => cli_cwd::set_startup_cwd(&dir),
+        Ok(None) => {}
+        Err(e) => {
+            // `show_startup_error` also prints to stderr, and shows a dialog on
+            // Windows — where a release build is a GUI-subsystem app with no
+            // console, so stderr alone would be invisible.
+            panic_hook::show_startup_error("C0PL4ND couldn't start", &e.user_message());
+            std::process::exit(2);
+        }
     }
 
     // The window position + size are persisted natively by eframe via the

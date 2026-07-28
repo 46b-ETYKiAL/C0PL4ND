@@ -1238,10 +1238,16 @@ impl C0pl4ndApp {
         // is a no-op, so cmd's banner/prompt cursor never snaps home to (0,0).
         if pending_spawn.remove(&pane_id) {
             let (cols, rows) = cell_metrics.cols_rows(px_w, px_h);
-            // A restored pane opens in its saved cwd; a fresh pane (no restore
-            // entry) opens in the default dir. `remove` consumes the entry so a
-            // later re-use of the id never inherits a stale cwd.
-            let pane_term = match restored_cwds.remove(&pane_id) {
+            // A restored pane opens in its saved cwd; otherwise the one-shot
+            // `--cwd` / `-d` startup directory (the "Open C0PL4ND here" shell
+            // verb) applies to the FIRST pane spawned; a fresh pane with neither
+            // opens in the default dir. Both `remove` and `take_startup_cwd`
+            // CONSUME their entry, so a later re-use of the id can never inherit
+            // a stale cwd and later tabs/splits never inherit the CLI flag.
+            let pane_term = match restored_cwds
+                .remove(&pane_id)
+                .or_else(crate::cli_cwd::take_startup_cwd)
+            {
                 Some(cwd) => {
                     PaneTerm::spawn_in_with_term(theme.clone(), cols, rows, Some(term), Some(&cwd))
                 }

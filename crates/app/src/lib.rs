@@ -29,6 +29,10 @@
 //! modules can stay where they are. `panic_hook` resolves `crate::reporting`
 //! through the binary's root re-export.
 
+/// `--cwd <path>` / `-d <path>` parsing + the one-shot startup-directory store
+/// the initial pane's PTY spawn consumes. In the lib (not a binary module) so
+/// the wiring suites in `tests/` drive the SAME store the shipping binary sets.
+pub mod cli_cwd;
 pub mod egui_app;
 pub mod issue_intake;
 pub mod reporting;

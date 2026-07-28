@@ -71,9 +71,58 @@
       </Directory>
     </StandardDirectory>
 
+    <!--
+      Explorer context-menu verb: "Open C0PL4ND here".
+
+      Two keys are required, and they are NOT interchangeable:
+        * Directory\shell          - right-click ON a folder icon.
+        * Directory\Background\shell - right-click on the EMPTY SPACE inside an
+          open folder (the far more common gesture).
+
+      Both use the %V token. %V is correct for BOTH cases; %1 works only for the
+      first and expands to nothing for Background, which is the classic bug that
+      makes the verb silently open in the wrong directory. The value is passed to
+      the binary's cwd flag (see crates/app/src/cli_cwd.rs), which validates it
+      and refuses a non-existent or non-directory path rather than falling back
+      silently - a path arriving from the shell is untrusted input.
+
+      ForceDeleteOnUninstall removes the whole key on uninstall so no orphan verb
+      is left pointing at a deleted binary.
+    -->
+    <Component Id="ShellOpenHereVerb" Guid="*" Directory="INSTALLFOLDER">
+      <RegistryKey
+        Root="HKLM"
+        Key="Software\Classes\Directory\shell\C0pl4ndOpenHere"
+        ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="Open C0PL4ND here" KeyPath="yes" />
+        <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]c0pl4nd.exe" />
+      </RegistryKey>
+      <RegistryKey
+        Root="HKLM"
+        Key="Software\Classes\Directory\shell\C0pl4ndOpenHere\command"
+        ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]c0pl4nd.exe&quot; --cwd &quot;%V&quot;" />
+      </RegistryKey>
+
+      <RegistryKey
+        Root="HKLM"
+        Key="Software\Classes\Directory\Background\shell\C0pl4ndOpenHere"
+        ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="Open C0PL4ND here" />
+        <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]c0pl4nd.exe" />
+      </RegistryKey>
+      <RegistryKey
+        Root="HKLM"
+        Key="Software\Classes\Directory\Background\shell\C0pl4ndOpenHere\command"
+        ForceDeleteOnUninstall="yes">
+        <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]c0pl4nd.exe&quot; --cwd &quot;%V&quot;" />
+      </RegistryKey>
+    </Component>
+
     <Feature Id="Main" Title="C0PL4ND" Level="1">
       <ComponentRef Id="MainExecutable" />
       <ComponentRef Id="ApplicationShortcut" />
+      <ComponentRef Id="ShellOpenHereVerb" />
     </Feature>
 
     <!-- Add/Remove Programs metadata + branded icon. -->

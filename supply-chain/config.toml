@@ -376,6 +376,10 @@ criteria = "safe-to-deploy"
 version = "0.8.2"
 criteria = "safe-to-run"
 
+[[exemptions.crossbeam-channel]]
+version = "0.5.16"
+criteria = "safe-to-deploy"
+
 [[exemptions.crossbeam-deque]]
 version = "0.8.6"
 criteria = "safe-to-run"
@@ -948,6 +952,10 @@ criteria = "safe-to-deploy"
 version = "0.2.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.keyboard-types]]
+version = "0.7.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.khronos-egl]]
 version = "6.0.0"
 criteria = "safe-to-deploy"
@@ -1058,6 +1066,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.moxcms]]
 version = "0.8.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.muda]]
+version = "0.19.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.naga]]
@@ -1837,6 +1849,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.tracing-test-macro]]
 version = "0.2.6"
+criteria = "safe-to-deploy"
+
+[[exemptions.tray-icon]]
+version = "0.24.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.ttf-parser]]

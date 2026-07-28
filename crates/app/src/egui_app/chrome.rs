@@ -199,7 +199,7 @@ fn glyph_button(
         ui.painter().rect_stroke(
             rect.expand(1.0),
             egui::CornerRadius::same(4),
-            egui::Stroke::new(2.0, super::theme::focus_ring_color(colors)),
+            egui::Stroke::new(2.0f32, super::theme::focus_ring_color(colors)),
             egui::StrokeKind::Outside,
         );
     }
@@ -706,7 +706,7 @@ impl C0pl4ndApp {
                                     ui.painter().vline(
                                         x,
                                         tab.rect.y_range(),
-                                        egui::Stroke::new(2.0, colors.accent),
+                                        egui::Stroke::new(2.0f32, colors.accent),
                                     );
                                 }
                             }

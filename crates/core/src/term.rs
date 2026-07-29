@@ -3223,20 +3223,20 @@ impl Terminal {
         }
     }
 
-    /// Drains the oldest pending OSC 52 clipboard READ request, if any.
+    /// Drains all pending OSC 52 clipboard READ requests at once.
     ///
-    /// Always `None` unless clipboard reads were opted into — a denied read is
+    /// The ONLY read-drain. There is deliberately no singular
+    /// `take_clipboard_read` companion to the write side's
+    /// [`Terminal::take_clipboard_write`]: reads are consumed by the host's
+    /// per-frame `for req in term.take_clipboard_reads()` loop, so a one-at-a-time
+    /// drain has no caller and offers nothing the batch drain does not
+    /// (`take_clipboard_reads().into_iter().next()`). One shipped as dormant `pub`
+    /// API — `pub` on a `pub` type, so `dead_code` never fired — and was removed
+    /// rather than left to look supported.
+    ///
+    /// Always empty unless clipboard reads were opted into: a denied read is
     /// answered inline by the terminal and never queued. The host answers a
     /// drained request with [`Terminal::respond_clipboard_read`].
-    pub fn take_clipboard_read(&mut self) -> Option<osc::ClipboardReadRequest> {
-        if self.screen.pending_clipboard_reads.is_empty() {
-            None
-        } else {
-            Some(self.screen.pending_clipboard_reads.remove(0))
-        }
-    }
-
-    /// Drains all pending OSC 52 clipboard READ requests at once.
     pub fn take_clipboard_reads(&mut self) -> Vec<osc::ClipboardReadRequest> {
         std::mem::take(&mut self.screen.pending_clipboard_reads)
     }

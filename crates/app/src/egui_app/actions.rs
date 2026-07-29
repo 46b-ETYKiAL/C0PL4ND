@@ -32,115 +32,117 @@ use c0pl4nd_core::config::{action_label, canonical_key_token, Chord};
 
 use super::{grid, PaneId};
 
-/// Everything the shell can be asked to DO, independent of who asked.
+/// Declare the shell's whole action vocabulary ONCE.
 ///
-/// Each variant maps to exactly one `[keybindings]` field (its
-/// [`Action::binding`]) and to one command-palette row (its [`Action::label`],
-/// which is the same label the settings rows show — one source of truth).
+/// The [`Action`] variants, [`Action::ALL`], and [`Action::binding`] are all
+/// expanded from the single arm list below, so an action that is missing from
+/// `ALL` — or from the binding table — cannot be WRITTEN, let alone shipped.
 ///
-/// Clipboard copy/paste are deliberately NOT here: `egui-winit` intercepts those
-/// chords in its window-event dispatcher and delivers them as `Event::Copy` /
-/// `Event::Cut` rather than `Event::Key`, so they are handled on their own path
-/// and their settings rows stay honestly disabled rather than pretending to be
-/// rebindable here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Action {
+/// That is the entire point. `ALL` used to be a hand-maintained
+/// `[Action; 20]` guarded by `assert_eq!(Action::ALL.len(), 20)`, which compares
+/// the array's declared length with itself: a tautology that can never fail. A
+/// 21st variant with arms in `binding()` and `dispatch_action` but omitted from
+/// `ALL` compiled and passed the whole suite, while being invisible to the
+/// command palette and unreachable from `dispatch_keybindings`. Generating the
+/// list from the same arms as the enum makes that omission unrepresentable
+/// instead of merely untested.
+macro_rules! define_actions {
+    ($(
+        $(#[$vmeta:meta])*
+        $variant:ident => $binding:literal,
+    )+) => {
+        /// Everything the shell can be asked to DO, independent of who asked.
+        ///
+        /// Each variant maps to exactly one `[keybindings]` field (its
+        /// [`Action::binding`]) and to one command-palette row (its
+        /// [`Action::label`], which is the same label the settings rows show —
+        /// one source of truth).
+        ///
+        /// Clipboard copy/paste are deliberately NOT here: `egui-winit` intercepts
+        /// those chords in its window-event dispatcher and delivers them as
+        /// `Event::Copy` / `Event::Cut` rather than `Event::Key`, so they are
+        /// handled on their own path and their settings rows stay honestly
+        /// disabled rather than pretending to be rebindable here.
+        ///
+        /// Declared through [`define_actions!`], which also generates
+        /// [`Action::ALL`] and [`Action::binding`] from the same arm list.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum Action {
+            $(
+                $(#[$vmeta])*
+                $variant,
+            )+
+        }
+
+        impl Action {
+            /// How many actions there are — counted from the macro arms, never
+            /// written by hand, so it cannot disagree with [`ALL`](Self::ALL).
+            pub const COUNT: usize = [$(Action::$variant,)+].len();
+
+            /// Every action, in command-palette display order.
+            ///
+            /// Exhaustive BY CONSTRUCTION: generated from the same
+            /// [`define_actions!`] arm list as the variants themselves, so there
+            /// is no way to declare an action that is absent from this list.
+            pub const ALL: [Action; Self::COUNT] = [$(Action::$variant,)+];
+
+            /// The `[keybindings]` config field this action is bound through. The
+            /// dispatcher resolves the user's combo from this name, so a rebind in
+            /// `config.toml` moves the chord with no code change.
+            #[must_use]
+            pub fn binding(self) -> &'static str {
+                match self {
+                    $(Action::$variant => $binding,)+
+                }
+            }
+        }
+    };
+}
+
+define_actions! {
     /// Open a new terminal pane.
-    NewTab,
+    NewTab => "new_tab",
     /// Close the focused pane (never the last one).
-    ClosePane,
+    ClosePane => "close_tab",
     /// Move keyboard focus to the next pane, wrapping.
-    FocusNextPane,
+    FocusNextPane => "next_tab",
     /// Split the focused pane to the right.
-    SplitRight,
+    SplitRight => "split_right",
     /// Split the focused pane downward.
-    SplitDown,
+    SplitDown => "split_down",
     /// Toggle zoom on the focused pane.
-    ZoomPane,
+    ZoomPane => "zoom_pane",
     /// Rebuild the layout as a uniform, equal-sized grid.
-    EqualizePanes,
+    EqualizePanes => "equalize_panes",
     /// Flip the pane shell between the grid and tab layouts.
-    ToggleViewMode,
+    ToggleViewMode => "toggle_view_mode",
     /// Toggle the in-terminal find overlay.
-    ToggleSearch,
+    ToggleSearch => "search",
     /// Toggle the command palette.
-    ToggleCommandPalette,
+    ToggleCommandPalette => "command_palette",
     /// Toggle the command-history quick-run sidebar.
-    ToggleHistorySidebar,
+    ToggleHistorySidebar => "history_sidebar",
     /// Toggle the settings window.
-    ToggleSettings,
+    ToggleSettings => "settings",
     /// Toggle borderless OS fullscreen.
-    ToggleFullscreen,
+    ToggleFullscreen => "fullscreen",
     /// Increase the terminal font size.
-    IncreaseFont,
+    IncreaseFont => "increase_font",
     /// Decrease the terminal font size.
-    DecreaseFont,
+    DecreaseFont => "decrease_font",
     /// Reset the terminal font size to the built-in default.
-    ResetFont,
+    ResetFont => "reset_font",
     /// Clear the focused pane's scrollback.
-    ClearScrollback,
+    ClearScrollback => "clear_scrollback",
     /// Copy the focused pane's whole buffer to the clipboard.
-    CopyAll,
+    CopyAll => "copy_all",
     /// Scroll the focused pane to the oldest retained line.
-    ScrollToTop,
+    ScrollToTop => "scroll_to_top",
     /// Scroll the focused pane back to live output.
-    ScrollToBottom,
+    ScrollToBottom => "scroll_to_bottom",
 }
 
 impl Action {
-    /// Every action, in command-palette display order.
-    pub const ALL: [Action; 20] = [
-        Action::NewTab,
-        Action::ClosePane,
-        Action::FocusNextPane,
-        Action::SplitRight,
-        Action::SplitDown,
-        Action::ZoomPane,
-        Action::EqualizePanes,
-        Action::ToggleViewMode,
-        Action::ToggleSearch,
-        Action::ToggleCommandPalette,
-        Action::ToggleHistorySidebar,
-        Action::ToggleSettings,
-        Action::ToggleFullscreen,
-        Action::IncreaseFont,
-        Action::DecreaseFont,
-        Action::ResetFont,
-        Action::ClearScrollback,
-        Action::CopyAll,
-        Action::ScrollToTop,
-        Action::ScrollToBottom,
-    ];
-
-    /// The `[keybindings]` config field this action is bound through. The
-    /// dispatcher resolves the user's combo from this name, so a rebind in
-    /// `config.toml` moves the chord with no code change.
-    #[must_use]
-    pub fn binding(self) -> &'static str {
-        match self {
-            Action::NewTab => "new_tab",
-            Action::ClosePane => "close_tab",
-            Action::FocusNextPane => "next_tab",
-            Action::SplitRight => "split_right",
-            Action::SplitDown => "split_down",
-            Action::ZoomPane => "zoom_pane",
-            Action::EqualizePanes => "equalize_panes",
-            Action::ToggleViewMode => "toggle_view_mode",
-            Action::ToggleSearch => "search",
-            Action::ToggleCommandPalette => "command_palette",
-            Action::ToggleHistorySidebar => "history_sidebar",
-            Action::ToggleSettings => "settings",
-            Action::ToggleFullscreen => "fullscreen",
-            Action::IncreaseFont => "increase_font",
-            Action::DecreaseFont => "decrease_font",
-            Action::ResetFont => "reset_font",
-            Action::ClearScrollback => "clear_scrollback",
-            Action::CopyAll => "copy_all",
-            Action::ScrollToTop => "scroll_to_top",
-            Action::ScrollToBottom => "scroll_to_bottom",
-        }
-    }
-
     /// The human-readable label shown in the command palette — the SAME string
     /// the settings keybinding row shows, resolved from the core label table so
     /// the two surfaces can never drift apart.
@@ -473,7 +475,29 @@ mod tests {
             assert!(!seen.contains(&a.binding()), "duplicate binding {a:?}");
             seen.push(a.binding());
         }
-        assert_eq!(Action::ALL.len(), 20, "Action::ALL must list every variant");
+        // A REPEATED action is the other way a generated list can be wrong: two
+        // rows for one action in the palette, and a `matching_actions` order that
+        // shows it twice.
+        //
+        // What is NOT asserted here any more is `Action::ALL.len() == 20`. `ALL`
+        // is `[Action; Self::COUNT]` with `COUNT` counted from the same
+        // `define_actions!` arms, so that comparison was the array's declared
+        // length against itself — a tautology that stayed green when a 21st
+        // variant was added and left out of `ALL`. Omission is now a compile
+        // error instead, which is strictly stronger than any runtime assertion
+        // could be.
+        let mut seen_actions: Vec<Action> = Vec::new();
+        for a in Action::ALL {
+            assert!(
+                !seen_actions.contains(&a),
+                "{a:?} appears twice in Action::ALL"
+            );
+            seen_actions.push(a);
+        }
+        // No length assertion here on purpose. `ALL.len() == COUNT` (or any other
+        // literal) would be the SAME tautology in a new coat: `ALL` is
+        // `[Action; Self::COUNT]`, so its length is `COUNT` by its own type.
+        // Cardinality is the compiler's job now, not a test's.
     }
 
     #[test]

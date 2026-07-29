@@ -85,7 +85,7 @@
 /// target and cannot reach this binary-local module) validates a typed combo with
 /// the EXACT parser that registers it. Re-exported for the tests + the FFI below;
 /// there is one implementation, never a second copy that could drift.
-pub use c0pl4nd_core::config::parse_hotkey;
+pub use c0pl4nd_core::config::{parse_hotkey, HotkeySpec};
 
 /// A screen-space rectangle in physical pixels (left/top inclusive, right/bottom
 /// exclusive — the Win32 `RECT` convention).
@@ -223,6 +223,35 @@ pub const fn is_out_of_view(visible: bool, minimized: bool) -> bool {
     !visible || minimized
 }
 
+/// **The arming decision** — whether quake mode may claim a global hotkey at all,
+/// and if so exactly which combo.
+///
+/// `Some(spec)` means "register THIS combo"; `None` means **claim nothing** and
+/// leave the combo free for every other application. There are exactly two ways
+/// to get `None`, and they are the module's two documented refusals:
+///
+/// * `!cfg.enabled` — the DEFAULT. `RegisterHotKey` claims a combo process-wide
+///   and denies it to every other app, so a global hotkey is an OS-level
+///   privilege and the whole feature is opt-in. This is the load-bearing
+///   default-OFF guard.
+/// * the combo does not parse, or carries NO modifier (which would swallow a bare
+///   keystroke system-wide) — [`parse_hotkey`] refuses it.
+///
+/// This is a PURE function of the config precisely so it is falsifiable: the
+/// Windows `imp::init` below calls it and does nothing else to decide, so the
+/// function the tests pin IS the one the shipping hotkey path runs. Before it
+/// existed, the decision lived inline inside `init`, which returns early on an
+/// unprimed `CACHED_HWND` — 0 for the whole test binary — so no test could ever
+/// reach, and therefore ever falsify, the default-OFF guard.
+#[must_use]
+pub fn should_arm(cfg: &c0pl4nd_core::config::QuakeConfig) -> Option<HotkeySpec> {
+    if !cfg.enabled {
+        // Default path: claim NOTHING. The combo stays free for other apps.
+        return None;
+    }
+    parse_hotkey(&cfg.hotkey)
+}
+
 // ---------------------------------------------------------------------------
 // Public entry points — driven from `egui_main` (the wiring seam)
 // ---------------------------------------------------------------------------
@@ -323,16 +352,18 @@ mod imp {
     /// Register the hotkey + install the subclass. See the public wrapper for the
     /// default-OFF / refuse-on-unparseable contract.
     pub fn init(ctx: &eframe::egui::Context, cfg: &c0pl4nd_core::config::QuakeConfig) {
-        if !cfg.enabled {
-            // Default path: claim NOTHING. The combo stays free for other apps.
-            return;
-        }
-        let Some(spec) = super::parse_hotkey(&cfg.hotkey) else {
-            tracing::warn!(
-                target: "c0pl4nd::quake",
-                hotkey = %cfg.hotkey,
-                "quake hotkey is unparseable or has no modifier; quake mode stays off"
-            );
+        // The ENTIRE arming decision — default-OFF plus the unparseable /
+        // modifier-less refusal — is `super::should_arm`, a pure function the
+        // tests can falsify. `init` adds nothing to it; it only logs WHY.
+        let Some(spec) = super::should_arm(cfg) else {
+            if cfg.enabled {
+                tracing::warn!(
+                    target: "c0pl4nd::quake",
+                    hotkey = %cfg.hotkey,
+                    "quake hotkey is unparseable or has no modifier; quake mode stays off"
+                );
+            }
+            // Disabled (the default) is the silent path: claim NOTHING, say nothing.
             return;
         };
         let Some(hwnd) = cached() else {
@@ -615,8 +646,14 @@ mod imp {
                 0,
                 "a zero handle must never be cached"
             );
-            // The DEFAULT (disabled) config must claim no global hotkey — this is
-            // the opt-in invariant, exercised through the real `init` entry point.
+            // `init` must not panic (and must leave `REGISTERED` false) for either
+            // config shape. NOTE what this CANNOT prove: with `CACHED_HWND` at 0,
+            // `init` returns at the `cached()` guard no matter what, so
+            // `!REGISTERED` here holds even with the default-OFF check deleted.
+            // The falsifiable default-OFF assertion is
+            // `super::tests::default_config_never_arms_a_global_hotkey`, which
+            // pins `should_arm` — the pure predicate `init` now delegates the
+            // whole arming decision to.
             let ctx = eframe::egui::Context::default();
             init(&ctx, &c0pl4nd_core::config::QuakeConfig::default());
             assert!(
@@ -674,6 +711,97 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use c0pl4nd_core::config::QuakeConfig;
+
+    /// A config with `enabled` forced on and everything else defaulted.
+    fn enabled(hotkey: &str) -> QuakeConfig {
+        QuakeConfig {
+            enabled: true,
+            hotkey: hotkey.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn default_config_never_arms_a_global_hotkey() {
+        // THE opt-in invariant, and the one this module's headline claim rests
+        // on: `RegisterHotKey` denies a combo to every other application, so a
+        // config that has not asked for quake mode must claim nothing.
+        //
+        // Deleting the `if !cfg.enabled { return None; }` guard from `should_arm`
+        // fails THIS assertion (the default hotkey parses fine, so without the
+        // guard the default config would arm `Ctrl+Shift+Grave` process-wide).
+        assert_eq!(
+            should_arm(&QuakeConfig::default()),
+            None,
+            "the default (disabled) config must never arm a global hotkey"
+        );
+        // It is the `enabled` FLAG that refuses, not a bad combo: a perfectly
+        // valid combo is still refused while disabled.
+        for combo in ["Ctrl+Shift+Grave", "Alt+F1", "Win+Space"] {
+            let cfg = QuakeConfig {
+                enabled: false,
+                hotkey: combo.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(
+                should_arm(&cfg),
+                None,
+                "{combo} must stay free while quake mode is off"
+            );
+        }
+    }
+
+    #[test]
+    fn an_enabled_config_arms_exactly_the_combo_it_names() {
+        // The other direction, so the guard above cannot be satisfied by a
+        // `should_arm` that simply always refuses: opting in DOES arm, and arms
+        // the parsed spec — never a different combo.
+        let spec = should_arm(&enabled("Ctrl+Shift+Grave"))
+            .expect("an enabled config with the default combo must arm");
+        assert_eq!(
+            spec,
+            parse_hotkey("Ctrl+Shift+Grave").expect("the default combo parses"),
+            "must arm the combo the config names"
+        );
+        // The shipped default combo is the one that arms once enabled.
+        assert_eq!(
+            should_arm(&enabled(&QuakeConfig::default().hotkey)),
+            Some(spec),
+            "enabling the default config arms the default combo"
+        );
+        for combo in ["Alt+F1", "Win+Space", "Ctrl+Alt+q"] {
+            assert_eq!(
+                should_arm(&enabled(combo)),
+                parse_hotkey(combo),
+                "{combo} must arm exactly what the parser accepts"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unparseable_or_modifierless_combo_never_arms() {
+        // The module's second documented refusal. A modifier-less combo would
+        // swallow a bare keystroke across the whole desktop, so it is refused
+        // even though quake mode was explicitly enabled.
+        for bad in [
+            "F12",        // no modifier — would steal a bare key system-wide
+            "Grave",      // ditto
+            "Ctrl+Shift", // modifiers only, no key
+            "Ctrl+A+B",   // two non-modifier keys — ambiguous
+            "Ctrl+",      // empty token
+            "Ctrl+Nope",  // unknown key name
+            "Ctrl+F25",   // out-of-range function key
+            "",           // empty combo
+        ] {
+            assert_eq!(
+                should_arm(&enabled(bad)),
+                None,
+                "{bad:?} must never arm a global hotkey"
+            );
+        }
+    }
 
     #[test]
     fn quake_rect_uses_the_work_area_top_and_full_width() {

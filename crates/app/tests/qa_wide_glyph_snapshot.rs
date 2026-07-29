@@ -66,17 +66,52 @@ fn require_gpu() {
     );
 }
 
-/// Build a real-wgpu harness over the production `C0pl4ndApp`.
+/// THE ONE HARNESS CONSTRUCTOR. Every scene in this file builds its harness
+/// here — this is the file's only kittest builder call site, and
+/// [`no_scene_can_bypass_the_config_isolation`] asserts that structurally.
+///
+/// That single funnel is what makes [`isolate_config_dir`] load-bearing rather
+/// than advisory. It used to be called only from [`build`], and SIX of the
+/// sixteen scenes constructed their harness by other routes (an inline builder
+/// for the HiDPI scene, `build_tinted`, `render_with`) — so they ran against the
+/// developer's real `%APPDATA%\c0pl4nd\config.toml`, both READING it (the same
+/// scene rendered different pixels on two machines, or after any settings
+/// change) and WRITING to it. Four of those six are asserting regression guards,
+/// and an ambient config with `crt_scanlines` / `wired_ambient` / `flicker` on
+/// made two of them FAIL outright. CI runs this file under nextest
+/// (process-per-test), so the `set_var` redirect performed by some OTHER test's
+/// `build()` never reached them: the exposure was deterministic, not bad luck.
+///
+/// `pixels_per_point` is `None` for the default 1.0 rendering; `mutate` runs on
+/// the freshly-constructed app inside the eframe creation closure, which is the
+/// only point a scene can override live config before the first frame.
 ///
 /// Panics (via [`require_gpu`] or the harness itself) when the host cannot render —
 /// never silently degrades. See [`require_gpu`].
-fn build() -> Harness<'static, egui_app::C0pl4ndApp> {
-    require_gpu();
+fn build_harness(
+    pixels_per_point: Option<f32>,
+    mutate: impl FnOnce(&mut egui_app::C0pl4ndApp) + 'static,
+) -> Harness<'static, egui_app::C0pl4ndApp> {
+    // Isolate FIRST: nothing this function goes on to touch may resolve the real
+    // per-user config dir, not even incidentally (the app's `gpu-diag.log` is
+    // written next to `config.toml`, so an un-isolated render litters there too).
     isolate_config_dir();
-    Harness::builder()
-        .with_size(egui::vec2(HARNESS_W as f32, HARNESS_H as f32))
-        .wgpu()
-        .build_eframe(|cc| egui_app::C0pl4ndApp::new(cc))
+    require_gpu();
+    let mut builder = Harness::builder().with_size(egui::vec2(HARNESS_W as f32, HARNESS_H as f32));
+    if let Some(ppp) = pixels_per_point {
+        builder = builder.with_pixels_per_point(ppp);
+    }
+    builder.wgpu().build_eframe(move |cc| {
+        let mut app = egui_app::C0pl4ndApp::new(cc);
+        mutate(&mut app);
+        app
+    })
+}
+
+/// Build a real-wgpu harness over the production `C0pl4ndApp`, on the persisted
+/// (now isolated → default) config.
+fn build() -> Harness<'static, egui_app::C0pl4ndApp> {
+    build_harness(None, |_| {})
 }
 
 /// Point `Config::default_path()` at a throwaway dir for this test process.
@@ -91,22 +126,63 @@ fn build() -> Harness<'static, egui_app::C0pl4ndApp> {
 ///
 /// `default_path()` resolves from `APPDATA` (Windows) / `XDG_CONFIG_HOME` /
 /// `HOME`, so overriding those redirects both the load and the save. Called from
-/// `build()` so every scene is covered, and idempotent so repeated calls in one
-/// process keep using the same dir.
+/// [`build_harness`] — the file's ONLY harness constructor — so every scene is
+/// covered by construction, and idempotent so repeated calls in one process keep
+/// using the same dir.
+///
+/// The dir is a `tempfile` dir, NOT a name derived from the process id: pids
+/// recycle, and a recycled name is a dir a PREVIOUS run already saved a config
+/// into — which is the same read-contamination this function exists to remove,
+/// just sourced from an old test run instead of the developer's profile. The
+/// `TempDir` is parked in a `static`, so it lives for the whole process (the app
+/// keeps writing to it) and is never dropped mid-run.
 fn isolate_config_dir() {
     use std::sync::OnceLock;
-    static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
     let dir = DIR.get_or_init(|| {
-        let d = std::env::temp_dir().join(format!("c0pl4nd-qa-cfg-{}", std::process::id()));
-        std::fs::create_dir_all(&d).expect("create the QA config dir");
-        d
+        tempfile::Builder::new()
+            .prefix("c0pl4nd-qa-cfg-")
+            .tempdir()
+            .expect("create the QA config dir")
     });
     // Edition 2021: `set_var` is safe here. All these scenes run single-threaded
     // (`--test-threads=1`, and the wgpu renders serialise anyway), and the value
     // is constant per process, so there is no racing writer.
-    std::env::set_var("APPDATA", dir);
-    std::env::set_var("XDG_CONFIG_HOME", dir);
-    std::env::set_var("HOME", dir);
+    std::env::set_var("APPDATA", dir.path());
+    std::env::set_var("XDG_CONFIG_HOME", dir.path());
+    std::env::set_var("HOME", dir.path());
+}
+
+/// STRUCTURAL GUARD — the reason [`isolate_config_dir`] cannot silently stop
+/// covering a scene again. Needs no GPU, so it runs in the ordinary suite.
+///
+/// The previous regression was not a wrong isolation function; it was a SECOND
+/// (and third, and fourth) way to construct a harness that never called it.
+/// Asserting the file has exactly ONE harness-builder call site is what makes
+/// "every scene is isolated" checkable instead of a claim: a new scene that
+/// hand-rolls its own builder fails here, immediately, by name.
+#[test]
+fn no_scene_can_bypass_the_config_isolation() {
+    const SRC: &str = include_str!("qa_wide_glyph_snapshot.rs");
+    // Split so this test's own needles do not count as call sites.
+    let builder_sites = SRC.matches(concat!("Harness::", "builder()")).count();
+    let eframe_sites = SRC.matches(concat!("build_", "eframe(")).count();
+    let isolate_sites = SRC.matches(concat!("isolate_config", "_dir();")).count();
+    assert_eq!(
+        builder_sites, 1,
+        "this file must construct its harness in exactly ONE place (build_harness), \
+         so config isolation cannot be bypassed by adding a scene; found \
+         {builder_sites} builder call sites"
+    );
+    assert_eq!(
+        eframe_sites, 1,
+        "likewise exactly ONE eframe construction; found {eframe_sites}"
+    );
+    assert_eq!(
+        isolate_sites, 1,
+        "the isolation must be invoked from that single constructor, not sprinkled \
+         per scene; found {isolate_sites} invocations"
+    );
 }
 
 /// Render the current frame, ASSERT it is a real image, and save it to
@@ -221,12 +297,7 @@ fn qa_launch_frame() {
 fn qa_launch_frame_hidpi() {
     // Reproduce a 1.5x HiDPI display (the reported garble machine) — the default
     // qa harness renders at ppp 1.0, which never reproduced it.
-    require_gpu();
-    let mut h: Harness<'static, egui_app::C0pl4ndApp> = Harness::builder()
-        .with_size(egui::vec2(1100.0, 720.0))
-        .with_pixels_per_point(1.5)
-        .wgpu()
-        .build_eframe(|cc| egui_app::C0pl4ndApp::new(cc));
+    let mut h = build_harness(Some(1.5), |_| {});
     for _ in 0..30 {
         h.step();
         std::thread::sleep(Duration::from_millis(20));
@@ -364,21 +435,15 @@ fn qa_split_panes() {
 /// override just the transparency fields for the QA render (mirrors the user
 /// dialling Settings → Appearance). Panics without a GPU; see [`require_gpu`].
 fn build_tinted(opacity: f32, tint_strength: f32) -> Harness<'static, egui_app::C0pl4ndApp> {
-    require_gpu();
-    Harness::builder()
-        .with_size(egui::vec2(1100.0, 720.0))
-        .wgpu()
-        .build_eframe(move |cc| {
-            let mut app = egui_app::C0pl4ndApp::new(cc);
-            // Single always-transparent model: the opacity slider is the whole
-            // see-through control; a low opacity + a strong tint is the state to
-            // eyeball the tint/transparency fixes in.
-            app.config.opacity = opacity;
-            app.config.tint = "#ff0040".to_string();
-            app.config.tint_enabled = true;
-            app.config.tint_strength = tint_strength;
-            app
-        })
+    build_harness(None, move |app| {
+        // Single always-transparent model: the opacity slider is the whole
+        // see-through control; a low opacity + a strong tint is the state to
+        // eyeball the tint/transparency fixes in.
+        app.config.opacity = opacity;
+        app.config.tint = "#ff0040".to_string();
+        app.config.tint_enabled = true;
+        app.config.tint_strength = tint_strength;
+    })
 }
 
 /// VISUAL-QA: window transparency ON + strong red tint at LOW opacity, split into
@@ -420,16 +485,13 @@ fn qa_tint_settings_stays_opaque() {
 
 /// Render the real app with a config mutation applied. Panics without a GPU; see
 /// [`require_gpu`].
+///
+/// The mutation is applied on top of the ISOLATED (default) config, not on top
+/// of whatever the developer last saved — these are asserting regression guards
+/// whose thresholds are stated against the default surface, and an ambient
+/// `crt_scanlines` / `wired_ambient` / `flicker` used to make them fail.
 fn render_with(mutate: impl FnOnce(&mut c0pl4nd_core::Config) + 'static) -> image::RgbaImage {
-    require_gpu();
-    let mut h = Harness::builder()
-        .with_size(egui::vec2(1100.0, 720.0))
-        .wgpu()
-        .build_eframe(move |cc| {
-            let mut app = egui_app::C0pl4ndApp::new(cc);
-            mutate(&mut app.config);
-            app
-        });
+    let mut h = build_harness(None, move |app| mutate(&mut app.config));
     for _ in 0..5 {
         h.step();
     }

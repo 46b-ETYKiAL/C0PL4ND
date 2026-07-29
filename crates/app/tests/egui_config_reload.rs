@@ -17,7 +17,6 @@
 
 use c0pl4nd::egui_app;
 use std::cell::RefCell;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use egui_kittest::Harness;
@@ -36,16 +35,21 @@ fn harness(app: &RefCell<C0pl4ndApp>) -> Harness<'_> {
     h
 }
 
-/// A private temp dir for one test, named so concurrent test binaries and
-/// repeated runs never collide.
-fn temp_config_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "c0pl4nd_hotreload_{tag}_{}_{}",
-        std::process::id(),
-        Instant::now().elapsed().as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A private temp dir for one test, guaranteed unique by the OS.
+///
+/// This used to hand-roll the name from `process::id()` plus
+/// `Instant::now().elapsed().as_nanos()` — which is not a timestamp at all, but
+/// the gap between those two adjacent calls (≈0 ns). Uniqueness therefore rested
+/// on the pid alone, and pids recycle: a second run that drew a recycled pid
+/// would reuse a previous run's dir, complete with the `config.toml` that run
+/// left behind. `tempfile` asks the OS for a dir that does not exist and cleans
+/// it up on drop, so the caller also stops needing a manual `remove_dir_all`
+/// that a panicking test would skip anyway.
+fn temp_config_dir(tag: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("c0pl4nd_hotreload_{tag}_"))
+        .tempdir()
+        .expect("create the hot-reload temp dir")
 }
 
 /// Step frames (with small sleeps, since the watcher's throttle is wall-clock)
@@ -83,7 +87,7 @@ fn step_until(
 #[test]
 fn config_toml_edit_is_picked_up_live() {
     let dir = temp_config_dir("live");
-    let path = dir.join("config.toml");
+    let path = dir.path().join("config.toml");
     // Start from a file that matches the app's starting state, so the ONLY
     // change the app can observe is the edit made below.
     std::fs::write(&path, "theme = \"itasha-corp\"\n").unwrap();
@@ -128,8 +132,6 @@ fn config_toml_edit_is_picked_up_live() {
         "the reload must APPLY the theme (reloading Config alone leaves the \
          panes drawing the old colours)"
     );
-
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// A config file that fails to PARSE must never clobber the running settings.
@@ -141,7 +143,7 @@ fn config_toml_edit_is_picked_up_live() {
 #[test]
 fn an_unparseable_edit_keeps_the_running_config() {
     let dir = temp_config_dir("badparse");
-    let path = dir.join("config.toml");
+    let path = dir.path().join("config.toml");
     std::fs::write(&path, "theme = \"itasha-corp\"\n").unwrap();
 
     // Start from a NON-default in-memory config so "kept" is distinguishable
@@ -174,8 +176,6 @@ fn an_unparseable_edit_keeps_the_running_config() {
         c0pl4nd_core::Config::default().theme,
         "nothing from the broken file may be partially applied"
     );
-
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// A file that is TOUCHED but semantically unchanged must not churn the app.
@@ -185,7 +185,7 @@ fn an_unparseable_edit_keeps_the_running_config() {
 #[test]
 fn a_touched_but_equivalent_file_does_not_announce_a_reload() {
     let dir = temp_config_dir("equiv");
-    let path = dir.join("config.toml");
+    let path = dir.path().join("config.toml");
     let body = c0pl4nd_core::Config::default().to_toml().unwrap();
     std::fs::write(&path, &body).unwrap();
 
@@ -203,6 +203,4 @@ fn a_touched_but_equivalent_file_does_not_announce_a_reload() {
         !announced,
         "a touched-but-equivalent config must not announce a reload"
     );
-
-    std::fs::remove_dir_all(&dir).ok();
 }

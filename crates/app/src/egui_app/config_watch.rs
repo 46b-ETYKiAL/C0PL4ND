@@ -48,11 +48,33 @@ pub(crate) struct FileStamp {
     mtime: Option<SystemTime>,
 }
 
+// Counts the metadata reads performed on the CURRENT THREAD, so the throttle
+// tests can assert that a throttled poll does not touch the filesystem at all —
+// rather than only that it returned `None`, which is equally true of a poll that
+// DID stat the file and found it unchanged. Avoiding the stat is the entire
+// purpose of the throttle, so it is the thing worth asserting.
+//
+// Thread-local (libtest gives each test its own thread) and read as a DELTA, so
+// concurrent tests can never see each other's counts.
+#[cfg(test)]
+thread_local! {
+    static STAT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of [`stamp_of`] calls made on this thread so far. Compare two
+/// readings; never assert on the absolute value.
+#[cfg(test)]
+pub(crate) fn stat_calls() -> usize {
+    STAT_CALLS.with(std::cell::Cell::get)
+}
+
 /// Read the current stamp of `path`, or `None` when it does not exist (or its
 /// metadata cannot be read — a locked file mid-rename, a permission change).
 /// An unreadable file is deliberately indistinguishable from an absent one:
 /// both mean "nothing to reload right now", never "reload from nothing".
 pub(crate) fn stamp_of(path: &Path) -> Option<FileStamp> {
+    #[cfg(test)]
+    STAT_CALLS.with(|c| c.set(c.get() + 1));
     let md = std::fs::metadata(path).ok()?;
     Some(FileStamp {
         len: md.len(),
@@ -214,14 +236,31 @@ mod tests {
         assert!(w.poll(t0).is_none());
 
         write_later(&p, "theme = \"ghost-paper\"\n# a longer file\n");
+
+        // OBSERVE the stat, don't infer it. `poll(..).is_none()` alone is also
+        // true of a poll that stats the file and compares equal, so on its own
+        // it cannot tell a working throttle from a removed one — and skipping
+        // the filesystem is what the throttle is FOR.
+        let before = stat_calls();
         assert!(
             w.poll(t0 + POLL_INTERVAL / 2).is_none(),
+            "a poll inside the interval must report no change"
+        );
+        assert_eq!(
+            stat_calls(),
+            before,
             "a poll inside the interval must not even stat the file"
         );
+
         assert_eq!(
             w.poll(t0 + POLL_INTERVAL * 2),
             Some(p.clone()),
             "the same edit is reported once the interval has elapsed"
+        );
+        assert_eq!(
+            stat_calls(),
+            before + 1,
+            "the poll past the interval must stat the file exactly once"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

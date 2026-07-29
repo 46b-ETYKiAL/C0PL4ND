@@ -42,6 +42,30 @@ fn harness(app: &RefCell<C0pl4ndApp>) -> Harness<'_> {
     Harness::new(move |ctx| app.borrow_mut().frame_tick(ctx))
 }
 
+/// A DELIBERATELY WIDE harness, for the tests that must CLICK a per-tab control.
+///
+/// Tab labels are the shell's live OSC title. On a developer box that is short
+/// (`cmd.exe`), but the Windows CI runner's shell reports
+/// `Administrator: C:\Windows\system32\cmd.exe` — roughly 45 characters. With two
+/// panes open, two titles that long overflow the default harness width, the tab
+/// strip scrolls, and a tab's × ends up clipped or under the right-anchored
+/// caption cluster. `node.click()` then lands on nothing and the effect never
+/// happens, so `click_tab_control_until` exhausts its retries and panics —
+/// deterministically on CI, never locally. That is a TAB-OVERFLOW-AT-NARROW-WIDTH
+/// concern; these tests are about "a × closes its own pane", so give them room
+/// rather than let an unrelated layout limit decide whether they can run at all.
+///
+/// Wide enough for two ~45-char titles plus both tabs' controls and the caption
+/// cluster, with margin for a longer title still.
+fn harness_wide(app: &RefCell<C0pl4ndApp>) -> Harness<'_> {
+    #[allow(deprecated)]
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(2400.0, 600.0))
+        .build(move |ctx| app.borrow_mut().frame_tick(ctx));
+    h.run();
+    h
+}
+
 /// The exact tab label a pane currently renders (its live OSC window title when
 /// the running shell set one, else the `pane {id}` fallback). Tab text and the
 /// per-tab `pin`/`close` accessible labels are all built from this, so deriving
@@ -456,7 +480,7 @@ fn clicking_tab_pin_toggles_pinned() {
 fn clicking_tab_close_removes_the_pane() {
     // Open a second terminal so there are two panes (0, 1) to close one of.
     let app = RefCell::new(C0pl4ndApp::bootstrap());
-    let mut h = harness(&app);
+    let mut h = harness_wide(&app);
     click_new_terminal(&mut h, &app);
     let before = app.borrow().pane_count();
     assert_eq!(before, 2, "two panes after adding one");
@@ -493,7 +517,7 @@ fn pinned_tab_has_no_close_button() {
     // A pinned tab hides its × so it can't be closed by accident (unpin first).
     // Open a second terminal so pane 1's close button is present to compare.
     let app = RefCell::new(C0pl4ndApp::bootstrap());
-    let mut h = harness(&app);
+    let mut h = harness_wide(&app);
     click_new_terminal(&mut h, &app);
 
     // Per-tab close/pin accessible labels are derived from each pane's LIVE tab

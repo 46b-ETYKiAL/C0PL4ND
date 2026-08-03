@@ -87,7 +87,7 @@ unicode-bidi = "=0.3.18"
 # chosen face into egui's `FontFamily::Monospace`. Already in the lock graph
 # (cosmic-text pulls it via egui's text stack), so no new transitive cost.
 # Exact-pinned per dependency-management.md (production). MIT/Apache-2.0.
-fontdb = "=0.23.0"
+fontdb = "=0.24.0"
 
 # --- In-app verified self-updater (Settings → Updates) ---
 # Telemetry-free download + SHA-256/minisign verify-before-swap + atomic

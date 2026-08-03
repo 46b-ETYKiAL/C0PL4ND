@@ -102,7 +102,7 @@ jobs:
         # only — it does not change the binary's runtime behavior or add a
         # runtime dependency.
         # taiki-e/install-action@v2.79.10 — reproducible prebuilt-tool install.
-        uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9
+        uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf
         with:
           tool: cargo-auditable
 

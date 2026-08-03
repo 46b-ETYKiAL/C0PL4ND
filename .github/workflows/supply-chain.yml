@@ -74,7 +74,7 @@ jobs:
         # crates.io latest (supports the trusted-publisher field); taiki-e's
         # prebuilt manifest tops out at 0.10.0 (= its "latest") which cannot parse
         # it, so pin explicitly (taiki-e source-builds 0.10.2 when no prebuilt).
-        uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9
+        uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf
         with:
           tool: cargo-vet@0.10.2
 

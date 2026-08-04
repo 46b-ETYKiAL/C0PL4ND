@@ -101,16 +101,27 @@ bound; out-of-range colour components; integer overflow on coordinates.
 200-wide RLE sixel under a 2s bound; the robustness test feeds garbage-only
 and out-of-range-colour sixel bodies without panic.
 
-**Residual risk (low–informational):** the sparse pixel map is keyed by
-`(x, y)` with no absolute cap on `max_x`/`max_y`. A crafted stream of the form
-`!65535~` repeated across many bands (`-`) could, in principle, grow the map
-toward tens of millions of entries before the DCS terminates. The 8 MiB DCS
-accumulator cap on the *input* side bounds how much sixel text can arrive in
-one APC/DCS, which indirectly bounds output, but the relationship is not a
-hard pixel-count ceiling. **Recommendation:** add an explicit
-`max_x * max_y` (or pixel-count) guard inside `decode_sixel`, mirroring the
-Kitty `checked_mul` discipline. **No fix applied (out of audit scope).** The
-test suite documents current behaviour as bounded under realistic inputs.
+**Finding (at time of audit): unbounded sparse pixel map.** The map was keyed
+by `(x, y)` with no absolute cap on `max_x`/`max_y`, so a crafted stream could
+grow it toward tens of millions of entries before the DCS terminated. The input
+side already bounded how much sixel text could arrive in one APC/DCS, but that
+was an indirect bound, not a hard pixel-count ceiling.
+
+**Status: FIXED.** `decode_sixel` now enforces a hard output ceiling, applying
+the same checked-multiply discipline the Kitty decoder uses:
+
+- a per-axis dimension clamp, sized so the dense worst case lands exactly on
+  the pixel ceiling;
+- a `MAX_SIXEL_PIXELS` ceiling (16 Mpx) checked as a backstop on every
+  iteration of the decode loop, so no byte sequence can grow the map past it;
+- a cumulative work budget, which additionally defeats the band-reset re-plot
+  variant that bounds output but not effort;
+- a final `checked_mul` product check on the declared raster.
+
+Any stream that exceeds a limit causes the decoder to return `None` and drop
+the image; it cannot allocate past the ceiling or pin a thread. The variant
+that motivated the work budget was found by the `fuzz_sixel` fuzz target,
+which continues to run against this path.
 
 ---
 

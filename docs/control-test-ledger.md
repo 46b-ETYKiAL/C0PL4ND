@@ -139,8 +139,7 @@ egui-shell-facing ones driven through the real `frame_tick`:
 
 The core VT-correctness + DoS-cap fixes (PR #169) carry their own
 `c0pl4nd-core` regression tests (continuation lockstep ×5, CUU/CUD margins, SU
-scrollback ×2, the six queue/cap DoS tests). See `GAP_LIST.md` §
-"Whole-app audit-and-fix program (2026-06-12)".
+scrollback ×2, the six queue/cap DoS tests).
 
 ## Milestone 3+ (planned controls) — reconciled 2026-07-16, legacy rows corrected 2026-07-19
 

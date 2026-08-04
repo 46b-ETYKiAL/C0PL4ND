@@ -6,22 +6,31 @@
 #
 # Run locally:  gitleaks detect --source . --no-banner --redact
 #
-# Note: GitHub's hosted secret-scanning (which is the authoritative gate on the
-# public repo) reports zero open alerts; this file keeps the supplementary
-# local/CI gitleaks scan equally clean.
+# This config is enforced by the `gitleaks` job in .github/workflows/ci.yml,
+# which feeds the aggregating CI Gate. Note that GitHub's hosted secret
+# scanning is the authoritative gate on the public repo; this is the
+# local-runnable mirror and the in-PR signal.
 
 [extend]
 useDefault = true
 
 [[rules]]
-# Re-scope the built-in generic-api-key rule so the PTY round-trip test
-# sentinel is not treated as a credential.
+# Re-scope the built-in generic-api-key rule so the terminal round-trip test
+# sentinels are not treated as credentials.
+#
+# These are literal marker strings that a test types into a pane and then
+# waits to read back out of the grid, to prove the write->pty->parse->render
+# path carried them. They are compared for equality, never authenticate
+# anything, and are deliberately fixed so the assertion is deterministic.
+# The allowlist is scoped BOTH by a `c0pl4nd_`-prefixed regex AND by path, so
+# it cannot silently excuse a real credential elsewhere in the tree.
 id = "generic-api-key"
 [rules.allowlist]
-description = "PTY echo round-trip test sentinel — a literal string echoed by a child process to verify the pty read path; not a credential."
+description = "Terminal round-trip test sentinels — fixed marker strings echoed back through the pty/grid to verify the read path; not credentials."
 regexes = [
-  '''c0pl4nd_pty_ok''',
+  '''c0pl4nd_[a-z0-9_]+''',
 ]
 paths = [
   '''crates/core/src/pty/mod\.rs''',
+  '''crates/app/tests/egui_terminal\.rs''',
 ]

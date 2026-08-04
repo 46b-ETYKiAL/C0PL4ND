@@ -120,7 +120,7 @@ Common types: `feat`, `fix`, `docs`, `perf`, `refactor`, `test`, `build`, `ci`, 
 
 ## Code of Conduct
 
-This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md). We are explicitly committed to *not* repeating the maintainer-dismissiveness patterns that drive users away from other terminal projects. Be kind, be specific, and assume good faith.
+This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md). We are explicitly committed to treating every report and suggestion as worth a considered reply, even when the answer is no. Be kind, be specific, and assume good faith.
 
 ---
 

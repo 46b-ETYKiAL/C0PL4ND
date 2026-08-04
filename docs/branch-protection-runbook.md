@@ -52,7 +52,10 @@ gh api -X PUT repos/46b-ETYKiAL/Itasha.Corp_C0PL4ND/branches/master/protection \
       { "context": "Dependency review" },
       { "context": "Supply-chain Audit" },
       { "context": "No-Network Gate" },
-      { "context": "Zero-egress invariant" }
+      { "context": "Zero-egress invariant" },
+      { "context": "public-repo content-safety audit" },
+      { "context": "gitleaks" },
+      { "context": "CI Gate" }
     ]
   },
   "enforce_admins": false,
@@ -62,6 +65,15 @@ gh api -X PUT repos/46b-ETYKiAL/Itasha.Corp_C0PL4ND/branches/master/protection \
 JSON
 ```
 
+- `CI Gate` is the aggregating job in `ci.yml`: it inspects every other job's
+  result explicitly and fails if any is not `success`, so a skipped or
+  cancelled job cannot satisfy it. Requiring it is what makes the individual
+  contexts above impossible to bypass by skipping.
+- `public-repo content-safety audit` runs `tests/content_safety_audit.py`
+  (internal references, developer paths, personal mailboxes, work-tracking
+  tokens) after first running its own falsification suite, so a guard that has
+  stopped detecting something fails loudly instead of reporting a clean tree.
+  `gitleaks` covers credential shapes over full history, using `.gitleaks.toml`.
 - `strict:false` is correct when using a **merge queue** (the queue handles
   up-to-dateness); set `true` only without a queue.
 - Start `enforce_admins:false` so you can still admin-merge a hotfix; flip to

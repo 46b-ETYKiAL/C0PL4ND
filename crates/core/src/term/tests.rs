@@ -2743,6 +2743,136 @@ fn xtgettcap_answers_a_malformed_hex_name() {
     assert_eq!(t.take_pty_response().as_slice(), b"\x1bP0+r\x1b\\");
 }
 
+#[test]
+fn xtgettcap_advertises_smulx_styled_underline() {
+    let mut t = Terminal::new(4, 20);
+    // "Smulx" hex = 536D756C78.
+    t.advance(b"\x1bP+q536D756C78\x1b\\");
+    let expected = format!(
+        "\x1bP1+r536D756C78={}\x1b\\",
+        hex_encode(SMULX_CAPABILITY.as_bytes())
+    );
+    assert_eq!(t.take_pty_response(), expected.as_bytes());
+}
+
+#[test]
+fn xtgettcap_advertises_setulc_underline_colour() {
+    let mut t = Terminal::new(4, 20);
+    // "Setulc" hex = 536574756C63.
+    t.advance(b"\x1bP+q536574756C63\x1b\\");
+    let expected = format!(
+        "\x1bP1+r536574756C63={}\x1b\\",
+        hex_encode(SETULC_CAPABILITY.as_bytes())
+    );
+    assert_eq!(t.take_pty_response(), expected.as_bytes());
+}
+
+#[test]
+fn smulx_advertisement_is_backed_by_real_support() {
+    // TRUTHFULNESS: advertising `Smulx` promises that the sequence its template
+    // expands to actually selects an underline style. Instantiate the template
+    // by hand for each `%p1` and assert the parser really honours it — an
+    // advertisement no implementation backs is the lie this test exists to stop.
+    assert!(
+        SMULX_CAPABILITY.starts_with("\x1b[4:") && SMULX_CAPABILITY.ends_with('m'),
+        "Smulx must expand to an SGR 4 colon sub-parameter: {SMULX_CAPABILITY:?}"
+    );
+    let cases = [
+        (b"\x1b[4:0mX".as_slice(), UnderlineStyle::None),
+        (b"\x1b[4:1mX".as_slice(), UnderlineStyle::Single),
+        (b"\x1b[4:2mX".as_slice(), UnderlineStyle::Double),
+        (b"\x1b[4:3mX".as_slice(), UnderlineStyle::Curly),
+        (b"\x1b[4:4mX".as_slice(), UnderlineStyle::Dotted),
+        (b"\x1b[4:5mX".as_slice(), UnderlineStyle::Dashed),
+    ];
+    for (seq, want) in cases {
+        let mut t = Terminal::new(2, 10);
+        t.advance(seq);
+        assert_eq!(
+            t.grid().cell(0, 0).unwrap().flags.underline_style,
+            want,
+            "Smulx claims support for {seq:x?}"
+        );
+    }
+}
+
+#[test]
+fn setulc_advertisement_is_backed_by_real_support() {
+    // TRUTHFULNESS: `Setulc` promises the colon form WITH the empty colorspace
+    // slot (`58:2::r:g:b`) is understood. Assert the template really emits that
+    // shape, and that the shape really sets the underline colour.
+    assert!(
+        SETULC_CAPABILITY.starts_with("\x1b[58:2::") && SETULC_CAPABILITY.ends_with('m'),
+        "Setulc must expand to the colon RGB form: {SETULC_CAPABILITY:?}"
+    );
+    let mut t = Terminal::new(2, 10);
+    // The hand-expansion of the template for %p1 = 0x0A141E (10,20,30).
+    t.advance(b"\x1b[58:2::10:20:30mX");
+    assert_eq!(
+        t.grid().cell(0, 0).unwrap().underline_color,
+        Some(Color::Rgb(10, 20, 30)),
+        "Setulc claims support for the empty-colorspace colon form"
+    );
+}
+
+// ---- XTVERSION (`CSI > 0 q`) ----
+
+#[test]
+fn xtversion_reports_the_crate_version() {
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[>0q");
+    let expected = format!("\x1bP>|c0pl4nd({})\x1b\\", env!("CARGO_PKG_VERSION"));
+    assert_eq!(t.take_pty_response(), expected.as_bytes());
+    // Guard the DERIVATION, not just the shape: a hard-coded literal passes
+    // today and breaks on the next version bump, so pin that the reported
+    // version is the crate's own and is a real dotted version, never a stub.
+    let ver = env!("CARGO_PKG_VERSION");
+    assert!(
+        ver.contains('.') && ver.chars().next().is_some_and(|c| c.is_ascii_digit()),
+        "the crate version must be a real dotted version, got {ver:?}"
+    );
+}
+
+#[test]
+fn xtversion_omitted_parameter_is_treated_as_zero() {
+    // `CSI > q` with no parameter is the same request as `CSI > 0 q`.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[>q");
+    let expected = format!("\x1bP>|c0pl4nd({})\x1b\\", env!("CARGO_PKG_VERSION"));
+    assert_eq!(t.take_pty_response(), expected.as_bytes());
+}
+
+#[test]
+fn xtversion_ignores_a_non_zero_parameter() {
+    // Deliberate narrow exception to "always answer a query": XTVERSION defines
+    // no invalid/negative reply form, so there is nothing truthful to send for
+    // a Ps the protocol assigns no meaning to.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[>1q");
+    assert!(
+        t.take_pty_response().is_empty(),
+        "only Ps 0 requests the version"
+    );
+}
+
+#[test]
+fn xtversion_does_not_disturb_decscusr_or_secondary_da() {
+    // `CSI > Ps q` (XTVERSION), `CSI Ps SP q` (DECSCUSR) and `CSI > Ps c`
+    // (secondary DA) are near neighbours. Pin that adding XTVERSION moved
+    // neither of the other two.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[4 q"); // DECSCUSR: steady underline
+    assert!(
+        t.take_pty_response().is_empty(),
+        "DECSCUSR sets state and emits no reply"
+    );
+    t.advance(b"\x1bP$q q\x1b\\"); // DECRQSS confirms the shape really changed
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1$r4 q\x1b\\");
+
+    t.advance(b"\x1b[>c"); // secondary DA still answers its own reply
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1b[>0;0;0c");
+}
+
 // ---- DECRQSS (`DCS $ q <setting> ST` — report the current setting) ----
 
 #[test]

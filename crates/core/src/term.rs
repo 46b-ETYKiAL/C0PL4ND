@@ -33,6 +33,30 @@ pub const DEFAULT_SCROLLBACK: usize = 10_000;
 /// oldest entry is dropped rather than growing without limit.
 const KITTY_KBD_STACK_MAX: usize = 16;
 
+/// Terminal name reported by XTVERSION (`CSI > 0 q`). The VERSION is never
+/// written here — it is read from `CARGO_PKG_VERSION` at the reply site so it
+/// cannot rot out of step with the crate.
+const XTVERSION_NAME: &str = "c0pl4nd";
+
+/// Terminfo `Smulx` — styled underline. `%p1` is the style selector, emitted as
+/// an SGR 4 colon sub-parameter (`4:0` … `4:5`).
+///
+/// Advertised because that mapping is REAL: `Screen::sgr`'s `4` arm reads
+/// `groups[i].get(1)` and maps 0/1/2/3/4/5 to
+/// none/single/double/curly/dotted/dashed. The advertisement is bound to that
+/// behaviour by `smulx_advertisement_is_backed_by_real_support`.
+const SMULX_CAPABILITY: &str = "\x1b[4:%p1%dm";
+
+/// Terminfo `Setulc` — underline colour. Splits `%p1` (a packed 24-bit RGB
+/// value) into r/g/b and emits the colon form `58:2::r:g:b`, empty colorspace
+/// slot included.
+///
+/// Advertised because `parse_extended_color` genuinely handles that exact
+/// shape: for `kind == 2` it takes the LAST three sub-parameters after the
+/// kind, so the empty slot is tolerated. Bound to that behaviour by
+/// `setulc_advertisement_is_backed_by_real_support`.
+const SETULC_CAPABILITY: &str = "\x1b[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%dm";
+
 /// Byte cap on an accumulated DECRQSS (`DCS $ q … ST`) setting selector. Real
 /// selectors are 1-2 bytes (`m`, `r`, `SP q`, `" q`); the cap bounds memory
 /// against a hostile stream that never terminates the DCS.
@@ -1540,6 +1564,12 @@ impl Screen {
                 Ok("Co") | Ok("colors") => Some("256"),
                 Ok("TN") | Ok("name") => Some("xterm-256color"),
                 Ok("RGB") => Some(""), // boolean capability — present, empty value.
+                // Styled underline (SGR `4:n`) + underline colour (SGR 58) are
+                // genuinely implemented, so advertise them: an app that probes
+                // terminfo and gets the invalid form downgrades to a plain
+                // underline even though `4:3` / `58:2::r:g:b` work here.
+                Ok("Smulx") => Some(SMULX_CAPABILITY),
+                Ok("Setulc") => Some(SETULC_CAPABILITY),
                 _ => None,
             };
             // Re-encoded from the DECODED bytes, so the quoted name is
@@ -1556,6 +1586,22 @@ impl Screen {
             };
             self.push_pty_response(resp.as_bytes());
         }
+    }
+
+    /// XTVERSION reply (`CSI > 0 q`): `DCS > | <name>(<version>) ST` — the shape
+    /// xterm (`XTerm(370)`) and kitty (`kitty(0.21.2)`) use, which is what
+    /// version-sniffing apps parse.
+    ///
+    /// The version comes from `CARGO_PKG_VERSION` at COMPILE time rather than a
+    /// hand-written literal, so it tracks the crate version instead of silently
+    /// rotting one release after someone forgets to bump it.
+    fn report_xtversion(&mut self) {
+        let resp = format!(
+            "\x1bP>|{}({})\x1b\\",
+            XTVERSION_NAME,
+            env!("CARGO_PKG_VERSION")
+        );
+        self.push_pty_response(resp.as_bytes());
     }
 
     /// DECRQSS reply: `DCS $ q <selector> ST` asks the terminal to report the
@@ -1933,6 +1979,26 @@ impl Perform for Screen {
                 .and_then(|p| p.first().copied())
                 .unwrap_or(0);
             self.set_cursor_shape(ps);
+            return;
+        }
+        // XTVERSION: `CSI > Ps q` — the `>` private marker distinguishes it from
+        // DECSCUSR (`CSI Ps SP q`, handled just above) and from a bare
+        // `CSI Ps q`. Only Ps 0 (or omitted) requests the version.
+        //
+        // A non-zero Ps is IGNORED rather than answered: xterm assigns it no
+        // meaning and the protocol defines no negative/invalid reply form for
+        // XTVERSION, so there is nothing truthful to send. This is a deliberate
+        // narrow exception to the "always answer a query" rule that DECRQSS and
+        // XTGETTCAP follow — those protocols DO define an invalid form.
+        if action == 'q' && intermediates.contains(&b'>') {
+            let ps = params
+                .iter()
+                .next()
+                .and_then(|p| p.first().copied())
+                .unwrap_or(0);
+            if ps == 0 {
+                self.report_xtversion();
+            }
             return;
         }
         // DECSTR soft reset: `CSI ! p` — the `!` is the intermediate.

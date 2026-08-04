@@ -391,6 +391,161 @@ fn cell_at_pos_maps_pointer_to_grid_cell() {
     assert_eq!(cell_at_pos(egui::pos2(36.0, 60.0), origin, 0.0, ch), None);
 }
 
+// ---- drag-select autoscroll rate + edge clamping ----------------------------
+//
+// The geometry half of drag-select autoscroll. The behavioural half — that the
+// view actually scrolls AND the selection extends over the newly revealed lines
+// — is driven end-to-end through the real frame loop in
+// `crates/app/tests/egui_drag_autoscroll.rs`.
+
+#[test]
+fn autoscroll_is_silent_while_the_pointer_is_inside_the_grid() {
+    // Grid spans y ∈ [20, 180) (10 rows of 16pt). Anywhere inside — including
+    // exactly on either boundary — must not scroll: autoscroll is an
+    // edge-OVERSHOOT behaviour, not a side effect of dragging.
+    let (top, bottom, ch) = (20.0, 180.0, 16.0);
+    assert_eq!(autoscroll_lines(100.0, top, bottom, ch), 0, "mid-grid");
+    assert_eq!(autoscroll_lines(top, top, bottom, ch), 0, "on the top edge");
+    assert_eq!(
+        autoscroll_lines(bottom, top, bottom, ch),
+        0,
+        "on the bottom edge"
+    );
+}
+
+#[test]
+fn autoscroll_direction_matches_the_edge_the_pointer_left() {
+    // Positive == back into history (`scroll_view(+n)`), so dragging ABOVE the
+    // top must be positive and BELOW the bottom negative. A swapped sign would
+    // scroll the view AWAY from the content the user is reaching for.
+    let (top, bottom, ch) = (20.0, 180.0, 16.0);
+    assert!(
+        autoscroll_lines(top - 1.0, top, bottom, ch) > 0,
+        "above the top scrolls BACK into history"
+    );
+    assert!(
+        autoscroll_lines(bottom + 1.0, top, bottom, ch) < 0,
+        "below the bottom scrolls FORWARD toward the live bottom"
+    );
+}
+
+#[test]
+fn autoscroll_rate_scales_with_the_overshoot_and_is_capped() {
+    // One row past → 1 line; three rows past → 3; a flung pointer saturates at
+    // the cap instead of teleporting across the whole history.
+    let (top, bottom, ch) = (20.0, 180.0, 16.0);
+    assert_eq!(
+        autoscroll_lines(bottom + 1.0, top, bottom, ch),
+        -1,
+        "a single pixel of overshoot still moves one line"
+    );
+    assert_eq!(autoscroll_lines(bottom + ch, top, bottom, ch), -1);
+    assert_eq!(
+        autoscroll_lines(bottom + 3.0 * ch, top, bottom, ch),
+        -3,
+        "three rows of overshoot must move three lines, not one"
+    );
+    assert_eq!(
+        autoscroll_lines(top - 3.0 * ch, top, bottom, ch),
+        3,
+        "the same scaling applies above the top edge"
+    );
+    assert_eq!(
+        autoscroll_lines(bottom + 10_000.0, top, bottom, ch),
+        -AUTOSCROLL_MAX_LINES,
+        "a far-flung pointer clamps to the per-frame cap"
+    );
+    assert_eq!(
+        autoscroll_lines(top - 10_000.0, top, bottom, ch),
+        AUTOSCROLL_MAX_LINES
+    );
+}
+
+#[test]
+fn autoscroll_never_divides_by_zero_or_wraps_on_degenerate_input() {
+    // Degenerate cell height / inverted span / non-finite pointer are all
+    // "no scroll", never a panic and never a saturated negative from a bad cast.
+    assert_eq!(
+        autoscroll_lines(0.0, 20.0, 180.0, 0.0),
+        0,
+        "zero cell height"
+    );
+    assert_eq!(
+        autoscroll_lines(0.0, 20.0, 180.0, -4.0),
+        0,
+        "negative height"
+    );
+    assert_eq!(autoscroll_lines(0.0, 180.0, 20.0, 16.0), 0, "inverted span");
+    assert_eq!(autoscroll_lines(f32::NAN, 20.0, 180.0, 16.0), 0);
+    assert_eq!(
+        autoscroll_lines(f32::NEG_INFINITY, 20.0, 180.0, 16.0),
+        0,
+        "an infinite pointer is not a scroll request"
+    );
+}
+
+#[test]
+fn clamping_maps_an_off_grid_pointer_to_the_nearest_edge_cell() {
+    // Origin (10,20), 8×16 cells, a 4-col × 10-row grid. Inside, the clamped
+    // mapping agrees with `cell_at_pos`; outside, it pins to the edge cell
+    // instead of returning None (above/left) or a row that does not exist
+    // (below/right) — the latter would place the selection head off the grid.
+    let origin = egui::pos2(10.0, 20.0);
+    let (cw, ch) = (8.0, 16.0);
+    let (cols, rows) = (4, 10);
+    assert_eq!(
+        clamp_pos_to_grid_cell(egui::pos2(36.0, 60.0), origin, cw, ch, cols, rows),
+        Some((2, 3)),
+        "inside the grid it agrees with the unclamped hit test"
+    );
+    assert_eq!(
+        cell_at_pos(egui::pos2(36.0, 60.0), origin, cw, ch),
+        Some((2, 3))
+    );
+    // Above / left of the origin — `cell_at_pos` gives up here, which is exactly
+    // why a drag past the TOP edge used to freeze the selection head.
+    assert_eq!(
+        cell_at_pos(egui::pos2(-900.0, -900.0), origin, cw, ch),
+        None
+    );
+    assert_eq!(
+        clamp_pos_to_grid_cell(egui::pos2(-900.0, -900.0), origin, cw, ch, cols, rows),
+        Some((0, 0)),
+        "off the top-left pins to the first cell"
+    );
+    // Below / right of the last cell pins to the LAST cell, never past it.
+    assert_eq!(
+        clamp_pos_to_grid_cell(egui::pos2(9_000.0, 9_000.0), origin, cw, ch, cols, rows),
+        Some((rows - 1, cols - 1)),
+        "off the bottom-right pins to the last cell"
+    );
+    // A non-finite coordinate must not saturate into a bogus index.
+    assert_eq!(
+        clamp_pos_to_grid_cell(
+            egui::pos2(f32::NAN, f32::INFINITY),
+            origin,
+            cw,
+            ch,
+            cols,
+            rows
+        ),
+        Some((0, 0))
+    );
+    // Degenerate grids yield no cell at all rather than underflowing `count - 1`.
+    assert_eq!(
+        clamp_pos_to_grid_cell(egui::pos2(36.0, 60.0), origin, cw, ch, 0, rows),
+        None
+    );
+    assert_eq!(
+        clamp_pos_to_grid_cell(egui::pos2(36.0, 60.0), origin, cw, ch, cols, 0),
+        None
+    );
+    assert_eq!(
+        clamp_pos_to_grid_cell(egui::pos2(36.0, 60.0), origin, 0.0, ch, cols, rows),
+        None
+    );
+}
+
 #[test]
 fn link_url_at_cell_matches_half_open_span() {
     // One link on row 0 spanning cols [4, 25). A col inside hits; the

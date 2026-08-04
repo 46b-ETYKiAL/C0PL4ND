@@ -147,6 +147,88 @@ pub(crate) fn cell_at_pos(
     Some((row, col))
 }
 
+/// The most scrollback lines ONE frame of drag-select autoscroll may move.
+/// Matches the wheel handler's per-frame tick cap so a pointer flung far off the
+/// pane cannot teleport the view across the whole history in a single frame.
+pub(crate) const AUTOSCROLL_MAX_LINES: i32 = 8;
+
+/// How many scrollback lines a drag-select autoscroll should move THIS frame,
+/// given the pointer's `y` (POINTS, screen space) and the grid's vertical span
+/// `[grid_top, grid_bottom)` (`grid_bottom == origin.y + rows * ch`).
+///
+/// Sign matches [`super::pane_term::PaneTerm::scroll_view`]: **positive goes BACK
+/// into history** (the pointer is dragged ABOVE the top edge, so the selection
+/// must reach older lines) and **negative goes FORWARD toward the live bottom**
+/// (dragged BELOW the bottom edge). A pointer inside the grid returns `0`.
+///
+/// The rate SCALES with how far past the edge the pointer is: one grid row of
+/// overshoot moves one line, five rows move five, capped at
+/// [`AUTOSCROLL_MAX_LINES`]. Any overshoot at all moves at least one line, so a
+/// pointer parked one pixel outside still scrolls.
+///
+/// Pure (no egui frame, no terminal) so the rate curve is unit-testable. Degenerate
+/// inputs (non-positive `ch`, an inverted/empty grid span, a non-finite pointer)
+/// return `0` rather than dividing by zero or saturating a cast.
+pub(crate) fn autoscroll_lines(pointer_y: f32, grid_top: f32, grid_bottom: f32, ch: f32) -> i32 {
+    if ch <= 0.0 || !pointer_y.is_finite() || !grid_top.is_finite() || !grid_bottom.is_finite() {
+        return 0;
+    }
+    if grid_bottom <= grid_top {
+        return 0;
+    }
+    // Overshoot past the nearer edge, in points. Positive = above the top.
+    let overshoot = if pointer_y < grid_top {
+        grid_top - pointer_y
+    } else if pointer_y > grid_bottom {
+        -(pointer_y - grid_bottom)
+    } else {
+        return 0;
+    };
+    let cells = (overshoot.abs() / ch).ceil();
+    // `as i32` saturates, so an absurd pointer coordinate clamps rather than
+    // wrapping negative; the explicit `min` keeps the documented cap.
+    let lines = (cells as i32).clamp(1, AUTOSCROLL_MAX_LINES);
+    if overshoot > 0.0 {
+        lines
+    } else {
+        -lines
+    }
+}
+
+/// Map a pointer position to a grid `(row, col)`, CLAMPED to the grid's edges.
+///
+/// Unlike [`cell_at_pos`] — which returns `None` above/left of the grid and lets
+/// high indices run past the last row/column — this always yields a cell inside
+/// `0..rows` × `0..cols`. That is what a drag-select needs: a pointer dragged off
+/// any edge must still name a sensible EDGE cell (so the selection head keeps
+/// following it) instead of vanishing or naming a row that does not exist.
+///
+/// Returns `None` only for a degenerate grid (zero cell size or zero extent).
+/// Non-finite coordinates clamp to `(0, 0)`; enormous ones clamp to the last
+/// cell — the `as usize` cast saturates, so nothing wraps and nothing panics.
+pub(crate) fn clamp_pos_to_grid_cell(
+    pos: egui::Pos2,
+    origin: egui::Pos2,
+    cw: f32,
+    ch: f32,
+    cols: usize,
+    rows: usize,
+) -> Option<(usize, usize)> {
+    if cw <= 0.0 || ch <= 0.0 || cols == 0 || rows == 0 {
+        return None;
+    }
+    let axis = |p: f32, o: f32, size: f32, count: usize| -> usize {
+        if !p.is_finite() || p <= o {
+            return 0;
+        }
+        (((p - o) / size).floor() as usize).min(count - 1)
+    };
+    Some((
+        axis(pos.y, origin.y, ch, rows),
+        axis(pos.x, origin.x, cw, cols),
+    ))
+}
+
 /// Whether two 1-D ranges overlap (open-interval test), used by directional
 /// pane focus to require orthogonal-axis overlap between two pane rects.
 pub(crate) fn ranges_overlap(a: egui::Rangef, b: egui::Rangef) -> bool {

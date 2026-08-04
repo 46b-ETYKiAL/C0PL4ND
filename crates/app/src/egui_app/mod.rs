@@ -1650,9 +1650,58 @@ impl C0pl4ndApp {
                     }
                 }
                 if resp.dragged() {
-                    if let (Some(sel), Some((line, c))) = (selection.as_mut(), cell0) {
+                    if let Some(sel) = selection.as_mut() {
                         if sel.pane == pane_id {
-                            sel.head = (line, c);
+                            // AUTOSCROLL: dragging past the top/bottom edge scrolls
+                            // this pane's view AND keeps extending the selection over
+                            // the lines that scroll into view — without it a selection
+                            // could never exceed one screenful (the pointer simply left
+                            // the grid, `cell_at_pos` returned `None` above the top, and
+                            // the head froze). Both edges, both directions, and the rate
+                            // scales with how far past the edge the pointer is;
+                            // `scroll_view` clamps at the scrollback ends so neither
+                            // direction can run past the history.
+                            let mut extended = false;
+                            if let (Some(p), Some((cols, prows))) = (pos, pane_size) {
+                                let rows = prows as usize;
+                                let grid_bottom = origin.y + rows as f32 * ch;
+                                let lines = autoscroll_lines(p.y, origin.y, grid_bottom, ch);
+                                if lines != 0 {
+                                    if let Some(term) = terms.get_mut(&pane_id) {
+                                        term.scroll_view(lines);
+                                    }
+                                    // The pointer can sit STILL outside the grid while the
+                                    // view keeps scrolling, and a held-still pointer emits
+                                    // no input event — so ask for the next frame explicitly
+                                    // or the autoscroll would stall after one step.
+                                    ui.ctx().request_repaint();
+                                }
+                                // Re-read the window top AFTER the scroll (`scroll_view`
+                                // clamps, so the move may be shorter than asked) and map
+                                // the pointer — clamped to the grid's edges — into an
+                                // ABSOLUTE line. Clamping is what lets the head follow a
+                                // pointer that is outside the pane instead of freezing,
+                                // and it keeps an off-grid pointer from naming a row that
+                                // does not exist.
+                                let ws = terms
+                                    .get(&pane_id)
+                                    .and_then(PaneTerm::window_start)
+                                    .unwrap_or(window_start);
+                                if let Some((r, c)) =
+                                    clamp_pos_to_grid_cell(p, origin, cw, ch, cols as usize, rows)
+                                {
+                                    sel.head = (ws + r, c);
+                                    extended = true;
+                                }
+                            }
+                            // Degenerate pane (no size / no pointer): fall back to the
+                            // plain unclamped hit test, so a pane whose size is not yet
+                            // known still drags exactly as it did before.
+                            if !extended {
+                                if let Some((line, c)) = cell0 {
+                                    sel.head = (line, c);
+                                }
+                            }
                             mouse_captured = true;
                         }
                     }

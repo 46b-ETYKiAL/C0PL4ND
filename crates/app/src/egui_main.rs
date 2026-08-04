@@ -338,6 +338,19 @@ fn main() -> eframe::Result<()> {
                 "win_chrome_snap_layouts",
                 std::sync::Arc::new(|ui: &mut egui::Ui| win_chrome::tick(ui.ctx())),
             );
+            // Windows 11 window MATERIAL: rounded corners + an explicit backdrop
+            // choice. A frameless window is square-cornered unless the app asks
+            // otherwise, and DWM's default `Auto` backdrop paints a system material
+            // UNDER our own per-pixel-alpha surface — which is what the `opacity`
+            // slider composites through, so the material has to be declined
+            // explicitly (see `win_chrome::desired_window_material`). Both go
+            // through winit's TYPED `WindowExtWindows` extension rather than a raw
+            // `DwmSetWindowAttribute`, so this `#![deny(unsafe_code)]` binary stays
+            // unsafe-free. `winit_window()` is `None` only in headless/test hosts.
+            // A no-op off Windows and when `C0PL4ND_DISABLE_SNAP_CHROME` is set.
+            if let Some(window) = cc.winit_window() {
+                win_chrome::apply_window_material(window.as_ref(), shipping_window_material());
+            }
             // System-tray icon. Created HERE — after the window exists and on the
             // event-loop thread — so it can prime the real HWND (for
             // minimize/restore) and register its click/menu handlers. A single
@@ -472,6 +485,15 @@ fn launch_transparency_enabled() -> bool {
 /// the viewport can be created already at the always-on-top window level. Mirrors
 /// [`launch_gpu_preference`]: a missing / unreadable config yields `false` (the
 /// opt-in default), never a crash.
+/// The corner + backdrop pair the SHIPPING window asks the OS for.
+///
+/// The single decision helper shared by the eframe creation closure and the test
+/// that pins it: the call site passes this function's result verbatim, so there
+/// is no separate argument that could drift from what is asserted.
+fn shipping_window_material() -> (win_chrome::CornerStyle, win_chrome::BackdropStyle) {
+    win_chrome::desired_window_material(launch_transparency_enabled())
+}
+
 fn launch_always_on_top() -> bool {
     c0pl4nd_core::Config::default_path()
         .filter(|p| p.exists())
@@ -819,6 +841,36 @@ mod tests {
             (r.top, r.bottom),
             (6, 34),
             "maximize-button y mirrors chrome.rs"
+        );
+    }
+
+    /// The window MATERIAL the shipping call site actually asks for.
+    ///
+    /// `apply_window_material` is handed `launch_transparency_enabled()` from the
+    /// eframe creation closure, and that is unconditionally `true` (the window is
+    /// always created transparent-capable). So the shipped window must round its
+    /// corners AND decline the DWM system backdrop — leaving the backdrop on its
+    /// `Auto` default would paint a system material under the very surface the
+    /// `opacity` slider composites through.
+    ///
+    /// This pins the DECISION at the argument the call site passes. The OS effect
+    /// itself (`set_corner_preference` / `set_system_backdrop` actually changing
+    /// how DWM draws the window) needs a real Windows 11 window and is NOT covered
+    /// here — see the honest-limits note in `win_chrome`'s module docs.
+    #[test]
+    fn shipping_window_material_is_round_cornered_and_backdrop_free() {
+        use crate::win_chrome::{BackdropStyle, CornerStyle};
+        assert!(
+            super::launch_transparency_enabled(),
+            "precondition: the shipping window is always transparent-capable"
+        );
+        // The SAME helper the creation closure hands to `apply_window_material`.
+        let (corner, backdrop) = super::shipping_window_material();
+        assert_eq!(corner, CornerStyle::Round, "a frameless window must round");
+        assert_eq!(
+            backdrop,
+            BackdropStyle::None,
+            "the DWM material must be declined on the transparent surface"
         );
     }
 

@@ -21,6 +21,30 @@
 //! is a real failure mode — a broken paint path still clears the target — and it
 //! used to produce a PNG and pass, because this file only rendered and saved.
 //!
+//! ### …but "not a uniform colour" is a WHOLE-FRAME check, and the chrome alone
+//! ### satisfies it
+//!
+//! Every frame here carries a titlebar, a tab strip and a status bar. Those are
+//! painted from app state that is ready on frame one, so the whole-frame
+//! uniform-colour check is satisfied *by the chrome* — it says nothing at all
+//! about the TERMINAL, which is the thing these scenes exist to show. Measured:
+//! `qa_launch_frame` produced a PNG whose entire pane body was empty (no banner,
+//! no prompt, no cursor — only chrome) and PASSED, while `qa_launch_frame_hidpi`
+//! in the SAME run captured the full banner + prompt. Two runs of one scene, both
+//! "green", showing different things: the check could not tell them apart.
+//! `qa_split_panes` was the same defect with a fixed shape — the newly-split
+//! pane's shell has never emitted a byte after six frames, so the frame a human
+//! is asked to eyeball for "both panes render" reliably showed one EMPTY pane.
+//!
+//! So the scenes that claim to show rendered terminal content now (a) poll the
+//! real frame loop until every pane's shell has actually produced output — the
+//! same wait `egui_term_render.rs` and [`px_harness`] use, bounded, and a FAILURE
+//! rather than a blank snapshot if it never arrives — and (b) assert, per pane,
+//! that the pane's own body rect carries painted pixels
+//! ([`assert_every_pane_rendered_content`]). That assertion is scoped to the
+//! production `pane_body_rect` with the padding and scrollbar band removed, so
+//! neither the chrome nor a focused pane's border ring can satisfy it.
+//!
 //! What is NOT asserted, and needs a human (or an agent with image-reading) to
 //! eyeball the PNG: glyph shaping, wide/CJK advance widths, colour fidelity,
 //! cursor placement, layout. That is the eyeball this file exists for; the
@@ -223,7 +247,9 @@ fn no_scene_can_bypass_the_config_isolation() {
 /// a fully blank frame — the exact symptom of a broken paint path — produced a
 /// PNG and passed, so every test in this file was an artifact generator rather
 /// than a check. An unasserted render is not a test.
-fn snapshot(h: &mut Harness<'_, egui_app::C0pl4ndApp>, name: &str) {
+/// Returns the rendered frame so a scene can go on to assert something about
+/// WHAT it shows — the whole-frame checks below deliberately cannot.
+fn snapshot(h: &mut Harness<'_, egui_app::C0pl4ndApp>, name: &str) -> image::RgbaImage {
     h.step();
     let img = h.render().expect("kittest wgpu render must succeed");
 
@@ -263,6 +289,237 @@ fn snapshot(h: &mut Harness<'_, egui_app::C0pl4ndApp>, name: &str) {
         img.height(),
         out.display()
     );
+    img
+}
+
+// ---------------------------------------------------------------------------
+// "the pane actually shows terminal content" — the check `snapshot` cannot make
+// ---------------------------------------------------------------------------
+
+/// How long a scene waits for a freshly-spawned shell to emit its first output.
+///
+/// Bounded on purpose: a shell that NEVER emits must FAIL the scene, not hang it
+/// and not quietly snapshot a blank pane. Generous because this covers a cold
+/// `cmd.exe` on a loaded machine and a login shell reading its rc files.
+const SHELL_OUTPUT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Consecutive polls on which every pane must hold output before the wait is
+/// satisfied.
+///
+/// One sighting is not enough. The pane's PTY is resized to fit its rect on the
+/// first laid-out frames, and a reflow can momentarily blank the grid — so a
+/// wait that returns on the FIRST non-empty read can hand the snapshot a grid
+/// that is empty again a few frames later. Measured once, on a machine still
+/// loaded from a full rebuild: the wait was satisfied and the frame then rendered
+/// zero painted pixels. Requiring the output to still be there several polls
+/// running costs ~100ms and removes that window.
+const STABLE_OUTPUT_POLLS: u32 = 5;
+
+/// Minimum painted (non-background) pixels a pane body must carry to count as
+/// "showing terminal content".
+///
+/// Calibrated from the real frames, not guessed. On the 1100x720 harness a
+/// cmd.exe banner + prompt measures in the low thousands of painted pixels, and
+/// an empty pane measures ZERO once the border ring and scrollbar band are
+/// excluded (see [`pane_content_rect_px`]) — so the floor sits an order of
+/// magnitude below real content and far above blank. It is not a "some pixel
+/// differs" check: a lone cursor block (~14x7 px) would not clear it.
+const MIN_PAINTED_PX_PER_PANE: u64 = 400;
+
+/// Per-channel slack when deciding a pixel is "the background". Absorbs any
+/// faint dither/gradient in the pane backing so a subtle non-flat background
+/// cannot be counted as painted content.
+const BG_TOL: i32 = 8;
+
+/// Drive the real frame loop until EVERY pane in the grid has produced terminal
+/// output, then let the frame settle.
+///
+/// This replaces the fixed step-and-sleep waits the affected scenes used. A
+/// fixed wait is a race: it captured the full banner on one run and a completely
+/// empty terminal on the next, and BOTH passed. The poll is the same shape
+/// `egui_term_render.rs` and [`px_harness`] already use — step the production
+/// loop, check observable state, bounded by a deadline.
+///
+/// It is deliberately a hard FAILURE on timeout. Returning early (or skipping)
+/// would put the blank frame straight back into the PNG a human is asked to
+/// eyeball, which is the entire defect.
+fn await_every_pane_has_output(h: &mut Harness<'_, egui_app::C0pl4ndApp>, scene: &str) {
+    let deadline = Instant::now() + SHELL_OUTPUT_TIMEOUT;
+    let mut pending = String::from("the grid has no panes at all");
+    let mut stable = 0u32;
+    while Instant::now() < deadline {
+        h.step();
+        let ids = h.state().pane_ids();
+        if ids.is_empty() {
+            stable = 0;
+        } else {
+            let waiting: Vec<String> = ids
+                .iter()
+                .filter(|id| {
+                    h.state()
+                        .pane_grid_text(**id)
+                        .is_none_or(|t| t.trim().is_empty())
+                })
+                .map(|id| format!("pane {}", id.raw()))
+                .collect();
+            if waiting.is_empty() {
+                stable += 1;
+                if stable >= STABLE_OUTPUT_POLLS {
+                    // Settle: the poll fires on the FIRST byte reaching the grid,
+                    // and a shell's banner + prompt arrive over several reads.
+                    // Without this the snapshot can catch a half-drawn banner.
+                    for _ in 0..10 {
+                        h.step();
+                    }
+                    return;
+                }
+            } else {
+                stable = 0;
+                pending = waiting.join(", ");
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "QA-SNAPSHOT[{scene}]: {pending} produced NO terminal output within \
+         {SHELL_OUTPUT_TIMEOUT:?}. This scene renders a frame a human is asked to \
+         eyeball for terminal content, so snapshotting an empty pane here would \
+         be a picture of nothing that passes."
+    );
+}
+
+/// The region of a pane a reader actually reads: its production body rect, minus
+/// the window padding and minus the scrollbar overlay band on the right edge.
+///
+/// Excluding those is what keeps [`assert_every_pane_rendered_content`] honest
+/// rather than vacuous. The focused pane draws a 2px accent ring INSIDE its body
+/// rect (`egui_app::mod` "background quad (theme bg) + focus ring"), which alone
+/// paints well over a thousand pixels around an EMPTY pane — a count taken over
+/// the raw rect would therefore be satisfied by exactly the blank frame this
+/// assertion exists to reject. The padding inset (the same
+/// `config_window_padding` the production `grid_text_origin` uses) clears the
+/// ring; the right-edge band clears the scrollbar.
+fn pane_content_rect_px(
+    h: &Harness<'_, egui_app::C0pl4ndApp>,
+    pane: egui_app::grid::PaneId,
+) -> (u32, u32, u32, u32) {
+    // `egui_app::scrollbar`'s BAR_WIDTH (8) + BAR_MARGIN (3) are private to the
+    // crate, so their sum is mirrored here with a point of slack.
+    const SCROLLBAR_BAND: f32 = 12.0;
+    let s = h.state();
+    let rect = s.pane_body_rect(pane).unwrap_or_else(|| {
+        panic!(
+            "pane {} has no laid-out body rect — the grid has not rendered a \
+             frame yet, so there is nothing to measure",
+            pane.raw()
+        )
+    });
+    // Floored at the ring's own width so a zero-padding config still excludes it.
+    let pad = f32::from(s.config_window_padding()).max(4.0);
+    let ppp = h.ctx.pixels_per_point();
+    let x0 = ((rect.left() + pad) * ppp).round() as u32;
+    let y0 = ((rect.top() + pad) * ppp).round() as u32;
+    let x1 = ((rect.right() - pad - SCROLLBAR_BAND) * ppp).round() as u32;
+    let y1 = ((rect.bottom() - pad) * ppp).round() as u32;
+    assert!(
+        x1 > x0 && y1 > y0,
+        "pane {}'s content rect is degenerate after insetting {rect:?} — the pane \
+         is too small to carry any terminal content",
+        pane.raw()
+    );
+    (x0, y0, x1, y1)
+}
+
+/// `(painted, total, background)` over the half-open region `[x0,x1) x [y0,y1)`:
+/// how many pixels differ from that region's MODAL colour by more than
+/// [`BG_TOL`] on any channel.
+///
+/// The modal colour is taken from the region itself rather than from the theme,
+/// so this stays correct under a tint, a transparency alpha or a theme change —
+/// it measures "was anything drawn ON the pane backing", which is the property,
+/// not "is the backing the colour I expected".
+fn painted_px_in(img: &image::RgbaImage, region: (u32, u32, u32, u32)) -> (u64, u64, [u8; 4]) {
+    let (x0, y0, x1, y1) = region;
+    let (x1, y1) = (x1.min(img.width()), y1.min(img.height()));
+    let mut hist: std::collections::HashMap<[u8; 4], u64> = std::collections::HashMap::new();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            *hist.entry(img.get_pixel(x, y).0).or_default() += 1;
+        }
+    }
+    let bg = *hist
+        .iter()
+        .max_by_key(|(_, n)| **n)
+        .map(|(c, _)| c)
+        .expect("the content region is non-empty");
+    let (mut painted, mut total) = (0u64, 0u64);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            total += 1;
+            let p = img.get_pixel(x, y).0;
+            if (0..4).any(|i| (i32::from(p[i]) - i32::from(bg[i])).abs() > BG_TOL) {
+                painted += 1;
+            }
+        }
+    }
+    (painted, total, bg)
+}
+
+/// THE assertion that stops a scene passing while showing an empty terminal:
+/// EVERY pane in the grid must carry painted content inside its own body rect.
+///
+/// Per-pane and scoped to production geometry, both deliberately. A whole-frame
+/// count cannot tell "both panes render" from "one pane renders and the other is
+/// blank" — which is precisely what `qa_split_panes` was shipping — and a count
+/// over the raw rect would be satisfied by the focus ring of an empty pane.
+fn assert_every_pane_rendered_content(
+    h: &Harness<'_, egui_app::C0pl4ndApp>,
+    img: &image::RgbaImage,
+    scene: &str,
+) {
+    let ids = h.state().pane_ids();
+    assert!(
+        !ids.is_empty(),
+        "QA-SNAPSHOT[{scene}]: the grid has no panes, so the frame cannot be \
+         showing the terminal this scene claims to show"
+    );
+    for pane in ids {
+        let region = pane_content_rect_px(h, pane);
+        let (painted, total, bg) = painted_px_in(img, region);
+        // The pane's grid state, read AFTER the frame was captured — so it
+        // narrows a failure without over-claiming. An empty grid means the shell
+        // had produced nothing, full stop. A NON-empty grid is the ambiguous
+        // case: either the render dropped content it had, or the content landed
+        // in the window between the captured frame and this read. (Measured: with
+        // the post-split wait cut, pane 1 painted 0 pixels and then reported 97
+        // grid characters a few milliseconds later — the second reading.) Saying
+        // which is which is the reader's job; printing both is this message's.
+        let grid = h.state().pane_grid_text(pane).unwrap_or_default();
+        let grid_chars = grid.chars().filter(|c| !c.is_whitespace()).count();
+        eprintln!(
+            "QA-SNAPSHOT[{scene}]: pane {} content rect {region:?} bg={bg:?} \
+             painted={painted}/{total} grid_nonspace_chars={grid_chars}",
+            pane.raw()
+        );
+        assert!(
+            painted >= MIN_PAINTED_PX_PER_PANE,
+            "QA-SNAPSHOT[{scene}]: pane {} rendered only {painted} painted pixels \
+             in its {total}-pixel body (background {bg:?}, floor \
+             {MIN_PAINTED_PX_PER_PANE}) — this pane is EMPTY in the PNG a human is \
+             asked to eyeball. The whole-frame 'not a uniform colour' check cannot \
+             see this: the titlebar and status bar satisfy it on their own. \
+             Its grid holds {grid_chars} non-whitespace characters when read just \
+             after the capture, so {} First 200 chars of the grid: {:?}",
+            pane.raw(),
+            if grid_chars > 0 {
+                "the content either arrived too late for the captured frame (widen \
+                 the wait) or the render dropped it (a paint defect)."
+            } else {
+                "the shell had produced nothing at all to draw."
+            },
+            grid.chars().take(200).collect::<String>()
+        );
+    }
 }
 
 /// Send a Ctrl+Shift+<key> chord (the default keybinding modifier on this host).
@@ -307,29 +564,134 @@ fn type_line(h: &mut Harness<'_, egui_app::C0pl4ndApp>, line: &str, needle: &str
     }
 }
 
+/// ANTI-VACUITY GUARD for [`assert_every_pane_rendered_content`] (needs a GPU).
+///
+/// The scenes above wait for output and then assert content is painted. Read
+/// quickly that looks circular — "wait for X, assert X" — and a guard that can
+/// only ever pass is worth nothing. This proves it is not: it takes a REAL
+/// rendered frame, blanks the pane's content region exactly as a dropped paint
+/// path would (fill it with the background the region already reports), and
+/// asserts the same measurement then falls below the floor.
+///
+/// It also pins the part that is easy to get subtly wrong: the measured region
+/// must EXCLUDE the focused pane's border ring. The blank frame it builds is the
+/// REAL failure picture — the terminal content gone, the pane's border ring
+/// still drawn (compare the reported PNG: an empty pane that still had its ring).
+/// The ring alone measures thousands of painted pixels, so a guard scoped to the
+/// raw body rect passes on a completely empty terminal.
+///
+/// The blanked band is derived from the raw body rect, NOT from
+/// [`pane_content_rect_px`] — deliberately. An earlier version blanked exactly
+/// the region it then measured, which made it self-referential: deleting the
+/// inset from `pane_content_rect_px` left this test green (verified — it
+/// SURVIVED that cut), because the ring got blanked along with everything else.
+/// Deriving the two independently is what makes the inset falsifiable here.
+#[test]
+#[ignore = "needs a real GPU; run with --ignored"]
+fn the_pane_content_assertion_rejects_a_blank_pane() {
+    /// Points left un-blanked at the pane edge — wide enough to preserve the 2pt
+    /// border ring, narrow enough that no terminal content survives inside it.
+    const KEEP_RING_PT: f32 = 3.0;
+
+    let mut h = build();
+    await_every_pane_has_output(&mut h, "content-guard");
+    h.step();
+    let img = h.render().expect("kittest wgpu render must succeed");
+    let pane = h.state().focused_pane();
+
+    // PREMISE: the pane really is showing content, or "blanking it changes the
+    // measurement" would be trivially true of an already-blank pane.
+    let content = pane_content_rect_px(&h, pane);
+    let (real, _, bg) = painted_px_in(&img, content);
+    assert!(
+        real >= MIN_PAINTED_PX_PER_PANE,
+        "PREMISE: this guard needs a pane that IS rendering content; it measured \
+         only {real} painted pixels"
+    );
+
+    // Build the failure picture: everything inside the pane's border cleared to
+    // the pane background, the border itself untouched.
+    let rect = h
+        .state()
+        .pane_body_rect(pane)
+        .expect("the pane is laid out after a rendered frame");
+    let ppp = h.ctx.pixels_per_point();
+    let to_px = |v: f32| v.max(0.0).round() as u32;
+    let raw = (
+        to_px(rect.left() * ppp),
+        to_px(rect.top() * ppp),
+        to_px(rect.right() * ppp),
+        to_px(rect.bottom() * ppp),
+    );
+    let keep = to_px(KEEP_RING_PT * ppp);
+    let mut blanked = img.clone();
+    for y in (raw.1 + keep)..(raw.3.saturating_sub(keep)).min(blanked.height()) {
+        for x in (raw.0 + keep)..(raw.2.saturating_sub(keep)).min(blanked.width()) {
+            blanked.put_pixel(x, y, image::Rgba(bg));
+        }
+    }
+
+    // 1. The production region rejects it.
+    let (after, _, _) = painted_px_in(&blanked, content);
+    eprintln!("content-guard: real={real} blanked={after} floor={MIN_PAINTED_PX_PER_PANE}");
+    assert!(
+        after < MIN_PAINTED_PX_PER_PANE,
+        "the content floor ({MIN_PAINTED_PX_PER_PANE}) does not reject an empty \
+         pane — the measured region still carried {after} painted pixels on a \
+         frame whose terminal content was erased, so the scenes above would pass \
+         on an empty terminal. The usual cause is the measured region creeping \
+         back over the pane's border ring."
+    );
+
+    // 2. …and the SAME frame over the RAW body rect is NOT rejected, which is
+    //    the whole justification for insetting.
+    let (raw_painted, _, _) = painted_px_in(&blanked, raw);
+    eprintln!("content-guard: same blanked frame over the RAW rect = {raw_painted} painted");
+    assert!(
+        raw_painted >= MIN_PAINTED_PX_PER_PANE,
+        "this half asserts the border ring ALONE would satisfy the floor, which is \
+         why `pane_content_rect_px` insets. The raw rect measured only \
+         {raw_painted} painted pixels on an emptied pane, so that justification no \
+         longer holds and the claim must be re-derived rather than left asserting \
+         something untrue"
+    );
+}
+
+/// VISUAL-QA: the app as it looks on launch — the shell's banner and its first
+/// prompt, in the default theme and font. That RENDERED CONTENT is the eyeball
+/// target: startup glyph shaping, prompt colours and the cursor are what this
+/// frame exists to show, and none of them can be judged from an empty pane.
+///
+/// It is therefore NOT a cold-start scene, and it no longer waits a fixed 30
+/// steps and hopes. That fixed wait was a race: it captured a completely empty
+/// terminal on one run and the full banner + prompt on the next, and both
+/// "passed" because the only checks were the frame size and a whole-frame
+/// not-uniform-colour test that the titlebar and status bar satisfy by
+/// themselves. The scene now polls until the shell has actually emitted output
+/// and asserts the pane carries painted content, so it can no longer pass while
+/// showing an empty terminal.
 #[test]
 #[ignore = "visual-QA aid: needs a real GPU; run explicitly with --ignored"]
 fn qa_launch_frame() {
     let mut h = build();
-    // A few frames to let the shell banner + prompt land.
-    for _ in 0..30 {
-        h.step();
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    snapshot(&mut h, "launch");
+    await_every_pane_has_output(&mut h, "launch");
+    let img = snapshot(&mut h, "launch");
+    assert_every_pane_rendered_content(&h, &img, "launch");
 }
 
+/// VISUAL-QA: the launch frame on a 1.5x HiDPI display (the reported garble
+/// machine) — the default qa harness renders at ppp 1.0, which never reproduced
+/// it. Same deliberate intent as [`qa_launch_frame`]: the banner + prompt are the
+/// eyeball target, so the same poll-then-assert replaces the same fixed wait.
+/// (This scene is where the race was caught: in one run it captured the full
+/// banner while `qa_launch_frame` captured nothing, and both were green.)
 #[test]
 #[ignore = "visual-QA aid: needs a real GPU; run explicitly with --ignored"]
 fn qa_launch_frame_hidpi() {
-    // Reproduce a 1.5x HiDPI display (the reported garble machine) — the default
-    // qa harness renders at ppp 1.0, which never reproduced it.
     let mut h = build_harness(Some(1.5), |_| {});
-    for _ in 0..30 {
-        h.step();
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    snapshot(&mut h, "launch-hidpi");
+    await_every_pane_has_output(&mut h, "launch-hidpi");
+    let img = snapshot(&mut h, "launch-hidpi");
+    assert_every_pane_rendered_content(&h, &img, "launch-hidpi");
 }
 
 #[test]
@@ -442,18 +804,73 @@ fn qa_find_overlay() {
     snapshot(&mut h, "find");
 }
 
+/// VISUAL-QA: a split grid — TWO panes side by side, each showing its own live
+/// shell. The eyeball target is both panes rendering: the divider, the focus
+/// ring on the active pane, and terminal content on BOTH sides.
+///
+/// So this is deliberately NOT a "just after the split" cold frame. It used to
+/// be one by accident — six steps after the chord, the newly-spawned shell has
+/// never emitted a byte, so the PNG reliably showed the new pane completely
+/// EMPTY while the whole-frame checks passed on the strength of the populated
+/// pane plus the chrome. A human eyeballing "both panes render" was being shown
+/// one pane rendering. The scene now:
+///   1. asserts the chord actually ADDED a pane (nothing checked that before —
+///      a no-op keybinding would have snapshotted a single pane and passed);
+///   2. asserts the two panes are genuinely side by side (disjoint x-ranges),
+///      which is what "split right" means and what the frame claims to show;
+///   3. waits for BOTH shells to produce output, then asserts BOTH panes carry
+///      painted content — per pane, so "one pane renders" can never satisfy it.
 #[test]
 #[ignore = "visual-QA aid: needs a real GPU; run explicitly with --ignored"]
 fn qa_split_panes() {
     let mut h = build();
-    for _ in 0..10 {
-        h.step();
-    }
+    await_every_pane_has_output(&mut h, "split (pre-split pane)");
+    let before = h.state().pane_ids().len();
+
     chord(&mut h, egui::Key::D); // Ctrl+Shift+D — split right
     for _ in 0..6 {
         h.step();
     }
-    snapshot(&mut h, "split");
+    let ids = h.state().pane_ids();
+    assert_eq!(
+        ids.len(),
+        before + 1,
+        "Ctrl+Shift+D must add a pane: the grid went from {before} to {} panes, \
+         so this frame is not showing a split at all",
+        ids.len()
+    );
+
+    await_every_pane_has_output(&mut h, "split");
+    let img = snapshot(&mut h, "split");
+
+    // Side by side, not stacked and not overlapping: the x-ranges of the two
+    // panes must be disjoint. A vertical split (or one pane painted over the
+    // other) is a different picture from the one this scene is named for.
+    let mut rects: Vec<(u64, egui::Rect)> = h
+        .state()
+        .pane_ids()
+        .into_iter()
+        .map(|id| {
+            (
+                id.raw(),
+                h.state()
+                    .pane_body_rect(id)
+                    .expect("every pane is laid out after a rendered frame"),
+            )
+        })
+        .collect();
+    rects.sort_by(|a, b| a.1.left().total_cmp(&b.1.left()));
+    for pair in rects.windows(2) {
+        let ((ia, a), (ib, b)) = (pair[0], pair[1]);
+        assert!(
+            a.right() <= b.left() + 0.5,
+            "panes {ia} and {ib} are not side by side: {a:?} overlaps {b:?} in x — \
+             Ctrl+Shift+D is a SPLIT RIGHT, so the two panes must occupy disjoint \
+             horizontal bands"
+        );
+    }
+
+    assert_every_pane_rendered_content(&h, &img, "split");
 }
 
 /// Build a real-wgpu harness whose live config has window-transparency ON with a

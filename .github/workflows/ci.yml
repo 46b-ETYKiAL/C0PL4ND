@@ -273,10 +273,17 @@ jobs:
         run: vulkaninfo --summary || true
 
       - name: Run the visual-QA render suite
-        # --run-ignored only: every test in this file is #[ignore]d, so this runs
-        # exactly the visual-QA suite and nothing else. Single-threaded because
-        # each test stands up its own wgpu device against one software rasteriser.
-        run: cargo nextest run -p c0pl4nd --test qa_wide_glyph_snapshot --locked --run-ignored only --test-threads 1
+        # --run-ignored only: every render test in these files is #[ignore]d, so
+        # this runs exactly the real-frame suites and nothing else. Single-threaded
+        # because each test stands up its own wgpu device against one software
+        # rasteriser.
+        #
+        # egui_term_render is here because it is a real-frame test and this is the
+        # only job with an adapter. It used to be un-ignored and therefore ran in
+        # the `test` job above, where its GPU probe returned early and libtest
+        # reported `ok` — a skip that read as a pass. It now FAILS without an
+        # adapter, so it has to run where one exists.
+        run: cargo nextest run -p c0pl4nd --test qa_wide_glyph_snapshot --test egui_term_render --locked --run-ignored only --test-threads 1
 
       - name: Upload the rendered QA frames (eyeball aid)
         if: always()

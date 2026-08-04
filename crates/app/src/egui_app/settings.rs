@@ -85,6 +85,40 @@ const APPEARANCE_SEARCH_LABELS: &[&str] = &[
     "accessibility",
 ];
 
+/// The `row_visible` keyword strings for the three **Window → Closing and
+/// minimizing** rows, as named consts.
+///
+/// Each is passed BOTH to its own `row_visible(q, …)` call AND (via
+/// [`WINDOW_SEARCH_LABELS`]) to the section's `section_visible` label list, so
+/// the row and the section it lives in can never disagree about which query
+/// reveals them — a section that stays hidden while its row would have matched
+/// is a control the user can see on the tab but never find by searching.
+const CLOSE_TO_TRAY_LABEL: &str = "close to tray system tray notification area minimise";
+const MINIMIZE_TO_TRAY_LABEL: &str = "minimize to tray taskbar hide system tray minimise";
+const WARN_RUNNING_LABEL: &str = "warn running command close confirm prompt process";
+
+/// Cross-category search labels for the **Window** section. Shared with the
+/// `the_new_window_rows_are_reachable_by_search` test so the invariant is checked
+/// against the PRODUCTION labels, not an inline copy that would pass even after
+/// the real list was emptied.
+const WINDOW_SEARCH_LABELS: &[&str] = &[
+    "padding",
+    "columns",
+    "rows",
+    "panes",
+    "dividers",
+    "linked",
+    "symmetrical",
+    "status bar",
+    "graphics",
+    "backend",
+    "gpu",
+    "renderer",
+    CLOSE_TO_TRAY_LABEL,
+    MINIMIZE_TO_TRAY_LABEL,
+    WARN_RUNNING_LABEL,
+];
+
 /// Cross-category search labels for the **Motion** section. Each entry is the
 /// canonical label of exactly one Motion row (see the `row_visible(q, …)` calls),
 /// so any query that reveals the section via a label also reveals its row — no
@@ -2043,25 +2077,7 @@ fn render_sections(
     }
 
     // -------------------------------------------------------------------- Window
-    if section_visible(
-        sel,
-        q,
-        "Window",
-        &[
-            "padding",
-            "columns",
-            "rows",
-            "panes",
-            "dividers",
-            "linked",
-            "symmetrical",
-            "status bar",
-            "graphics",
-            "backend",
-            "gpu",
-            "renderer",
-        ],
-    ) {
+    if section_visible(sel, q, "Window", WINDOW_SEARCH_LABELS) {
         ui.heading("Window");
         help(
             ui,
@@ -2114,6 +2130,72 @@ fn render_sections(
                     .changed();
                 ui.label("");
                 changed |= reset_to_default(ui, &mut config.show_status_bar, &def.show_status_bar);
+                ui.end_row();
+            }
+        });
+
+        group(
+            ui,
+            "Closing and minimizing",
+            "What the close button and the minimize button actually do.",
+        );
+        grid("window_close").show(ui, |ui| {
+            if row_visible(q, CLOSE_TO_TRAY_LABEL) {
+                changed |= ui
+                    .checkbox(&mut config.window.close_to_tray, "Close to tray")
+                    .on_hover_text(
+                        "Closing the window hides it to the system tray instead of \
+                         quitting, so the running shells keep going. Click the tray \
+                         icon to bring it back, or use the tray menu's Quit to \
+                         really exit. Ignored if the tray icon could not be created.",
+                    )
+                    .changed();
+                ui.label("");
+                changed |= reset_to_default(
+                    ui,
+                    &mut config.window.close_to_tray,
+                    &def.window.close_to_tray,
+                );
+                ui.end_row();
+            }
+
+            if row_visible(q, MINIMIZE_TO_TRAY_LABEL) {
+                changed |= ui
+                    .checkbox(&mut config.window.minimize_to_tray, "Minimize to tray")
+                    .on_hover_text(
+                        "Minimizing hides the window to the system tray instead of \
+                         leaving it on the taskbar. Ignored if the tray icon could \
+                         not be created.",
+                    )
+                    .changed();
+                ui.label("");
+                changed |= reset_to_default(
+                    ui,
+                    &mut config.window.minimize_to_tray,
+                    &def.window.minimize_to_tray,
+                );
+                ui.end_row();
+            }
+
+            if row_visible(q, WARN_RUNNING_LABEL) {
+                changed |= ui
+                    .checkbox(
+                        &mut config.window.warn_on_close_running,
+                        "Warn if a command is still running",
+                    )
+                    .on_hover_text(
+                        "Closing kills every shell outright, so an in-flight build \
+                         or migration dies with no prompt. This asks first. Needs \
+                         shell prompt integration (OSC 133) to know a command is \
+                         running — a shell without it never triggers the prompt.",
+                    )
+                    .changed();
+                ui.label("");
+                changed |= reset_to_default(
+                    ui,
+                    &mut config.window.warn_on_close_running,
+                    &def.window.warn_on_close_running,
+                );
                 ui.end_row();
             }
         });
@@ -3716,6 +3798,149 @@ mod tests {
                 dispatched.contains(&name),
                 expected_editable,
                 "binding '{name}' editability does not match the dispatch table"
+            );
+        }
+    }
+
+    // ---- Window > Closing and minimizing: the three new toggles ----
+
+    /// Drive the REAL `show` through a headless kittest harness with the Window
+    /// category selected, then click `label` and report the resulting config.
+    ///
+    /// This exercises the production render path, so a row that was written but
+    /// never reached (wrong section, wrong `row_visible` keyword, `end_row`
+    /// mismatch) fails here rather than shipping invisible.
+    fn click_window_row(label: &str) -> (Config, Config) {
+        use egui_kittest::kittest::Queryable;
+
+        let config = std::cell::RefCell::new(Config::default());
+        let before = config.borrow().clone();
+        let open = std::cell::RefCell::new(true);
+        let colors =
+            super::super::theme::ChromeColors::from_theme(&c0pl4nd_core::Theme::builtin_void());
+
+        #[allow(deprecated)]
+        let mut h = egui_kittest::Harness::new(|ctx| {
+            let mut cfg = config.borrow_mut();
+            let mut op = open.borrow_mut();
+            let _ = show(ctx, &mut cfg, &mut op, colors, false, false);
+        });
+        h.set_size(egui::vec2(1200.0, 900.0));
+        h.run();
+        // Switch to the Window category (the toggles live in its own group).
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Window")
+            .click();
+        h.run();
+        h.get_by_label(label).click();
+        h.run();
+        let after = config.borrow().clone();
+        (before, after)
+    }
+
+    #[test]
+    fn clicking_close_to_tray_flips_only_that_field() {
+        let (before, after) = click_window_row("Close to tray");
+        assert!(
+            !before.window.close_to_tray,
+            "precondition: close-to-tray ships OFF"
+        );
+        assert!(
+            after.window.close_to_tray,
+            "clicking the row must opt the LIVE config in"
+        );
+        // Its two neighbours in the same group must be untouched — a click that
+        // flipped the wrong `&mut` would otherwise pass a single-field check.
+        assert_eq!(
+            after.window.minimize_to_tray,
+            before.window.minimize_to_tray
+        );
+        assert_eq!(
+            after.window.warn_on_close_running,
+            before.window.warn_on_close_running
+        );
+    }
+
+    #[test]
+    fn clicking_minimize_to_tray_flips_only_that_field() {
+        let (before, after) = click_window_row("Minimize to tray");
+        assert!(!before.window.minimize_to_tray);
+        assert!(
+            after.window.minimize_to_tray,
+            "clicking the row must opt the LIVE config in"
+        );
+        assert_eq!(after.window.close_to_tray, before.window.close_to_tray);
+        assert_eq!(
+            after.window.warn_on_close_running,
+            before.window.warn_on_close_running
+        );
+    }
+
+    #[test]
+    fn clicking_the_running_command_warning_flips_only_that_field() {
+        let (before, after) = click_window_row("Warn if a command is still running");
+        assert!(
+            before.window.warn_on_close_running,
+            "precondition: the warning ships ON"
+        );
+        assert!(
+            !after.window.warn_on_close_running,
+            "clicking the row must opt the LIVE config OUT"
+        );
+        assert_eq!(after.window.close_to_tray, before.window.close_to_tray);
+        assert_eq!(
+            after.window.minimize_to_tray,
+            before.window.minimize_to_tray
+        );
+    }
+
+    #[test]
+    fn the_new_window_rows_are_reachable_by_search() {
+        // Asserted against the PRODUCTION consts the render path uses — an inline
+        // copy of the keyword list would keep passing after the real list was
+        // emptied or typo'd, which is exactly the row-you-cannot-find failure
+        // this test exists to catch.
+        //
+        // Each row's keyword string must contain the terms a user would type.
+        for term in ["tray", "close", "notification"] {
+            assert!(
+                row_visible(term, CLOSE_TO_TRAY_LABEL),
+                "close-to-tray row must be findable by {term:?}"
+            );
+        }
+        for term in ["tray", "minimize", "taskbar"] {
+            assert!(
+                row_visible(term, MINIMIZE_TO_TRAY_LABEL),
+                "minimize-to-tray row must be findable by {term:?}"
+            );
+        }
+        for term in ["running", "warn", "confirm"] {
+            assert!(
+                row_visible(term, WARN_RUNNING_LABEL),
+                "running-command warning row must be findable by {term:?}"
+            );
+        }
+
+        // ...and the Window SECTION must surface for those same terms in a
+        // cross-category search from another tab. A row whose keyword matches
+        // inside a section whose list does NOT is unreachable from the search
+        // box: the section never renders, so the row never gets the chance.
+        for term in ["tray", "notification", "taskbar", "confirm"] {
+            assert!(
+                section_visible("Appearance", term, "Window", WINDOW_SEARCH_LABELS),
+                "the Window section must surface for a cross-category {term:?} search"
+            );
+        }
+
+        // The section list must literally carry each row's keyword string, so
+        // the two can never drift apart.
+        for label in [
+            CLOSE_TO_TRAY_LABEL,
+            MINIMIZE_TO_TRAY_LABEL,
+            WARN_RUNNING_LABEL,
+        ] {
+            assert!(
+                WINDOW_SEARCH_LABELS.contains(&label),
+                "WINDOW_SEARCH_LABELS is missing the row keyword {label:?}"
             );
         }
     }

@@ -410,6 +410,29 @@ fn image_display_row(line: usize, window_start: usize, rows: usize) -> Option<i3
     Some(row as i32)
 }
 
+/// Whether the OSC 133 command marks say a command is STILL RUNNING.
+///
+/// The shell brackets each command with `;C` (output starts) and `;D` (command
+/// finished). The marks arrive in order and are only ever evicted from the FRONT
+/// under the core's flood cap, so the ordering holds: a command is in flight
+/// exactly when the LAST mark is a `;C` that no `;D` has closed.
+///
+/// **Limit — this reports what the SHELL reports.** A shell with no OSC 133
+/// prompt integration emits no marks at all, so an empty slice is `false`: we
+/// genuinely cannot tell, and a close-confirmation that fired on every close for
+/// an unintegrated shell would be worse than none. This is deliberately the
+/// conservative direction (miss rather than nag); it is the same constraint
+/// [`PaneTerm::last_command_exit_code`] already documents for the status bar.
+/// Pure, so the rule is exhaustively unit-tested with no shell and no PTY.
+#[must_use]
+fn command_in_flight(marks: &[c0pl4nd_core::term::osc::CommandMark]) -> bool {
+    use c0pl4nd_core::term::osc::CommandMarkKind;
+    matches!(
+        marks.last().map(|m| m.kind),
+        Some(CommandMarkKind::OutputStart)
+    )
+}
+
 /// One pane's live terminal. Owns the PTY session and the rendering inputs the
 /// egui shell needs each frame.
 pub struct PaneTerm {
@@ -541,7 +564,37 @@ impl PaneTerm {
     /// same deliberate test-facing-public-API pattern the chrome accessors use.
     #[allow(dead_code)]
     pub fn spawn_program(theme: Theme, program: &str, args: &[&str], cols: u16, rows: u16) -> Self {
-        match Session::spawn_program(program, args, rows, cols) {
+        Self::spawn_program_in(theme, program, args, cols, rows, None)
+    }
+
+    /// Like [`spawn_program`](Self::spawn_program) but starts the program in an
+    /// explicit working directory — the named-shell-profile counterpart to
+    /// [`spawn_in_with_term`](Self::spawn_in_with_term).
+    ///
+    /// Why it exists: `spawn_term_in` in `egui_app/mod.rs` picks ONE of two
+    /// branches — the default profile (program `None`) takes
+    /// `spawn_in_with_term` and carries the cwd, while a NAMED profile took
+    /// `spawn_program`, which had no cwd parameter at all. So reopening a closed
+    /// pane (or restoring a layout) under a named profile silently landed in the
+    /// default directory. One missing parameter, both paths; this is the variant
+    /// that closes it.
+    ///
+    /// `cwd = None` is the shell's own default directory. A `cwd` that no longer
+    /// names an existing directory falls back to home inside the core spawn (a
+    /// stale restored cwd is not an error), and a failed spawn degrades to an
+    /// error label, never a panic — identical to
+    /// [`spawn_program`](Self::spawn_program), which now delegates here so the
+    /// two can never drift apart.
+    #[allow(dead_code)]
+    pub fn spawn_program_in(
+        theme: Theme,
+        program: &str,
+        args: &[&str],
+        cols: u16,
+        rows: u16,
+        cwd: Option<&str>,
+    ) -> Self {
+        match Session::spawn_program_in(program, args, rows, cols, cwd) {
             Ok(session) => {
                 // P0.3: enroll the shell in the kill-on-close job so it (and its
                 // descendants) cannot outlive the app, even on a hard exit/crash.
@@ -1179,6 +1232,41 @@ impl PaneTerm {
             .unwrap_or_default()
     }
 
+    /// Whether this pane has a shell command STILL RUNNING — the signal the
+    /// close path needs before it kills every child (`prepare_shutdown` reaps
+    /// every PTY child with no prompt today, so an in-flight build/migration
+    /// dies silently).
+    ///
+    /// Derived from the OSC 133 marks the terminal ALREADY captures — no process
+    /// handle, no process-tree walk, no extra Win32 FFI. See
+    /// [`command_in_flight`] for the rule and its limits.
+    ///
+    /// Gated on the shell still being alive: a pane whose shell died mid-command
+    /// keeps its trailing `;C` mark forever, and reporting that as "running"
+    /// would warn about a process that no longer exists. `false` for a
+    /// failed-spawn pane, a dead shell, or a poisoned lock (the close path must
+    /// never be blocked by an unreadable pane).
+    ///
+    /// `allow(dead_code)`: the consuming branch is the close path in
+    /// `egui_app/mod.rs` (`prepare_shutdown` / `WindowCmd::Close` / the
+    /// `close_requested` + Alt+F4 fast-exits), which is outside this change's
+    /// file ownership — same deliberate accessor-ahead-of-its-call-site pattern
+    /// as [`spawn_program`](Self::spawn_program) and [`is_alive`](Self::is_alive).
+    #[allow(dead_code)]
+    pub fn has_running_command(&self) -> bool {
+        let Some(session) = self.session.as_ref() else {
+            return false;
+        };
+        if !session.is_alive() {
+            return false;
+        }
+        session
+            .terminal()
+            .lock()
+            .map(|t| command_in_flight(t.command_marks()))
+            .unwrap_or(false)
+    }
+
     /// Write raw bytes straight to the PTY (used for pasted text). Best-effort:
     /// a closed/dead session silently drops the write rather than panicking.
     pub fn write_bytes(&mut self, bytes: &[u8]) {
@@ -1491,6 +1579,261 @@ mod tests {
 
     fn void_theme() -> Theme {
         Theme::builtin_void()
+    }
+
+    // ---- OSC 133 "a command is still running" (the close-warning signal) ----
+
+    /// Build a mark slice for the pure rule without any terminal at all.
+    fn marks(
+        kinds: &[c0pl4nd_core::term::osc::CommandMarkKind],
+    ) -> Vec<c0pl4nd_core::term::osc::CommandMark> {
+        kinds
+            .iter()
+            .enumerate()
+            .map(|(i, k)| c0pl4nd_core::term::osc::CommandMark { kind: *k, line: i })
+            .collect()
+    }
+
+    #[test]
+    fn command_in_flight_is_true_only_for_an_unclosed_output_start() {
+        use c0pl4nd_core::term::osc::CommandMarkKind::{CommandEnd, OutputStart};
+        let end0 = CommandEnd { exit_code: Some(0) };
+        let end1 = CommandEnd { exit_code: Some(1) };
+        let end_none = CommandEnd { exit_code: None };
+
+        // No marks: an unintegrated shell reports nothing, so we cannot tell.
+        // Deliberately the conservative answer — see `command_in_flight`'s doc.
+        assert!(!command_in_flight(&[]), "no marks must not claim a command");
+        // A bare `;C` with no closing `;D` is the whole point: RUNNING.
+        assert!(command_in_flight(&marks(&[OutputStart])));
+        // `;C` then `;D` — the command finished, whatever its exit code.
+        assert!(!command_in_flight(&marks(&[OutputStart, end0])));
+        assert!(!command_in_flight(&marks(&[OutputStart, end1])));
+        assert!(!command_in_flight(&marks(&[OutputStart, end_none])));
+        // A finished command followed by a NEW `;C` is running again.
+        assert!(command_in_flight(&marks(&[OutputStart, end0, OutputStart])));
+        // ...and closing that one settles back to idle.
+        assert!(!command_in_flight(&marks(&[
+            OutputStart,
+            end0,
+            OutputStart,
+            end1
+        ])));
+        // Only the LAST mark decides — a long idle history must not read as busy.
+        assert!(!command_in_flight(&marks(&[
+            OutputStart,
+            end0,
+            OutputStart,
+            end0,
+            OutputStart,
+            end0
+        ])));
+        // A lone `;D` (integration switched on mid-session) is idle, not running.
+        assert!(!command_in_flight(&marks(&[end0])));
+    }
+
+    /// The accessor must read the LIVE terminal, not a snapshot: driving the real
+    /// OSC 133 bytes through the parser has to flip it both ways. This is the
+    /// wire from "the shell said `;C`" to "the close path would warn".
+    #[test]
+    fn has_running_command_follows_the_live_osc133_marks() {
+        let pane = PaneTerm::spawn(void_theme(), 80, 24);
+        // A fresh pane has no marks at all → not running.
+        assert!(
+            !pane.has_running_command(),
+            "a fresh pane must not claim a running command"
+        );
+        // No shell on this box → the None default above is the assertion.
+        let Some(term) = pane.terminal_for_test() else {
+            return;
+        };
+        // The shell announces a command's output starts here (`OSC 133 ; C`).
+        term.lock().unwrap().advance(b"\x1b]133;C\x07");
+        assert!(
+            pane.has_running_command(),
+            "after ESC]133;C BEL the pane must report a command in flight"
+        );
+        // ...and the matching `;D` clears it.
+        term.lock().unwrap().advance(b"\x1b]133;D;0\x07");
+        assert!(
+            !pane.has_running_command(),
+            "after ESC]133;D the command has finished — no warning"
+        );
+    }
+
+    /// A failed-spawn pane has no session; the close path must get a plain
+    /// `false` rather than a panic or an unwrap on `None`.
+    #[test]
+    fn has_running_command_is_false_for_a_failed_spawn_pane() {
+        let pane =
+            PaneTerm::spawn_program(void_theme(), "c0pl4nd-no-such-program-exists", &[], 80, 24);
+        assert!(
+            pane.error().is_some(),
+            "the bogus program must have failed to spawn"
+        );
+        assert!(
+            !pane.has_running_command(),
+            "a failed-spawn pane must never block the close path"
+        );
+    }
+
+    // ---- spawn_program_in: the named-profile cwd that used to be dropped ----
+
+    /// A uniquely-named directory under the OS temp dir. The unique component is
+    /// what the assertions match on, so Windows 8.3 short-name mangling of the
+    /// PARENT (`RUNNER~1`) can never make a correct spawn look wrong.
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("c0pl4nd-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the test cwd");
+        dir
+    }
+
+    /// Poll the pane's visible grid for `needle` until `timeout`. The PTY reader
+    /// is a background thread, so the output arrives asynchronously; returns the
+    /// last grid seen so a failure message can show what DID land.
+    fn wait_for_grid(pane: &PaneTerm, needle: &str, timeout: std::time::Duration) -> String {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut last = String::new();
+        loop {
+            last = pane.grid_text().unwrap_or(last);
+            if last.contains(needle) {
+                return last;
+            }
+            if std::time::Instant::now() >= deadline {
+                return last;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// A program that prints its own working directory, so the assertion is on
+    /// where the child ACTUALLY ran — not merely on the argument being stored.
+    fn print_cwd_program() -> (&'static str, Vec<&'static str>) {
+        #[cfg(windows)]
+        {
+            ("cmd.exe", vec!["/C", "cd"])
+        }
+        #[cfg(not(windows))]
+        {
+            ("/bin/sh", vec!["-c", "pwd"])
+        }
+    }
+
+    /// THE regression this variant exists for: with a named shell profile the
+    /// reopen/restore path had no way to pass a cwd, so the pane came back in the
+    /// default directory. The child must print the directory we asked for.
+    ///
+    /// Asserts the value reached its USE (the spawned process's real cwd), not
+    /// that it was stored somewhere — a `spawn_program_in` that accepted `cwd`
+    /// and then dropped it on the floor would pass any "a pane appeared" check.
+    #[test]
+    fn spawn_program_in_starts_the_child_in_the_requested_directory() {
+        let dir = unique_dir("spawn-in");
+        let unique = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("unique component")
+            .to_string();
+        let (program, args) = print_cwd_program();
+        let pane = PaneTerm::spawn_program_in(void_theme(), program, &args, 80, 24, dir.to_str());
+        if pane.error().is_some() {
+            // No shell available on this host: nothing to observe. Not a pass
+            // for the behaviour — just an absent platform.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let grid = wait_for_grid(&pane, &unique, std::time::Duration::from_secs(20));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            grid.contains(&unique),
+            "the child must RUN in the requested cwd; wanted {unique:?} in the \
+             grid, got:\n{grid}"
+        );
+    }
+
+    /// The home directory a cwd-less spawn is documented to fall back to
+    /// (`pty::dirs_home`). `None` on a host with neither variable set.
+    fn home_dir() -> Option<String> {
+        #[cfg(windows)]
+        let v = std::env::var_os("USERPROFILE");
+        #[cfg(not(windows))]
+        let v = std::env::var_os("HOME");
+        v.and_then(|s| s.into_string().ok())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Case-insensitively: does the grid show the child running in `dir`?
+    /// Windows reports drive letters and path case inconsistently, so an exact
+    /// match would be flaky where the behaviour is correct.
+    fn grid_shows_dir(grid: &str, dir: &str) -> bool {
+        grid.to_lowercase().contains(&dir.to_lowercase())
+    }
+
+    /// The companion direction: `cwd = None` lands in HOME — the fallback
+    /// `PtyProcess::spawn_program_in_with_term` applies when no directory is
+    /// given. `spawn_program` now delegates to `spawn_program_in(.., None)`, so
+    /// this pins that the delegation did not change the old behaviour.
+    ///
+    /// Asserts POSITIVELY (it landed in home), not merely that it avoided one
+    /// nominated directory: a weaker "not in dir X" form passes for a spawn that
+    /// landed in any of the thousands of other wrong directories.
+    #[test]
+    fn spawn_program_without_a_cwd_lands_in_home() {
+        let Some(home) = home_dir() else {
+            return; // No home on this host: the fallback is unobservable.
+        };
+        let (program, args) = print_cwd_program();
+        let pane = PaneTerm::spawn_program(void_theme(), program, &args, 80, 24);
+        if pane.error().is_some() {
+            return;
+        }
+        let grid = wait_for_grid(&pane, &home, std::time::Duration::from_secs(20));
+        assert!(
+            grid_shows_dir(&grid, &home),
+            "a cwd-less spawn must fall back to home ({home:?}); got:\n{grid}"
+        );
+    }
+
+    /// A `cwd` that no longer exists (a stale restored layout) must degrade to
+    /// the home fallback the core spawn provides — never a failed pane, and
+    /// never the missing path. Again asserted positively (it IS home) plus the
+    /// negative (it is NOT the vanished directory).
+    #[test]
+    fn spawn_program_in_falls_back_to_home_when_the_cwd_is_gone() {
+        let dir = unique_dir("spawn-stale");
+        let unique = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("unique component")
+            .to_string();
+        let stale = dir.to_str().expect("utf8 path").to_string();
+        // Delete it BEFORE spawning: this is exactly a restored-but-removed dir.
+        std::fs::remove_dir_all(&dir).expect("remove the test cwd");
+        let (program, args) = print_cwd_program();
+        let pane = PaneTerm::spawn_program_in(void_theme(), program, &args, 80, 24, Some(&stale));
+        assert!(
+            pane.error().is_none(),
+            "a stale cwd must not fail the spawn, got: {:?}",
+            pane.error()
+        );
+        let Some(home) = home_dir() else {
+            return;
+        };
+        let grid = wait_for_grid(&pane, &home, std::time::Duration::from_secs(20));
+        assert!(
+            grid_shows_dir(&grid, &home),
+            "a vanished cwd must fall back to home ({home:?}); got:\n{grid}"
+        );
+        assert!(
+            !grid.contains(&unique),
+            "the child cannot be running in a directory that does not exist; \
+             got:\n{grid}"
+        );
     }
 
     /// SGR 53 (overline) must reach the renderer's decoration pass. `has_decoration`

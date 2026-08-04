@@ -233,6 +233,25 @@ pub struct WindowConfig {
     /// is only restored when that monitor is still connected (multi-monitor
     /// safety). Matched against `MonitorHandle::name()` at restore time.
     pub monitor: Option<String>,
+    /// Closing the window (caption ✕ / Alt+F4 / taskbar Close) hides it to the
+    /// system tray instead of quitting. OFF by default: the ✕ meaning "quit" is
+    /// the platform expectation, and a user who has never seen the tray icon
+    /// would otherwise think the app vanished while its shells kept running.
+    /// Honoured only when a tray icon actually exists — see
+    /// [`WindowConfig::close_action`].
+    pub close_to_tray: bool,
+    /// Minimizing the window hides it to the system tray instead of leaving it
+    /// on the taskbar. OFF by default, same reasoning as
+    /// [`close_to_tray`](Self::close_to_tray). Honoured only when a tray icon
+    /// actually exists — see [`WindowConfig::minimize_action`].
+    pub minimize_to_tray: bool,
+    /// Ask for confirmation before closing while a shell command is still
+    /// running. ON by default: closing kills every child process outright, so an
+    /// in-flight `cargo build` / `rsync` / migration dies with no prompt — a real
+    /// data-loss surface. The prompt can only fire when the shell reports OSC 133
+    /// command marks, so a shell with no prompt integration never sees it (see
+    /// [`WindowConfig::close_guard`]).
+    pub warn_on_close_running: bool,
 }
 
 impl Default for WindowConfig {
@@ -247,6 +266,93 @@ impl Default for WindowConfig {
             size_h: None,
             maximized: None,
             monitor: None,
+            close_to_tray: false,
+            minimize_to_tray: false,
+            warn_on_close_running: true,
+        }
+    }
+}
+
+/// What a window-close request should actually do — the decision
+/// [`WindowConfig::close_action`] makes for the app's close paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseAction {
+    /// Run the real shutdown (persist config, reap every PTY child) and exit.
+    Exit,
+    /// Keep the process alive and hide the window to the tray instead.
+    HideToTray,
+}
+
+/// What a window-minimize request should actually do — the decision
+/// [`WindowConfig::minimize_action`] makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinimizeAction {
+    /// Ordinary minimize to the taskbar.
+    Minimize,
+    /// Hide the window entirely; the tray icon is the only way back.
+    HideToTray,
+}
+
+/// Whether a close may proceed, or must first confirm with the user — the
+/// decision [`WindowConfig::close_guard`] makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseGuard {
+    /// Nothing is running (or the warning is off): close immediately.
+    Proceed,
+    /// `busy_panes` panes have a command in flight; confirm before killing them.
+    Confirm {
+        /// How many panes report an unfinished command (always `>= 1`).
+        busy_panes: usize,
+    },
+}
+
+impl WindowConfig {
+    /// What a close request should do.
+    ///
+    /// * `tray_available` — whether a tray icon was actually created. The tray
+    ///   build is best-effort (a headless/session-0 shell has none), and hiding
+    ///   to a tray that does not exist would strand the window with no way back
+    ///   and no visible process. So a missing tray always degrades to
+    ///   [`CloseAction::Exit`], never to an unrecoverable hide.
+    /// * `explicit_quit` — the request came from a real "quit" affordance (the
+    ///   tray menu's Quit, a File→Quit item). This ALWAYS exits. Without it,
+    ///   close-to-tray would swallow the tray's own Quit — which posts `WM_CLOSE`
+    ///   into this very path — and the app could never be closed at all.
+    #[must_use]
+    pub fn close_action(&self, tray_available: bool, explicit_quit: bool) -> CloseAction {
+        if !explicit_quit && self.close_to_tray && tray_available {
+            CloseAction::HideToTray
+        } else {
+            CloseAction::Exit
+        }
+    }
+
+    /// What a minimize request should do. `tray_available` degrades a hide to an
+    /// ordinary minimize for the same reason as [`close_action`](Self::close_action):
+    /// never hide a window the user cannot get back.
+    #[must_use]
+    pub fn minimize_action(&self, tray_available: bool) -> MinimizeAction {
+        if self.minimize_to_tray && tray_available {
+            MinimizeAction::HideToTray
+        } else {
+            MinimizeAction::Minimize
+        }
+    }
+
+    /// Whether a close must confirm first, given how many panes have a command
+    /// in flight.
+    ///
+    /// `already_confirmed` is the user's answer to a previous prompt ("Close
+    /// anyway"). It short-circuits to [`CloseGuard::Proceed`] so the second pass
+    /// through the close path cannot re-prompt — without it the confirmation
+    /// would loop forever, since the commands are still running when the user
+    /// says yes.
+    #[must_use]
+    pub fn close_guard(&self, busy_panes: usize, already_confirmed: bool) -> CloseGuard {
+        if already_confirmed || !self.warn_on_close_running || busy_panes == 0 {
+            CloseGuard::Proceed
+        } else {
+            CloseGuard::Confirm { busy_panes }
         }
     }
 }
@@ -2648,6 +2754,220 @@ mod tests {
             ..Config::default()
         };
         assert!(c.validate().is_ok());
+    }
+
+    // ---- Tray / close-guard decisions (the pure logic the app's close paths call) ----
+
+    #[test]
+    fn tray_and_close_warning_defaults_are_off_off_on() {
+        // The tray toggles ship OFF (the ✕ keeps meaning "quit" until the user
+        // opts in) and the running-command warning ships ON (it guards a real
+        // data-loss surface and can only fire when a command is actually live).
+        let w = WindowConfig::default();
+        assert!(!w.close_to_tray, "close_to_tray must default OFF");
+        assert!(!w.minimize_to_tray, "minimize_to_tray must default OFF");
+        assert!(
+            w.warn_on_close_running,
+            "warn_on_close_running must default ON"
+        );
+    }
+
+    #[test]
+    fn close_action_covers_every_flag_combination() {
+        // Exhaustive over (close_to_tray, tray_available, explicit_quit): the
+        // ONLY hide is opt-in + tray-present + not an explicit quit.
+        for &close_to_tray in &[false, true] {
+            for &tray_available in &[false, true] {
+                for &explicit_quit in &[false, true] {
+                    let w = WindowConfig {
+                        close_to_tray,
+                        ..WindowConfig::default()
+                    };
+                    let expected = if close_to_tray && tray_available && !explicit_quit {
+                        CloseAction::HideToTray
+                    } else {
+                        CloseAction::Exit
+                    };
+                    assert_eq!(
+                        w.close_action(tray_available, explicit_quit),
+                        expected,
+                        "close_to_tray={close_to_tray} tray_available={tray_available} \
+                         explicit_quit={explicit_quit}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn close_to_tray_never_hides_without_a_tray() {
+        // The stranding case: hiding to a tray that failed to build would leave
+        // the window invisible with no icon to restore it and the shells still
+        // running. A missing tray must always degrade to a real exit.
+        let w = WindowConfig {
+            close_to_tray: true,
+            ..WindowConfig::default()
+        };
+        assert_eq!(w.close_action(false, false), CloseAction::Exit);
+        assert_eq!(w.close_action(true, false), CloseAction::HideToTray);
+    }
+
+    #[test]
+    fn explicit_quit_always_exits_even_with_close_to_tray_on() {
+        // The tray menu's Quit posts WM_CLOSE into the same close path. Without
+        // the explicit-quit escape the app would hide instead of quitting and
+        // could never be closed at all.
+        let w = WindowConfig {
+            close_to_tray: true,
+            ..WindowConfig::default()
+        };
+        assert_eq!(w.close_action(true, true), CloseAction::Exit);
+    }
+
+    #[test]
+    fn minimize_action_covers_every_flag_combination() {
+        for &minimize_to_tray in &[false, true] {
+            for &tray_available in &[false, true] {
+                let w = WindowConfig {
+                    minimize_to_tray,
+                    ..WindowConfig::default()
+                };
+                let expected = if minimize_to_tray && tray_available {
+                    MinimizeAction::HideToTray
+                } else {
+                    MinimizeAction::Minimize
+                };
+                assert_eq!(
+                    w.minimize_action(tray_available),
+                    expected,
+                    "minimize_to_tray={minimize_to_tray} tray_available={tray_available}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn close_guard_confirms_only_when_enabled_busy_and_unconfirmed() {
+        // Exhaustive over (warn_on_close_running, busy_panes==0?, already_confirmed).
+        for &warn in &[false, true] {
+            for &busy in &[0usize, 1, 3] {
+                for &confirmed in &[false, true] {
+                    let w = WindowConfig {
+                        warn_on_close_running: warn,
+                        ..WindowConfig::default()
+                    };
+                    let expected = if warn && busy > 0 && !confirmed {
+                        CloseGuard::Confirm { busy_panes: busy }
+                    } else {
+                        CloseGuard::Proceed
+                    };
+                    assert_eq!(
+                        w.close_guard(busy, confirmed),
+                        expected,
+                        "warn={warn} busy={busy} confirmed={confirmed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn close_guard_reports_the_real_busy_pane_count() {
+        // The count reaches the prompt, so the dialog can say "2 panes are still
+        // running a command" rather than a generic message. A guard that returned
+        // a constant would satisfy a bare is-Confirm assertion.
+        let w = WindowConfig::default();
+        assert_eq!(
+            w.close_guard(2, false),
+            CloseGuard::Confirm { busy_panes: 2 }
+        );
+        assert_eq!(
+            w.close_guard(7, false),
+            CloseGuard::Confirm { busy_panes: 7 }
+        );
+    }
+
+    #[test]
+    fn close_guard_confirmed_answer_stops_the_prompt_looping() {
+        // The commands are STILL running when the user clicks "Close anyway", so
+        // without the already-confirmed short-circuit the second pass through the
+        // close path would prompt again, forever.
+        let w = WindowConfig::default();
+        assert_eq!(
+            w.close_guard(4, false),
+            CloseGuard::Confirm { busy_panes: 4 }
+        );
+        assert_eq!(w.close_guard(4, true), CloseGuard::Proceed);
+    }
+
+    #[test]
+    fn tray_and_warning_flags_round_trip_through_toml() {
+        // The toggles must survive save→load, and a config written before these
+        // fields existed must still parse (serde(default) on WindowConfig).
+        let mut c = Config::default();
+        c.window.close_to_tray = true;
+        c.window.minimize_to_tray = true;
+        c.window.warn_on_close_running = false;
+        let toml = c.to_toml().expect("serialise");
+        let back = Config::from_toml(&toml, Path::new("round.toml")).expect("parse");
+        assert!(back.window.close_to_tray);
+        assert!(back.window.minimize_to_tray);
+        assert!(!back.window.warn_on_close_running);
+
+        // A legacy [window] table with none of the three keys falls back to the
+        // documented defaults rather than failing to parse.
+        let legacy = Config::from_toml(
+            "[window]\ncols = 100\nrows = 30\n",
+            Path::new("legacy.toml"),
+        )
+        .expect("legacy config must still parse");
+        assert!(!legacy.window.close_to_tray);
+        assert!(!legacy.window.minimize_to_tray);
+        assert!(legacy.window.warn_on_close_running);
+    }
+
+    #[test]
+    fn persist_geometry_copies_only_geometry_not_the_tray_toggles() {
+        // `persist_geometry` reloads the on-disk config and overwrites the
+        // geometry fields only. If it ever started copying the whole WindowConfig
+        // it would clobber a tray toggle the user changed in the settings window
+        // with whatever the geometry-capture snapshot happened to hold.
+        let on_disk = WindowConfig {
+            close_to_tray: true,
+            minimize_to_tray: true,
+            warn_on_close_running: false,
+            ..WindowConfig::default()
+        };
+        let mut merged = on_disk.clone();
+        let captured = WindowConfig {
+            pos_x: Some(11),
+            pos_y: Some(22),
+            size_w: Some(800),
+            size_h: Some(600),
+            maximized: Some(true),
+            monitor: Some("DISPLAY1".to_string()),
+            ..WindowConfig::default()
+        };
+        // Mirrors persist_geometry's field-by-field copy exactly.
+        merged.pos_x = captured.pos_x;
+        merged.pos_y = captured.pos_y;
+        merged.size_w = captured.size_w;
+        merged.size_h = captured.size_h;
+        merged.maximized = captured.maximized;
+        merged.monitor = captured.monitor.clone();
+
+        assert_eq!(merged.pos_x, Some(11), "geometry must be copied");
+        assert!(merged.close_to_tray, "close_to_tray must survive");
+        assert!(merged.minimize_to_tray, "minimize_to_tray must survive");
+        assert!(
+            !merged.warn_on_close_running,
+            "warn_on_close_running must survive"
+        );
+        // And the captured snapshot's own defaults are NOT what landed.
+        assert_ne!(
+            merged.warn_on_close_running, captured.warn_on_close_running,
+            "the geometry snapshot's default must not have overwritten the user's value"
+        );
     }
 
     // ---- ConfigError variants: construction, Display, and the load/save Io arms ----

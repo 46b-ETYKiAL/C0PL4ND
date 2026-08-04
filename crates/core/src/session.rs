@@ -216,7 +216,23 @@ impl Session {
 
     /// Spawn an explicit program (used by tests for deterministic behaviour).
     pub fn spawn_program(program: &str, args: &[&str], rows: u16, cols: u16) -> Result<Self> {
-        let pty = PtyProcess::spawn_program(program, args, rows, cols)?;
+        Self::spawn_program_in(program, args, rows, cols, None)
+    }
+
+    /// Like [`Session::spawn_program`] but starts the program in an explicit
+    /// working directory — the named-shell-profile counterpart to
+    /// [`spawn_shell_in`](Self::spawn_shell_in), so reopening or restoring a pane
+    /// under a named profile lands in the pane's own cwd rather than the default
+    /// one. A `cwd` that no longer exists falls back to home inside
+    /// [`PtyProcess::spawn_program_in`] (a stale restored cwd is not an error).
+    pub fn spawn_program_in(
+        program: &str,
+        args: &[&str],
+        rows: u16,
+        cols: u16,
+        cwd: Option<&str>,
+    ) -> Result<Self> {
+        let pty = PtyProcess::spawn_program_in(program, args, rows, cols, cwd)?;
         Self::from_pty(pty, rows, cols)
     }
 

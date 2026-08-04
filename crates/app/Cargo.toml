@@ -192,4 +192,12 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_KeyboardAndMouse", # TrackMouseEvent — WM_NCMOUSELEAVE hover tracking for the Snap-Layouts caption subclass
     "Win32_UI_Shell",             # SetWindowSubclass / DefSubclassProc — the additive win_chrome caption subclass
     "Win32_UI_WindowsAndMessaging",
+    # --- WinRT (not Win32) namespaces for the OSC 9 / OSC 777 desktop toast ---
+    # `crate::notify` builds a ToastGeneric document and hands it to the shell.
+    # These project SAFE Rust (they return windows::core::Result), so they add
+    # no `unsafe` beyond the one Win32 AUMID setter, which uses the
+    # already-enabled Win32_UI_Shell above. Same crate, same pinned 0.62 -- no
+    # new dependency, only additional generated bindings.
+    "Data_Xml_Dom",     # XmlDocument -- parses the toast payload
+    "UI_Notifications", # ToastNotificationManager / ToastNotification
 ] }

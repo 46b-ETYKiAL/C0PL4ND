@@ -53,12 +53,34 @@
     <StandardDirectory Id="ProgramMenuFolder">
       <Directory Id="ApplicationProgramsFolder" Name="C0PL4ND">
         <Component Id="ApplicationShortcut" Guid="*">
+          <!--
+            The AUMID is REQUIRED, not decoration.
+
+            A non-packaged Win32 process may only raise a WinRT toast under an
+            Application User Model ID that resolves to an installed Start-Menu
+            shortcut carrying that same ID in its System.AppUserModel.ID
+            property. With no such property, ToastNotifier.Show() RETURNS
+            SUCCESS and nothing is ever displayed - the failure has no runtime
+            symptom at all. C0PL4ND's OSC 9 / OSC 777 desktop-notification
+            path raises such a toast, so without this line that whole
+            feature is silently inert on a machine installed from this MSI.
+
+            The value MUST equal notify::AUMID in crates/app/src/notify.rs.
+            The pair is pinned in both directions by the notify_tests aumid
+            tests, which parse this file - a hand edit here that disagrees with
+            the constant fails the build rather than shipping a dead toast.
+
+            The shortcut is deliberately NON-advertised (a plain Target=), which
+            is what lets it carry shell properties.
+          -->
           <Shortcut
             Id="ApplicationStartMenuShortcut"
             Name="C0PL4ND"
             Description="C0PL4ND terminal emulator"
             Target="[INSTALLFOLDER]c0pl4nd.exe"
-            WorkingDirectory="INSTALLFOLDER" />
+            WorkingDirectory="INSTALLFOLDER">
+            <ShortcutProperty Key="System.AppUserModel.ID" Value="Itasha.Corp.C0PL4ND" />
+          </Shortcut>
           <RemoveFolder Id="CleanUpShortCut" Directory="ApplicationProgramsFolder" On="uninstall" />
           <RegistryValue
             Root="HKCU"

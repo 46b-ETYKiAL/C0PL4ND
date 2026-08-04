@@ -24,6 +24,18 @@
 
 use c0pl4nd_core::term::{Progress, ProgressState};
 
+/// Pump → attention-flash wiring tests. In a `#[path]`-included file (not this
+/// one's `mod tests`) because they drive the whole `C0pl4ndApp` rather than this
+/// module's pure functions, and because they must live inside `egui_app` to
+/// reach its private `pump_pane_effects` / `terminal_for_test`.
+///
+/// The desktop-TOAST half of the OSC 9 / OSC 777 story lives in the lib-root
+/// [`crate::notify`] module, whose own tests cover the pure decisions and the
+/// installer-AUMID correspondence.
+#[cfg(test)]
+#[path = "taskbar_wiring_tests.rs"]
+mod taskbar_wiring_tests;
+
 /// A platform-independent taskbar progress state — the mapping TARGET of an
 /// `OSC 9 ; 4` [`ProgressState`]. Mirrors the Win32 `TBPFLAG` set 1:1 but is
 /// defined HERE (not re-exported from the `windows` crate, which only compiles

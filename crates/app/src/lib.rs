@@ -39,5 +39,12 @@ pub mod cli_cwd;
 pub mod clipboard_read;
 pub mod egui_app;
 pub mod issue_intake;
+/// Real Windows desktop notifications (WinRT toasts) for OSC 9 / OSC 777, plus
+/// the pure suppression/sanitising/escaping decisions behind them and the
+/// `System.AppUserModel.ID` the installer shortcut must carry. A lib-root
+/// module (not `egui_app::notify`) because `egui_app`'s submodules are private,
+/// which would make this unreachable — and therefore dead — until its call site
+/// in the pump lands; see the module docs for that seam.
+pub mod notify;
 pub mod reporting;
 pub mod user_error;

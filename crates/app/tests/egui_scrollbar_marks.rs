@@ -417,3 +417,101 @@ fn successful_and_codeless_commands_paint_no_failure_mark() {
         "one non-zero `;D` after the same feed must paint exactly one failure tick"
     );
 }
+
+/// The SEARCH-HIT marks — the only kind the bar drew before this change — must
+/// still work, and must be drawn as the FULL-WIDTH kind so they are not confused
+/// with the two new half-width kinds. This is the regression guard on the
+/// pre-existing behaviour the `ScrollMark` refactor passed through.
+#[test]
+fn search_hits_still_paint_full_width_marks() {
+    let app = RefCell::new(C0pl4ndApp::bootstrap());
+    let mut h = harness(&app);
+    ensure_focused_spawned(&mut h, &app);
+    feed_filler(&mut h, &app);
+
+    // A needle on the LIVE screen (fed last, so it is inside the visible window
+    // the search spans are expressed in).
+    {
+        let mut a = app.borrow_mut();
+        a.test_feed_focused(b"UNIQUENEEDLE here\r\n");
+    }
+    h.run();
+
+    let (_, before) = ticks_now(&h, &app);
+    assert!(
+        before.is_empty(),
+        "negative control: the needle alone paints nothing until it is SEARCHED for"
+    );
+
+    // Ctrl+Shift+F opens the find overlay, then type the needle.
+    h.event(egui::Event::Key {
+        key: egui::Key::F,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        },
+    });
+    h.run();
+    for ch in "UNIQUENEEDLE".chars() {
+        h.event(egui::Event::Text(ch.to_string()));
+    }
+    h.run();
+
+    let (track, ticks) = ticks_now(&h, &app);
+    assert!(
+        !ticks.is_empty(),
+        "a find match must paint at least one tick on the bar — the search-hit \
+         marks are the behaviour that already existed and must not have regressed"
+    );
+    for t in &ticks {
+        assert!(
+            t.rect.left() <= track.left() + 0.5 && t.rect.right() >= track.right() - 0.5,
+            "a search hit must span the FULL track width ({:?} vs track {track:?}) — \
+             a half-width hit would be indistinguishable from a prompt or failure \
+             mark",
+            t.rect
+        );
+    }
+}
+
+/// A program that emits OSC 133 in a tight loop must not be able to turn the bar
+/// into thousands of painted rects per frame: the semantic marks are capped at
+/// the most recent [`MAX_TICKS`] of each kind. Without the cap, core's 4096
+/// retained prompt marks would all be drawn, every frame, onto a track a few
+/// hundred points tall.
+#[test]
+fn semantic_marks_are_capped_so_a_mark_flood_cannot_swamp_the_bar() {
+    /// Mirrors `MAX_SEMANTIC_SCROLL_MARKS` in the app (not importable from an
+    /// integration test); the assertions below only require that SOME cap under
+    /// the flood size is in force, so they stay honest if the app's value moves.
+    const MAX_TICKS: usize = 256;
+    const FLOOD: usize = MAX_TICKS + 120;
+
+    let app = RefCell::new(C0pl4ndApp::bootstrap());
+    let mut h = harness(&app);
+    ensure_focused_spawned(&mut h, &app);
+    feed_filler(&mut h, &app);
+
+    // Marks packed one per line — the flood a runaway prompt-integration loop
+    // (or a hostile program) produces.
+    feed_prompt_marks(&mut h, &app, FLOOD, 0);
+
+    let (_, ticks) = ticks_now(&h, &app);
+    assert!(
+        ticks.len() <= MAX_TICKS,
+        "{FLOOD} prompt marks must be capped to at most {MAX_TICKS} painted ticks, \
+         got {} — an uncapped bar pays for every retained mark on every frame",
+        ticks.len()
+    );
+    // ...and the cap must not be a silent "draw nothing": the bar still shows the
+    // most recent marks. A cap of zero would satisfy the bound above.
+    assert!(
+        ticks.len() >= MAX_TICKS / 2,
+        "the cap must still paint a useful number of the most recent marks, got {}",
+        ticks.len()
+    );
+}

@@ -5707,12 +5707,45 @@ fn paint_underline(
             bar(x0, x1, y - thickness);
             bar(x0, x1, y + thickness);
         }
-        // Dot on / dot off at a 2x period.
+        // Dot on / dot off.
+        //
+        // Each dot MUST be wider than TWO PHYSICAL PIXELS, and that is a hard
+        // constraint of the rasteriser, not a taste call. `epaint`'s
+        // `Tessellator::tessellate_rect` re-routes any un-stroked rect whose
+        // WIDTH is `<= 2.0 * feathering` (and `feathering` is exactly one
+        // physical pixel) into `tessellate_line_segment` between the rect's
+        // top-centre and bottom-centre — i.e. it approximates a thin rect as a
+        // VERTICAL hairline. For an underline dot that vertical segment is one
+        // pixel long, so it feathers away to nothing.
+        //
+        // That is precisely what shipped: this arm drew `bar(x, x + thickness)`
+        // every `thickness * 2.0`, and with `thickness = (ch * 0.06).max(1.0 /
+        // ppp)` = 1.02pt at ppp 1.0 it emitted 46 rects ~1.02pt wide that
+        // rasterised to ZERO pixels — the row was byte-identical to a row with
+        // no underline at all, even at a per-channel tolerance of 90/255, while
+        // the same run gave 94px solid and 60px dashed. `ESC[4:4m` was
+        // indistinguishable from `ESC[24m`. `U::Dashed` only ever escaped it
+        // because its dash is `thickness * 4.0` wide.
+        //
+        // Three physical pixels clears the threshold with margin, so the dot
+        // takes the real rect path; its 1px HEIGHT then takes the HORIZONTAL
+        // line-segment path, landing on the same crisp single scanline
+        // `U::Single` does. A 3-on/3-off period stays visibly finer than
+        // `U::Dashed` (4 on, 3 off), so the two styles remain distinct.
+        //
+        // The x edges are deliberately NOT run through `snap_to_physical` here:
+        // `tessellate_rect` already rounds every filled rect to the physical
+        // pixel grid (`round_rects_to_pixels`, on by default), so snapping first
+        // is a measured no-op — with and without it this run renders the same 48
+        // pixels in the same 16 dots. The physical-pixel WIDTH FLOOR is the whole
+        // fix; anything else here would be decoration that reads as load-bearing.
         U::Dotted => {
-            let step = (thickness * 2.0).max(1.0);
+            let px = 1.0 / ppp.max(0.01);
+            let dot = (thickness * 2.0).max(3.0 * px);
+            let step = (thickness * 4.0).max(6.0 * px);
             let mut x = x0;
             while x < x1 {
-                bar(x, (x + thickness).min(x1), y);
+                bar(x, (x + dot).min(x1), y);
                 x += step;
             }
         }

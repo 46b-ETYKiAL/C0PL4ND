@@ -1289,12 +1289,19 @@ impl C0pl4ndApp {
 
     /// Paint the bottom status bar — pane count + a theme-tinted hint. `colors`
     /// carries the theme-derived palette so the bar follows the active theme.
+    ///
+    /// Every accent-tinted item here uses [`ChromeColors::accent_text`], NOT the
+    /// raw `accent`: `accent` is the theme's `selection_background`, a wash
+    /// colour meant to sit behind text, and on the default `void` theme it is
+    /// `#33106b` against this bar's `#202020` panel — **1.11:1**, so the pane
+    /// counter and the toast were painted and unreadable. `accent_text` is the
+    /// same hue clamped to the WCAG AA text floor.
     pub(super) fn status_bar(&self, ui: &mut egui::Ui, colors: ChromeColors) {
         ui.horizontal(|ui| {
             let panes = super::grid::count_panes(&self.grid_tree);
             ui.label(
                 RichText::new(format!("{panes}/{} panes", super::grid::MAX_PANES))
-                    .color(colors.accent),
+                    .color(colors.accent_text),
             );
             ui.separator();
             ui.label(
@@ -1323,7 +1330,7 @@ impl C0pl4ndApp {
                     ui.separator();
                     ui.label(
                         RichText::new(format!("{} {label}", icon::MOUSE_SIMPLE))
-                            .color(colors.accent),
+                            .color(colors.accent_text),
                     )
                     .on_hover_text(
                         "The focused application has enabled mouse reporting \
@@ -1353,7 +1360,15 @@ impl C0pl4ndApp {
             }
             if let Some(toast) = &self.toast {
                 ui.separator();
-                ui.label(RichText::new(toast).color(colors.accent));
+                // TRUNCATE, never run off the window. The welcome toast is longer
+                // than the space left after the four hints, and an untruncated
+                // label is laid out at its full width and simply clipped by the
+                // panel — so it ended mid-word at the window edge with no ellipsis
+                // and no way to tell whether anything was missing. `truncate()`
+                // fits it to the remaining width and marks the cut with an
+                // ellipsis; the full text stays available on hover.
+                ui.add(egui::Label::new(RichText::new(toast).color(colors.accent_text)).truncate())
+                    .on_hover_text(toast);
             }
         });
     }

@@ -111,6 +111,37 @@ pub fn focus_ring_color(colors: ChromeColors) -> Color32 {
 /// The WCAG 2.4.11 non-text contrast floor a focus indicator must clear.
 pub const FOCUS_RING_MIN_CONTRAST: f32 = 3.0;
 
+/// The WCAG 2.2 **1.4.3 AA** contrast floor for normal-size body TEXT.
+///
+/// Distinct from [`FOCUS_RING_MIN_CONTRAST`] on purpose: 3:1 is the *non-text*
+/// floor for indicators and graphical objects (1.4.11), and applying it to text
+/// would sign off on a hint nobody can read.
+pub const TEXT_MIN_CONTRAST: f32 = 4.5;
+
+/// [`ChromeColors::accent`] made legible AS TEXT on `surface`.
+///
+/// `accent` is derived from the theme's `selection_background` — a colour chosen
+/// to sit BEHIND text as a wash, where being close to the background is the
+/// point. Painting it as a foreground has no contrast guarantee whatsoever, and
+/// the shipped `void` theme proves it: its selection colour `#33106b` on the
+/// status bar's `#202020` panel is **1.11:1** against a 4.5:1 floor, which
+/// rendered the pane counter and the welcome toast as near-invisible dark purple
+/// on dark grey.
+///
+/// This is the TEXT analogue of [`focus_ring_color`]: the theme's own hue is
+/// preferred and returned untouched when it already clears the floor, and only a
+/// failing accent is lifted — via the core clamp, which blends toward whichever
+/// monochrome pole has the headroom, so the accent keeps as much chroma as
+/// legibility allows instead of snapping to white.
+pub fn accent_text_color(accent: Color32, surface: Color32) -> Color32 {
+    let (r, g, b) = c0pl4nd_core::theme::enforce_min_contrast(
+        rgb_triple(accent),
+        rgb_triple(surface),
+        TEXT_MIN_CONTRAST,
+    );
+    Color32::from_rgb(r, g, b)
+}
+
 /// Parse a `c0pl4nd_core::Theme` `#rrggbb` field into an egui `Color32`, falling
 /// back to `fallback` when the field is empty or unparseable (e.g. the optional
 /// `selection_background` slot a minimal theme omits).
@@ -277,7 +308,15 @@ pub struct ChromeColors {
     pub muted: Color32,
     /// Live/selected accent (from the theme selection colour; brand green when
     /// the theme omits it). Used for the focused tab, status accent, headings.
+    ///
+    /// This is the raw theme colour and carries NO contrast guarantee — it is
+    /// for FILLS and strokes. Anything that paints it as TEXT on
+    /// [`Self::panel`] must use [`Self::accent_text`] instead.
     pub accent: Color32,
+    /// [`Self::accent`] made legible as TEXT on [`Self::panel`] (WCAG AA
+    /// [`TEXT_MIN_CONTRAST`]). Identical to `accent` for any theme whose
+    /// selection colour already clears the floor.
+    pub accent_text: Color32,
     /// First tone of the two-tone C0PL4ND wordmark ("C0PL"). Derived from the
     /// theme's BRIGHT magenta (echoing the brand purple) and guaranteed both
     /// readable and bright against the titlebar surface, so it tints with the
@@ -313,6 +352,7 @@ impl ChromeColors {
             fg,
             muted: fg.lerp_to_gamma(bg, 0.55),
             accent,
+            accent_text: accent_text_color(accent, panel),
             logo_a,
             logo_b,
         }
@@ -536,6 +576,104 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// THE STATUS-BAR LEGIBILITY GATE. Every colour the status bar paints TEXT
+    /// with must clear the WCAG 2.2 AA 1.4.3 floor against the surface it is
+    /// painted on, for every shipped theme. A failing pair breaks the build.
+    ///
+    /// It regressed exactly the way `bright.black` did, one tier up: the status
+    /// bar draws its pane counter and its toast in `colors.accent`, which is the
+    /// theme's `selection_background` — a colour designed to sit BEHIND text.
+    /// On the default `void` theme that is `#33106b` on the `#202020` panel:
+    /// **1.11:1**, a quarter of the floor. Rendered, the welcome toast and the
+    /// "1/6 panes" counter were dark purple on dark grey — present in the frame,
+    /// invisible to a reader.
+    ///
+    /// Asserted against the real WCAG formula rather than a hardcoded hex, so it
+    /// still means something when a palette is re-tuned, and asserted over the
+    /// WHOLE builtin fleet so a newly-embedded theme cannot slip a 1.11:1 pair
+    /// back in.
+    #[test]
+    fn every_status_bar_text_colour_meets_wcag_aa_on_its_surface() {
+        for (name, colors) in every_builtin_palette() {
+            // (label, text colour, surface) — the status bar paints on `panel`.
+            for (label, text) in [
+                ("accent_text (pane counter, toast)", colors.accent_text),
+                ("fg (the hint labels)", colors.fg),
+            ] {
+                let ratio = contrast_ratio(text, colors.panel);
+                assert!(
+                    ratio >= TEXT_MIN_CONTRAST,
+                    "{name}: status-bar {label} {text:?} on panel {:?} is only \
+                     {ratio:.2}:1 — below the WCAG AA text floor of \
+                     {TEXT_MIN_CONTRAST}:1. Text this close to its background is \
+                     painted but unreadable.",
+                    colors.panel,
+                );
+            }
+        }
+    }
+
+    /// [`accent_text_color`] must be a REAL clamp, not a pass-through: it leaves
+    /// an already-legible accent untouched (so a vivid theme keeps its hue) and
+    /// lifts a failing one until it clears the floor.
+    ///
+    /// Without the first half, "returns white always" would satisfy the gate
+    /// above while destroying every theme's accent; without the second, a
+    /// pass-through would satisfy the first half while fixing nothing.
+    #[test]
+    fn accent_text_color_lifts_only_what_fails_the_floor() {
+        let panel = Color32::from_rgb(0x20, 0x20, 0x20);
+
+        // The real defect: void's selection colour is unreadable as text.
+        let void = Color32::from_rgb(0x33, 0x10, 0x6b);
+        let before = contrast_ratio(void, panel);
+        assert!(
+            before < TEXT_MIN_CONTRAST,
+            "the regression fixture must actually be a failing pair, got \
+             {before:.2}:1"
+        );
+        let lifted = accent_text_color(void, panel);
+        assert_ne!(lifted, void, "a failing accent must be lifted");
+        assert!(
+            contrast_ratio(lifted, panel) >= TEXT_MIN_CONTRAST,
+            "the lift must clear the floor, got {:.2}:1",
+            contrast_ratio(lifted, panel)
+        );
+
+        // An accent that already clears the floor keeps its exact hue.
+        let bright = brand::GREEN;
+        assert!(contrast_ratio(bright, panel) >= TEXT_MIN_CONTRAST);
+        assert_eq!(
+            accent_text_color(bright, panel),
+            bright,
+            "a legible accent must be returned untouched, not washed to a pole"
+        );
+    }
+
+    /// The clamp must be wired into `ChromeColors`, not merely defined. Cutting
+    /// `accent_text: accent_text_color(accent, panel)` back to `accent` leaves
+    /// `every_status_bar_text_colour_meets_wcag_aa_on_its_surface` failing, but
+    /// this names the wire directly.
+    #[test]
+    fn chrome_colors_derives_accent_text_from_the_clamp() {
+        for (name, colors) in every_builtin_palette() {
+            assert_eq!(
+                colors.accent_text,
+                accent_text_color(colors.accent, colors.panel),
+                "{name}: accent_text must be the clamped accent"
+            );
+        }
+        // And on the default theme it must genuinely DIFFER from the raw accent —
+        // otherwise the field could be a rename of `accent` and every assertion
+        // above would still hold.
+        let void = ChromeColors::from_theme(&c0pl4nd_core::Theme::builtin_void());
+        assert_ne!(
+            void.accent_text, void.accent,
+            "void's accent #33106b fails the text floor, so its accent_text must \
+             differ from it"
+        );
     }
 
     #[test]

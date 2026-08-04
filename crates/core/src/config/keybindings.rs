@@ -576,6 +576,79 @@ mod tests {
         assert_eq!(canonical_key_token("Zoom"), "zoom");
     }
 
+    /// The canonical token for each punctuation arm, with every alias that must
+    /// fold onto it — the GLYPH first, because the glyph is the only spelling
+    /// that actually proves the arm is there.
+    const PUNCTUATION_ARMS: [(&str, &[&str]); 6] = [
+        ("period", &[".", "period", "dot"]),
+        ("slash", &["/", "slash"]),
+        ("backslash", &["\\", "backslash"]),
+        ("semicolon", &[";", "semicolon"]),
+        ("quote", &["'", "quote", "apostrophe"]),
+        ("backtick", &["`", "backtick", "grave"]),
+    ];
+
+    #[test]
+    fn punctuation_glyphs_and_their_names_fold_onto_one_token() {
+        // Asserting only the name that already EQUALS its token (`"slash"` ->
+        // `"slash"`) proves nothing: the `_ =>` fallback returns the input
+        // lowercased, so that assertion still holds with the whole arm deleted —
+        // while `Ctrl+/` typed as the glyph would quietly stop matching the
+        // binding spelled `mod+slash`. The glyph and every alias are therefore
+        // asserted together, so no single alias can carry the test on its own.
+        for (canonical, aliases) in PUNCTUATION_ARMS {
+            for alias in aliases {
+                assert_eq!(
+                    canonical_key_token(alias),
+                    canonical,
+                    "{alias:?} must canonicalize to {canonical:?}"
+                );
+                // Canonicalization is case-insensitive (a glyph is unchanged).
+                assert_eq!(
+                    canonical_key_token(&alias.to_ascii_uppercase()),
+                    canonical,
+                    "{alias:?} must canonicalize to {canonical:?} in any case"
+                );
+                // And with the surrounding whitespace a TOML author leaves in.
+                assert_eq!(
+                    canonical_key_token(&format!("  {alias} ")),
+                    canonical,
+                    "{alias:?} must canonicalize to {canonical:?} when padded"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn punctuation_chords_parse_match_and_agree_across_spellings() {
+        // End-to-end for the bindings a user actually writes (`mod+/`, `mod+;`):
+        // the glyph form and the named form must be the SAME chord, or one of
+        // them is a binding that looks right in the file and never fires — and
+        // `validate`'s collision detection would not see them as one chord.
+        for (canonical, aliases) in PUNCTUATION_ARMS {
+            let named = Chord::parse(&format!("mod+{canonical}"))
+                .unwrap_or_else(|| panic!("mod+{canonical} must parse"));
+            assert_eq!(named.key, canonical);
+            assert_eq!(named.canonical(), format!("mod+{canonical}"));
+            assert!(
+                named.matches(true, false, false, canonical),
+                "mod+{canonical} must fire for its own token"
+            );
+            assert!(
+                !named.matches(true, true, false, canonical),
+                "mod+{canonical} must stay distinct from the Shift variant"
+            );
+            for alias in aliases {
+                let chord = Chord::parse(&format!("mod+{alias}"))
+                    .unwrap_or_else(|| panic!("mod+{alias} must parse"));
+                assert_eq!(
+                    chord, named,
+                    "mod+{alias} and mod+{canonical} must be one binding"
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_plus_key_collapses_equals_and_folds_shift() {
         // `+` is Shift+`=` on most layouts, so both spellings and both shift

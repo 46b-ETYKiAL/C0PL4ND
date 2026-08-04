@@ -2200,6 +2200,55 @@ mod tests {
     }
 
     #[test]
+    fn register_modifiers_unions_bits_and_never_toggles_one_off() {
+        // `register_modifiers` is a UNION (`|`), not a toggle (`^`). The two are
+        // indistinguishable while the input never already carries NOREPEAT — and
+        // `HotkeySpec`'s fields are public, so a caller CAN hand one back in
+        // (re-registering an already-prepared mask is the obvious way to do it).
+        // With a toggle, that round-trip silently CLEARS `MOD_NOREPEAT` and the
+        // hotkey machine-guns at the key-repeat rate instead of toggling once —
+        // exactly the failure the flag exists to prevent. So assert the union
+        // property over EVERY subset of the modifier bits, NOREPEAT included:
+        // the result is always a superset of the input, and always has NOREPEAT.
+        const BITS: [u32; 5] = [
+            MOD_ALT_BIT,
+            MOD_CONTROL_BIT,
+            MOD_SHIFT_BIT,
+            MOD_WIN_BIT,
+            MOD_NOREPEAT_BIT,
+        ];
+        for mask in 0u32..(1 << BITS.len()) {
+            let modifiers = BITS
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| (mask >> i) & 1 == 1)
+                .fold(0u32, |acc, (_, bit)| acc | bit);
+            let spec = HotkeySpec {
+                modifiers,
+                vk: VK_GRAVE,
+            };
+            let registered = spec.register_modifiers();
+            assert_eq!(
+                registered & modifiers,
+                modifiers,
+                "register_modifiers dropped a bit it was given: \
+                 {modifiers:#06x} -> {registered:#06x}"
+            );
+            assert_eq!(
+                registered & MOD_NOREPEAT_BIT,
+                MOD_NOREPEAT_BIT,
+                "MOD_NOREPEAT must always be set, even when the input already \
+                 carries it: {modifiers:#06x} -> {registered:#06x}"
+            );
+            assert_eq!(
+                registered,
+                modifiers | MOD_NOREPEAT_BIT,
+                "the mask is exactly the user's bits plus NOREPEAT"
+            );
+        }
+    }
+
+    #[test]
     fn quake_parsed_hotkey_matches_the_free_parser_and_the_default_is_usable() {
         // The Settings UI calls `parsed_hotkey()`; the Win32 path calls
         // `parse_hotkey()`. They must be the same answer, or the UI would tell the

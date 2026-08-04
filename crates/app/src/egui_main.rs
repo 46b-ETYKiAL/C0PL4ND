@@ -57,6 +57,16 @@ mod tray;
 #[path = "egui_app/quake.rs"]
 mod quake;
 
+// Single-instance guard + argv forwarding: a SECOND `c0pl4nd.exe` hands its
+// `--cwd` to the running instance (which opens a tab and raises itself) instead
+// of starting a rival window. A BINARY-local module for the same reason as
+// `tray`/`quake` — it needs the real eframe HWND and the running winit message
+// loop (it reads `WM_COPYDATA` through its own `SetWindowSubclass` entry,
+// chaining rather than competing with `win_chrome`'s and `quake`'s). Its raw
+// Win32 FFI is quarantined behind its own `#![allow(unsafe_code)]`.
+#[path = "egui_app/single_instance.rs"]
+mod single_instance;
+
 // The egui shell lives in this crate's lib target so `tests/` links THIS
 // compilation instead of `#[path]`-including a private second copy — which made
 // llvm-cov attribute the kittest suites' coverage to an object the report never
@@ -172,6 +182,20 @@ fn main() -> eframe::Result<()> {
             panic_hook::show_startup_error("C0PL4ND couldn't start", &e.user_message());
             std::process::exit(2);
         }
+    }
+
+    // SINGLE INSTANCE. Deliberately placed AFTER the `--cwd` validation above:
+    // a malformed directory must still be refused with its clear message and
+    // exit 2, whether the user is launching the first window or the tenth — if
+    // this ran first, a bad path would be silently forwarded and swallowed.
+    //
+    // From here on a second launch is a TAB in the running window, not a rival
+    // process: without this, every "Open C0PL4ND here" spawns a whole new app.
+    // Any failure inside returns `Primary`, so a broken guard degrades to the
+    // previous behaviour (a second window) rather than to a launch that opens
+    // nothing.
+    if single_instance::acquire_or_forward(&args) == single_instance::Role::Secondary {
+        return Ok(());
     }
 
     // The window position + size are persisted natively by eframe via the
@@ -354,6 +378,24 @@ fn main() -> eframe::Result<()> {
                 }
             }
             quake::init(&cc.egui_ctx, &launch_quake_config());
+            // Single-instance: mark THIS window as the primary and start
+            // accepting forwarded launches on it. Primed here, with the tray and
+            // quake, for the same reasons — the real HWND must exist and we must
+            // be on the event-loop thread, because the forward arrives as a
+            // `WM_COPYDATA` dispatched to that window's message queue. This is
+            // the live call site the whole forwarding path depends on: without
+            // it the mutex would still be claimed but no window would carry the
+            // marker property, so every later launch would fall back to opening
+            // its own window.
+            #[cfg(windows)]
+            {
+                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                if let Ok(handle) = cc.window_handle() {
+                    if let RawWindowHandle::Win32(w) = handle.as_raw() {
+                        single_instance::install(&cc.egui_ctx, w.hwnd.get());
+                    }
+                }
+            }
             // On-launch update check. Drives the SHARED in-app updater that powers
             // the persistent, dismissible NOTIFICATION BANNER (and the Settings →
             // Updates page): a found update surfaces a one-click "Update now" strip

@@ -144,6 +144,7 @@ const KEYBINDING_SEARCH_LABELS: &[&str] = &[
     "copy everything",
     "scroll to top",
     "scroll to bottom",
+    "reopen closed pane",
 ];
 
 /// The release channels the Updates section offers. Mirrors the channels the

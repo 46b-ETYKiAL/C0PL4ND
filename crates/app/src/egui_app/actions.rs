@@ -140,6 +140,8 @@ define_actions! {
     ScrollToTop => "scroll_to_top",
     /// Scroll the focused pane back to live output.
     ScrollToBottom => "scroll_to_bottom",
+    /// Re-open the most recently closed pane, in the directory it was in.
+    ReopenClosedTab => "reopen_closed_tab",
 }
 
 impl Action {
@@ -314,6 +316,10 @@ impl super::C0pl4ndApp {
     pub(crate) fn dispatch_action(&mut self, action: Action, ctx: &egui::Context) {
         match action {
             Action::NewTab => self.new_terminal(),
+            // Delegates rather than inlining the pop: the undo stack is only
+            // consumed when a pane is really created (the pane cap can refuse),
+            // and that peek-then-pop belongs with the state it guards.
+            Action::ReopenClosedTab => self.reopen_closed_tab(),
             Action::ClosePane => self.close_pane(self.focused_pane),
             Action::FocusNextPane => self.focus_next_pane(),
             Action::SplitRight => self.split(egui_tiles::LinearDir::Horizontal),
@@ -727,6 +733,319 @@ mod tests {
             "chords resume once the composition ends"
         );
         assert!(app.settings_open, "the action ran after the composition");
+    }
+
+    // -----------------------------------------------------------------------
+    // Reopen-closed-pane
+    // -----------------------------------------------------------------------
+
+    /// Count the panes currently in the tree — the observable "did a pane come
+    /// back" signal.
+    fn pane_count(app: &super::super::C0pl4ndApp) -> usize {
+        app.pane_titles().len()
+    }
+
+    #[test]
+    fn closing_a_pane_records_it_on_the_reopen_stack() {
+        let mut app = super::super::C0pl4ndApp::bootstrap();
+        app.new_terminal();
+        assert_eq!(pane_count(&app), 2, "precondition: a second pane exists");
+        assert!(
+            app.closed_tab_cwds.is_empty(),
+            "nothing has been closed yet"
+        );
+
+        app.close_pane(app.focused_pane);
+
+        assert_eq!(
+            app.closed_tab_cwds.len(),
+            1,
+            "the closed pane must be recorded so it can be reopened"
+        );
+    }
+
+    #[test]
+    fn a_refused_close_records_nothing() {
+        // `close_pane` keeps the last pane alive. Recording BEFORE that guard
+        // would push an entry for a pane that never closed, so the next reopen
+        // would open a spurious tab the user never asked for.
+        let mut app = super::super::C0pl4ndApp::bootstrap();
+        assert_eq!(pane_count(&app), 1, "precondition: one pane");
+
+        app.close_pane(app.focused_pane);
+
+        assert_eq!(pane_count(&app), 1, "the last pane is never closed");
+        assert!(
+            app.closed_tab_cwds.is_empty(),
+            "a close that did not happen must not be recorded: {:?}",
+            app.closed_tab_cwds
+        );
+    }
+
+    #[test]
+    fn every_close_surface_records_on_the_reopen_stack() {
+        // The load-bearing claim of putting the capture in `close_pane` rather
+        // than in the `ClosePane` action: the tab ×, the context menu, and the
+        // chord are THREE different entry points, and a capture in the action
+        // would silently forget every pane closed with the mouse.
+        let ctx = egui::Context::default();
+        let mut app = super::super::C0pl4ndApp::bootstrap();
+
+        // (a) the keybinding / palette action.
+        app.new_terminal();
+        app.dispatch_action(Action::ClosePane, &ctx);
+        assert_eq!(app.closed_tab_cwds.len(), 1, "the action path records");
+
+        // (b) the right-click context menu (the tab × and the egui_tiles close
+        //     button both land in `close_pane` the same way this does).
+        app.new_terminal();
+        let pid = app.focused_pane;
+        app.apply_context_menu_action(super::super::ContextMenuAction::ClosePane(pid));
+        assert_eq!(
+            app.closed_tab_cwds.len(),
+            2,
+            "the context-menu path records too"
+        );
+
+        // (c) `close_pane` itself — the funnel every surface reaches.
+        app.new_terminal();
+        app.close_pane(app.focused_pane);
+        assert_eq!(app.closed_tab_cwds.len(), 3, "the direct path records");
+    }
+
+    #[test]
+    fn reopen_with_an_empty_stack_opens_nothing() {
+        // The difference between "reopen" and "new tab". A dispatch that just
+        // called `new_terminal()` would pass every other test in this file while
+        // conjuring a pane out of an empty history.
+        let ctx = egui::Context::default();
+        let mut app = super::super::C0pl4ndApp::bootstrap();
+        let before = pane_count(&app);
+
+        app.dispatch_action(Action::ReopenClosedTab, &ctx);
+
+        assert_eq!(
+            pane_count(&app),
+            before,
+            "reopen with nothing closed must not open a pane"
+        );
+    }
+
+    #[test]
+    fn reopen_brings_the_pane_back_and_consumes_the_entry() {
+        let ctx = egui::Context::default();
+        let mut app = super::super::C0pl4ndApp::bootstrap();
+        app.new_terminal();
+        app.close_pane(app.focused_pane);
+        assert_eq!(pane_count(&app), 1, "precondition: back to one pane");
+        assert_eq!(app.closed_tab_cwds.len(), 1, "precondition: one entry");
+
+        app.dispatch_action(Action::ReopenClosedTab, &ctx);
+
+        assert_eq!(pane_count(&app), 2, "the closed pane came back");
+        assert!(
+            app.closed_tab_cwds.is_empty(),
+            "the reopened entry is consumed, so a second reopen is not a repeat"
+        );
+    }
+
+    #[test]
+    fn reopen_spawns_the_shell_in_the_recorded_directory() {
+        // The WIRING test. A reopen that produced a pane in the DEFAULT directory
+        // would satisfy every pane-count assertion above while losing the one
+        // thing that makes the feature useful. `last_spawn_cwd` is written at the
+        // branch that actually hands the directory to the PTY, so this asserts
+        // the value travelled the whole way rather than being stored somewhere
+        // nothing reads.
+        let ctx = egui::Context::default();
+        let mut app = super::super::C0pl4ndApp::bootstrap();
+        let dir = std::env::temp_dir();
+        let want = dir.to_string_lossy().to_string();
+        app.closed_tab_cwds.push(Some(want.clone()));
+
+        app.dispatch_action(Action::ReopenClosedTab, &ctx);
+
+        assert_eq!(
+            app.last_spawn_cwd.as_deref(),
+            Some(want.as_str()),
+            "the recorded cwd must reach the spawn call, not just the stack"
+        );
+    }
+
+    #[test]
+    fn reopen_of_a_pane_with_no_known_cwd_still_returns_the_pane() {
+        // A shell with no OSC 7 (cmd.exe) reports no cwd. Recording only panes
+        // whose directory we happen to know would make the chord silently dead
+        // for those users, so `None` is recorded and the pane returns in the
+        // default directory.
+        let ctx = egui::Context::default();
+        let mut app = super::super::C0pl4ndApp::bootstrap();
+        app.closed_tab_cwds.push(None);
+
+        app.dispatch_action(Action::ReopenClosedTab, &ctx);
+
+        assert_eq!(pane_count(&app), 2, "the pane returns even with no cwd");
+        assert_eq!(
+            app.last_spawn_cwd, None,
+            "with no recorded cwd the shell uses its default directory"
+        );
+        assert!(app.closed_tab_cwds.is_empty(), "the entry is consumed");
+    }
+
+    #[test]
+    fn reopen_at_the_pane_cap_keeps_the_entry_for_later() {
+        // The reason the stack is PEEKED and only popped on success. At the cap
+        // the reopen is refused with a toast; a pop-first implementation would
+        // silently eat the user's undo step for a pane they never got back.
+        let ctx = egui::Context::default();
+        let mut app = super::super::C0pl4ndApp::bootstrap();
+        while pane_count(&app) < grid::MAX_PANES {
+            app.new_terminal();
+        }
+        assert_eq!(
+            pane_count(&app),
+            grid::MAX_PANES,
+            "precondition: at the pane cap"
+        );
+        app.closed_tab_cwds.push(Some("somewhere".to_string()));
+
+        app.dispatch_action(Action::ReopenClosedTab, &ctx);
+
+        assert_eq!(
+            pane_count(&app),
+            grid::MAX_PANES,
+            "the cap still refuses the pane"
+        );
+        assert_eq!(
+            app.closed_tab_cwds.len(),
+            1,
+            "a refused reopen must NOT consume the undo entry"
+        );
+    }
+
+    #[test]
+    fn the_reopen_stack_is_bounded() {
+        // An unbounded undo stack is a slow leak on a long session: every closed
+        // pane's path string would be retained for the life of the process.
+        let mut app = super::super::C0pl4ndApp::bootstrap();
+        for i in 0..(super::super::MAX_CLOSED_TAB_HISTORY + 5) {
+            app.push_closed_tab_cwd(Some(format!("dir-{i}")));
+        }
+
+        assert_eq!(
+            app.closed_tab_cwds.len(),
+            super::super::MAX_CLOSED_TAB_HISTORY,
+            "the stack is capped"
+        );
+        // The OLDEST entries are the ones dropped — the most recent close must
+        // still be the next thing a reopen returns.
+        assert_eq!(
+            app.closed_tab_cwds.last().and_then(Option::as_deref),
+            Some(format!("dir-{}", super::super::MAX_CLOSED_TAB_HISTORY + 4).as_str()),
+            "the newest close stays on top"
+        );
+        assert_eq!(
+            app.closed_tab_cwds.first().and_then(Option::as_deref),
+            Some("dir-5"),
+            "the oldest closes are the ones evicted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Forwarded launches (the single-instance receiving end)
+    // -----------------------------------------------------------------------
+
+    /// The forwarded-launch queue is PROCESS-wide (its producer is a bare Win32
+    /// window procedure that cannot capture state), so tests that touch it must
+    /// not run concurrently with each other or they would drain each other's
+    /// entries. Same discipline as `taskbar`'s `SERIAL` / `cli_cwd`'s store lock.
+    static FORWARD_QUEUE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn forward_queue_guard() -> std::sync::MutexGuard<'static, ()> {
+        // A poisoned lock just means an earlier test panicked; the queue is
+        // drained below regardless, so recovering is correct.
+        let g = FORWARD_QUEUE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = super::super::take_forwarded_launches(); // start from empty
+        g
+    }
+
+    #[test]
+    fn a_forwarded_launch_opens_a_pane_in_the_requested_directory() {
+        // The receiving half of single-instance forwarding: a second
+        // `c0pl4nd.exe --cwd <dir>` must become a PANE here, in that directory.
+        let _guard = forward_queue_guard();
+        let ctx = egui::Context::default();
+        let mut app = super::super::C0pl4ndApp::bootstrap();
+        let want = std::env::temp_dir().to_string_lossy().to_string();
+        let before = pane_count(&app);
+
+        super::super::push_forwarded_launch(Some(want.clone()));
+        app.drain_forwarded_launches(&ctx);
+
+        assert_eq!(pane_count(&app), before + 1, "the forwarded launch opened a pane");
+        assert_eq!(
+            app.last_spawn_cwd.as_deref(),
+            Some(want.as_str()),
+            "the forwarded directory must reach the spawn, not just the queue"
+        );
+    }
+
+    #[test]
+    fn a_forwarded_plain_launch_opens_a_default_pane() {
+        let _guard = forward_queue_guard();
+        let ctx = egui::Context::default();
+        let mut app = super::super::C0pl4ndApp::bootstrap();
+        let before = pane_count(&app);
+
+        super::super::push_forwarded_launch(None);
+        app.drain_forwarded_launches(&ctx);
+
+        assert_eq!(pane_count(&app), before + 1, "a plain forward still opens a pane");
+        assert_eq!(
+            app.last_spawn_cwd, None,
+            "no directory was requested, so the shell default is used"
+        );
+    }
+
+    #[test]
+    fn draining_consumes_the_queue_so_a_pane_is_not_reopened_every_frame() {
+        // `drain_forwarded_launches` runs on EVERY frame. A drain that did not
+        // consume would spawn a new shell ~60 times a second — the worst
+        // possible failure mode for this feature.
+        let _guard = forward_queue_guard();
+        let ctx = egui::Context::default();
+        let mut app = super::super::C0pl4ndApp::bootstrap();
+
+        super::super::push_forwarded_launch(None);
+        app.drain_forwarded_launches(&ctx);
+        let after_first = pane_count(&app);
+
+        app.drain_forwarded_launches(&ctx);
+        app.drain_forwarded_launches(&ctx);
+
+        assert_eq!(
+            pane_count(&app),
+            after_first,
+            "later frames must not re-open the same forwarded launch"
+        );
+    }
+
+    #[test]
+    fn the_forwarded_queue_is_bounded() {
+        // A script running the exe in a loop while the app is busy must not grow
+        // this without limit.
+        let _guard = forward_queue_guard();
+        for i in 0..(super::super::MAX_PENDING_FORWARDED_LAUNCHES + 20) {
+            super::super::push_forwarded_launch(Some(format!("dir-{i}")));
+        }
+
+        let drained = super::super::take_forwarded_launches();
+
+        assert_eq!(
+            drained.len(),
+            super::super::MAX_PENDING_FORWARDED_LAUNCHES,
+            "the forwarded-launch queue is capped"
+        );
     }
 
     #[test]

@@ -123,7 +123,7 @@ pub struct C0pl4ndApp {
     /// would reflow cmd's grid and snap its cursor back to (0,0), so typing
     /// overwrites the banner. Instead [`render_pane_body`] spawns each pending
     /// pane at the MEASURED `(cols, rows)` on the first frame its rect is known —
-    /// exactly how a manually-opened terminal (`spawn_term`) already behaves —
+    /// exactly how a manually-opened terminal (`spawn_term_in`) already behaves —
     /// after which the debounced resize is a no-op and the cursor stays put.
     pub(crate) pending_spawn: HashSet<PaneId>,
     /// Working directories captured from a previous run's persisted layout
@@ -133,6 +133,29 @@ pub struct C0pl4ndApp {
     /// on a fresh launch and after every entry is consumed — so a pane the user
     /// later splits never inherits a stale restored cwd.
     pub(crate) restored_cwds: HashMap<PaneId, String>,
+    /// The working directories of recently CLOSED panes, most-recent LAST — the
+    /// undo stack behind [`C0pl4ndApp::reopen_closed_tab`].
+    ///
+    /// Each entry is the pane's OSC-7-reported cwd at the moment it was closed,
+    /// or `None` for a pane whose shell never reported one (a failed spawn, or a
+    /// shell with no OSC 7 integration). `None` is DELIBERATELY recorded rather
+    /// than dropped: the user closed a pane and asked for it back, so the pane
+    /// must return either way — we simply cannot say where it was, and it opens
+    /// in the default dir. Recording only the panes we happen to know the cwd of
+    /// would make the chord silently do nothing on `cmd.exe`.
+    ///
+    /// Captured in [`C0pl4ndApp::close_pane`] — the ONE function every close path
+    /// (tab ×, egui_tiles close button, context menu, the `close_tab` chord)
+    /// routes through — so no close path can bypass it. Bounded to
+    /// [`MAX_CLOSED_TAB_HISTORY`]; the oldest entry is dropped past the cap so a
+    /// long session cannot grow this without limit.
+    pub(crate) closed_tab_cwds: Vec<Option<String>>,
+    /// The directory the most recent pane spawn was asked to start the shell in,
+    /// or `None` when it was asked for the shell's default. Written by
+    /// [`C0pl4ndApp::spawn_term_in`] at the branch that actually passes the
+    /// directory to the PTY. An observation field in the same family as
+    /// [`last_window_cmd`](Self::last_window_cmd).
+    pub(crate) last_spawn_cwd: Option<String>,
     /// Monotonic pane-id allocator.
     pub(crate) pane_alloc: PaneIdAllocator,
     /// The currently-focused pane (drives tab highlight + input routing).
@@ -431,6 +454,52 @@ pub struct C0pl4ndApp {
 
 /// The PTY grid size used to spawn a pane before its real pixel rect is known.
 /// The first `resize_to_px` corrects it to fit the allocated rect.
+/// Launches that a SECOND `c0pl4nd.exe` handed to this already-running instance
+/// instead of opening a rival window (see the binary-local `single_instance`
+/// module). Each entry is that launch's `--cwd`, or `None` for a plain launch.
+///
+/// A process-wide queue rather than a field on [`C0pl4ndApp`] because the
+/// producer is a bare Win32 window procedure: it is an `extern "system"` fn that
+/// cannot capture, runs on the event-loop thread the instant the message is
+/// dispatched, and has no `&mut App` to write into. `frame_tick` drains it.
+///
+/// Bounded at [`MAX_PENDING_FORWARDED_LAUNCHES`]: a script hammering the exe
+/// while the app is busy must not grow this without limit, and opening more
+/// panes than the grid can hold is pointless anyway.
+static FORWARDED_LAUNCHES: std::sync::Mutex<Vec<Option<String>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The cap on [`FORWARDED_LAUNCHES`]. Comfortably above the 6-pane grid cap, so
+/// a realistic burst is never dropped, while still bounded.
+const MAX_PENDING_FORWARDED_LAUNCHES: usize = 32;
+
+/// Hand a forwarded launch to the running instance. Called from the
+/// single-instance window procedure; the next frame opens a pane for it.
+///
+/// Never panics and never blocks meaningfully: a poisoned lock is ignored (the
+/// forwarded launch is dropped rather than taking down the OS callback that a
+/// second process is synchronously waiting on).
+pub fn push_forwarded_launch(cwd: Option<String>) {
+    if let Ok(mut q) = FORWARDED_LAUNCHES.lock() {
+        if q.len() < MAX_PENDING_FORWARDED_LAUNCHES {
+            q.push(cwd);
+        }
+    }
+}
+
+/// Drain the forwarded launches queued since the last call.
+pub fn take_forwarded_launches() -> Vec<Option<String>> {
+    FORWARDED_LAUNCHES
+        .lock()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default()
+}
+
+/// How many closed panes [`C0pl4ndApp::closed_tab_cwds`] remembers. Deep enough
+/// that "I closed the wrong one" is always recoverable several steps back,
+/// shallow enough that a day-long session cannot grow the stack without bound.
+const MAX_CLOSED_TAB_HISTORY: usize = 16;
+
 const SPAWN_COLS: u16 = 80;
 /// See [`SPAWN_COLS`].
 const SPAWN_ROWS: u16 = 24;
@@ -686,6 +755,8 @@ impl C0pl4ndApp {
             terms,
             pending_spawn,
             restored_cwds: HashMap::new(),
+            closed_tab_cwds: Vec::new(),
+            last_spawn_cwd: None,
             pane_alloc,
             focused_pane,
             pinned: HashSet::new(),
@@ -813,23 +884,100 @@ impl C0pl4ndApp {
         }
     }
 
-    fn spawn_term(&mut self, pid: PaneId) {
+    /// Spawn a fresh live terminal for `pid`, starting the shell in `cwd` when
+    /// one is given (`None` = the shell's own default directory, which is what
+    /// every path except reopen-closed-pane wants).
+    ///
+    /// Deliberately ONE function with an `Option` rather than a plain
+    /// `spawn_term` plus an `_in` variant: the wrapper had exactly zero callers
+    /// once `split_in` landed, and a dead pass-through is how a second spawn path
+    /// starts drifting from the first.
+    ///
+    /// **The cwd applies to the DEFAULT shell only.** When the user has switched
+    /// to a NAMED profile from the ▾ menu, the profile's program wins and the cwd
+    /// is not applied: `PaneTerm` exposes `spawn_program` (no directory) but no
+    /// `spawn_program_in`, so honouring both would mean either launching the
+    /// WRONG shell in the right directory — a much worse failure than the right
+    /// shell in the default directory — or widening `pane_term.rs`, which is
+    /// outside this change's ownership. The restore-from-layout path has exactly
+    /// the same limitation today (it always spawns the default shell), so this
+    /// adds no new inconsistency.
+    fn spawn_term_in(&mut self, pid: PaneId, cwd: Option<&str>) {
         let theme = self.theme.clone();
+        let term_name = self.config.term.clone();
         let profile = self.shell_profiles.get(self.active_shell);
-        let term = match profile.and_then(|p| p.program.clone()) {
+        let program = profile.and_then(|p| p.program.clone());
+        let args: Vec<String> = profile.map(|p| p.args.clone()).unwrap_or_default();
+        // Record the directory the shell was ACTUALLY asked to start in, at the
+        // exact branch that asks for it. Mirrors `last_window_cmd`: it makes an
+        // otherwise-invisible spawn argument observable, so the reopen wiring
+        // test asserts the cwd reached `spawn_in_with_term` rather than merely
+        // that a pane appeared (which a pane opened in the wrong directory would
+        // also satisfy).
+        self.last_spawn_cwd = None;
+        let term = match program {
             Some(program) => {
-                let args: Vec<String> = profile.map(|p| p.args.clone()).unwrap_or_default();
                 let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
                 PaneTerm::spawn_program(theme, &program, &arg_refs, SPAWN_COLS, SPAWN_ROWS)
             }
-            None => PaneTerm::spawn_with_term(
-                theme,
-                SPAWN_COLS,
-                SPAWN_ROWS,
-                Some(self.config.term.as_str()),
-            ),
+            None => match cwd {
+                Some(dir) => {
+                    self.last_spawn_cwd = Some(dir.to_string());
+                    PaneTerm::spawn_in_with_term(
+                        theme,
+                        SPAWN_COLS,
+                        SPAWN_ROWS,
+                        Some(term_name.as_str()),
+                        Some(dir),
+                    )
+                }
+                None => PaneTerm::spawn_with_term(
+                    theme,
+                    SPAWN_COLS,
+                    SPAWN_ROWS,
+                    Some(term_name.as_str()),
+                ),
+            },
         };
         self.terms.insert(pid, term);
+    }
+
+    /// Open one pane per launch that a second process forwarded to us, each in
+    /// the directory that launch asked for (`None` = the shell default).
+    ///
+    /// Reuses the ordinary new-pane path, so a forwarded launch is subject to
+    /// exactly the same pane cap and toast as pressing "+" — a script running
+    /// the exe in a loop can never grow the grid past its limit.
+    pub(crate) fn drain_forwarded_launches(&mut self, ctx: &egui::Context) {
+        for cwd in take_forwarded_launches() {
+            self.new_terminal_in(cwd.as_deref());
+            ctx.request_repaint();
+        }
+    }
+
+    /// Remember a closed pane's cwd on the reopen stack, dropping the oldest
+    /// entry past [`MAX_CLOSED_TAB_HISTORY`].
+    fn push_closed_tab_cwd(&mut self, cwd: Option<String>) {
+        self.closed_tab_cwds.push(cwd);
+        if self.closed_tab_cwds.len() > MAX_CLOSED_TAB_HISTORY {
+            self.closed_tab_cwds.remove(0);
+        }
+    }
+
+    /// Re-open the most recently closed pane, in the directory it was closed in.
+    /// A no-op with an empty stack.
+    ///
+    /// The stack entry is PEEKED and only popped once the pane actually exists:
+    /// at the 6-pane cap `new_terminal_in` refuses (with a toast), and popping
+    /// regardless would silently consume the user's undo step for a pane they
+    /// never got back.
+    pub(crate) fn reopen_closed_tab(&mut self) {
+        let Some(cwd) = self.closed_tab_cwds.last().cloned() else {
+            return;
+        };
+        if self.new_terminal_in(cwd.as_deref()) {
+            self.closed_tab_cwds.pop();
+        }
     }
 
     // ---- public observation surface (production accessors, NOT test-only) ----
@@ -1048,19 +1196,29 @@ impl C0pl4ndApp {
     /// Split the focused pane, allocating a fresh placeholder pane. Refused (with
     /// a toast) at the 6-pane cap.
     fn split(&mut self, dir: egui_tiles::LinearDir) {
+        self.split_in(dir, None);
+    }
+
+    /// [`split`](Self::split), but starting the new pane's shell in `cwd`.
+    /// Returns whether a pane was actually created — `false` at the pane cap or
+    /// when the tree refuses the split. The reopen path needs that answer so it
+    /// does not consume an undo step for a pane it never got.
+    fn split_in(&mut self, dir: egui_tiles::LinearDir, cwd: Option<&str>) -> bool {
         if count_panes(&self.grid_tree) >= grid::MAX_PANES {
             self.toast = Some(format!(
                 "You've reached the maximum of {} panes. Close one to open another.",
                 grid::MAX_PANES
             ));
-            return;
+            return false;
         }
         let new_pane = self.pane_alloc.alloc();
         if grid::split_focused(&mut self.grid_tree, self.focused_pane, new_pane, dir) {
-            self.spawn_term(new_pane);
+            self.spawn_term_in(new_pane, cwd);
             self.focused_pane = new_pane;
             self.toast = None;
+            return true;
         }
+        false
     }
 
     /// Open a new terminal (the single "+" button). Splits the focused pane
@@ -1072,13 +1230,19 @@ impl C0pl4ndApp {
     /// (the same path the "+" button triggers) — the blank-pane-on-split
     /// regression test exercises this.
     pub fn new_terminal(&mut self) {
+        self.new_terminal_in(None);
+    }
+
+    /// [`new_terminal`](Self::new_terminal), but starting the new pane's shell in
+    /// `cwd`. Returns whether a pane was created (see [`split_in`](Self::split_in)).
+    fn new_terminal_in(&mut self, cwd: Option<&str>) -> bool {
         let (w, h) = self.last_focused_size.unwrap_or((16.0, 9.0));
         let dir = if w >= h {
             egui_tiles::LinearDir::Horizontal // wide → side-by-side
         } else {
             egui_tiles::LinearDir::Vertical // tall → stacked
         };
-        self.split(dir);
+        self.split_in(dir, cwd)
     }
 
     /// Make shell profile `idx` active and open a new terminal running it (the
@@ -2815,6 +2979,14 @@ impl C0pl4ndApp {
             self.grid_tree.root.unwrap_or(tile),
             &egui_tiles::SimplificationOptions::default(),
         );
+        // Record where this pane was BEFORE its terminal is dropped — after this
+        // line the `PaneTerm` (and with it the OSC 7 cwd) is gone for good. This
+        // sits in `close_pane` rather than in the `close_tab` action precisely
+        // because the action is only ONE of four close paths: the tab-bar ×, the
+        // egui_tiles close button, and the right-click Close Pane item all reach
+        // the pane's end here and nowhere else, so capturing at the action would
+        // silently forget every pane closed by mouse.
+        self.push_closed_tab_cwd(self.terms.get(&pid).and_then(PaneTerm::cwd));
         self.terms.remove(&pid);
         self.pinned.remove(&pid);
         // A selection holds grid coordinates of a now-removed pane; drop it so it
@@ -4003,6 +4175,12 @@ impl C0pl4ndApp {
         // theme or motion setting takes effect on THIS frame rather than the
         // next. Throttled inside the watcher to one filesystem stat per
         // `config_watch::POLL_INTERVAL`.
+        // A SECOND `c0pl4nd.exe` launch (another "Open C0PL4ND here", or just
+        // running the exe again) is forwarded to THIS instance rather than
+        // opening a rival window. Its pane is opened here, on the UI thread —
+        // the window procedure that received it only queues, because it runs
+        // inside a synchronous `SendMessage` the other process is blocked on.
+        self.drain_forwarded_launches(ctx);
         self.config_hot_reload_tick(ctx);
         // Follow-OS dark/light (SCR1B3 parity): when enabled, track the OS
         // appearance and swap between the default dark/light themes to match.

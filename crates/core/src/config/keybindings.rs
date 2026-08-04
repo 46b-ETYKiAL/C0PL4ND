@@ -294,6 +294,8 @@ pub struct Keybindings {
     pub scroll_to_top: String,
     /// Scroll the focused pane back to live output.
     pub scroll_to_bottom: String,
+    /// Re-open the most recently closed pane, in the directory it was in.
+    pub reopen_closed_tab: String,
 }
 
 impl Default for Keybindings {
@@ -324,13 +326,19 @@ impl Default for Keybindings {
             copy_all: "mod+shift+a".into(),
             scroll_to_top: "mod+shift+home".into(),
             scroll_to_bottom: "mod+shift+end".into(),
+            // NOT `mod+shift+t` (the browser/VS Code convention for "reopen
+            // closed"): that chord is already `new_tab` here, matching Windows
+            // Terminal, and moving it would break the muscle memory of every
+            // existing user. `u` is free in the whole shipped keymap and reads
+            // as "undo close".
+            reopen_closed_tab: "mod+shift+u".into(),
         }
     }
 }
 
 /// The number of bindings in the schema — the length both [`Keybindings::entries`]
 /// and [`Keybindings::entries_mut`] return.
-pub const BINDING_COUNT: usize = 22;
+pub const BINDING_COUNT: usize = 23;
 
 impl Keybindings {
     /// Every (action-name, combo) pair, in a stable declaration order. The
@@ -362,6 +370,7 @@ impl Keybindings {
             ("copy_all", &self.copy_all),
             ("scroll_to_top", &self.scroll_to_top),
             ("scroll_to_bottom", &self.scroll_to_bottom),
+            ("reopen_closed_tab", &self.reopen_closed_tab),
         ]
     }
 
@@ -397,6 +406,7 @@ impl Keybindings {
             ("copy_all", &mut self.copy_all),
             ("scroll_to_top", &mut self.scroll_to_top),
             ("scroll_to_bottom", &mut self.scroll_to_bottom),
+            ("reopen_closed_tab", &mut self.reopen_closed_tab),
         ]
     }
 
@@ -491,6 +501,7 @@ pub fn action_label(action: &str) -> &str {
         "copy_all" => "Copy everything",
         "scroll_to_top" => "Scroll to top",
         "scroll_to_bottom" => "Scroll to bottom",
+        "reopen_closed_tab" => "Reopen closed pane",
         other => other,
     }
 }

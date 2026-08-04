@@ -340,6 +340,26 @@ jobs:
   msrv:
     name: MSRV (rust-version floor)
     runs-on: ubuntu-latest
+    # RUSTUP_TOOLCHAIN is the ONLY thing that makes this job authoritative.
+    #
+    # Installing a toolchain and making it rustup's *default* is NOT enough: the
+    # repo-root rust-toolchain.toml is a DIRECTORY OVERRIDE, and rustup's
+    # precedence is
+    #   `cargo +toolchain` > RUSTUP_TOOLCHAIN > `rustup override` > rust-toolchain.toml > default
+    # so the default always loses to the file. Before this env existed, the job
+    # installed the MSRV, set it as default, and then `cargo check` silently ran
+    # on the pinned channel from rust-toolchain.toml instead — rustup even said
+    # so on every run ("note that the toolchain 'stable-…' is currently in use
+    # (overridden by '…/rust-toolchain.toml')"). The gate could not fail; it
+    # re-tested the same channel every other job already tested.
+    #
+    # Chosen over per-command `cargo +1.95.0 …` because the env covers EVERY
+    # toolchain-proxy invocation in the job — including future steps, build
+    # scripts, and any tool that shells out to `cargo` without a `+` prefix.
+    # A `+`-prefix has to be remembered on each command; forgetting it once
+    # silently restores the vacuous gate this fixes.
+    env:
+      RUSTUP_TOOLCHAIN: "1.95.0"
     steps:
       - name: Harden the runner (egress audit)
         # step-security/harden-runner@v2.19.4
@@ -353,13 +373,14 @@ jobs:
         with:
           persist-credentials: false
 
-      # Pin the MSRV channel to the rust-version declared in Cargo.toml (1.80).
-      # Bump this in lockstep with the manifest; CI fails if the floor regresses.
-      - name: Install MSRV toolchain (1.80)
+      # Must equal both Cargo.toml `rust-version` and RUSTUP_TOOLCHAIN above.
+      # Bump all three in lockstep when a dependency or a language feature
+      # raises the floor; CI fails loudly if the floor regresses.
+      - name: Install MSRV toolchain (1.95.0)
         # dtolnay/rust-toolchain @master commit
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: "1.80"
+          toolchain: "1.95.0"
 
       - name: Cache cargo registry and target
         # Swatinem/rust-cache@v2.9.1
@@ -375,6 +396,18 @@ jobs:
           sudo apt-get install -y \
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libwayland-dev libfontconfig1-dev
+
+      # Anti-vacuity assertion. If a future edit ever lets the directory
+      # override win again, this fails HERE with a clear message instead of the
+      # job quietly re-testing the pinned channel and reporting green.
+      - name: Assert the MSRV toolchain is the one actually in use
+        run: |
+          set -euo pipefail
+          rustc --version
+          rustc --version | grep -qF 'rustc 1.95.0' || {
+            echo "::error::MSRV job is not running on 1.95.0 — a toolchain override won. See the RUSTUP_TOOLCHAIN comment on this job."
+            exit 1
+          }
 
       - name: cargo check on MSRV
         run: cargo check --workspace --locked

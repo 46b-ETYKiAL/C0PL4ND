@@ -1127,6 +1127,58 @@ impl PaneTerm {
         guard.last_command_exit_code()
     }
 
+    /// The ABSOLUTE content lines of this pane's captured OSC 133 `;A`/`;B`
+    /// shell-prompt marks — the same set [`jump_to_prompt`](Self::jump_to_prompt)
+    /// walks, surfaced so the scrollbar can also draw them as a map of where each
+    /// command began. Already in the `history.len() + row` absolute space
+    /// `window_start` uses, so no display-row mapping is needed.
+    ///
+    /// Empty for a dead pane / poisoned lock, and for the common case of a shell
+    /// with no prompt integration (which emits no marks at all).
+    pub fn prompt_mark_lines(&self) -> Vec<usize> {
+        let Some(session) = self.session.as_ref() else {
+            return Vec::new();
+        };
+        session
+            .terminal()
+            .lock()
+            .map(|t| t.prompt_marks().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// The ABSOLUTE content lines of the OSC 133 `;D` command-end marks whose
+    /// shell-reported exit code was NON-ZERO — "a command failed here". The
+    /// per-command counterpart to [`last_command_exit_code`](Self::last_command_exit_code),
+    /// which only answers for the most recent one.
+    ///
+    /// A `;D` with no exit code at all is NOT a failure (the shell simply did not
+    /// report one — the neutral "done" state), so it is excluded; so are `;C`
+    /// output-start marks, which carry no code.
+    pub fn failed_command_lines(&self) -> Vec<usize> {
+        use c0pl4nd_core::term::osc::CommandMarkKind;
+        let Some(session) = self.session.as_ref() else {
+            return Vec::new();
+        };
+        session
+            .terminal()
+            .lock()
+            .map(|t| {
+                t.command_marks()
+                    .iter()
+                    .filter(|m| {
+                        matches!(
+                            m.kind,
+                            CommandMarkKind::CommandEnd {
+                                exit_code: Some(code)
+                            } if code != 0
+                        )
+                    })
+                    .map(|m| m.line)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Write raw bytes straight to the PTY (used for pasted text). Best-effort:
     /// a closed/dead session silently drops the write rather than panicking.
     pub fn write_bytes(&mut self, bytes: &[u8]) {

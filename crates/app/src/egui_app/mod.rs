@@ -445,6 +445,17 @@ const SPAWN_ROWS: u16 = 24;
 /// absolute-px config field or its settings slider.
 const LINE_HEIGHT_ANCHOR_PX: f32 = 20.0;
 
+/// Most PROMPT (and most FAILED-COMMAND) ticks the scrollbar paints per pane.
+///
+/// Core retains up to 4096 prompt and 8192 command marks, and a program that
+/// emits OSC 133 in a tight loop can fill both. Painting every one of them would
+/// cost thousands of rects per frame AND collapse into an unreadable smear on a
+/// track only a few hundred points tall, so the bar shows the most RECENT
+/// [`MAX_SEMANTIC_SCROLL_MARKS`] of each kind — the ones a user is scrolling
+/// back toward. Search hits are NOT capped: they are already bounded by the
+/// visible grid.
+const MAX_SEMANTIC_SCROLL_MARKS: usize = 256;
+
 /// Convert the configured `config.font.line_height` (absolute px, default 20.0)
 /// into a row-pitch MULTIPLIER relative to the natural galley height. Pure +
 /// GPU-free so the pitch wiring is unit-testable.
@@ -968,6 +979,15 @@ impl C0pl4ndApp {
         self.terms.get(&pane_id).map(PaneTerm::size)
     }
 
+    /// A pane's BODY rect (screen points) as of the last rendered frame, or
+    /// `None` before the first frame has laid the grid out. The scrollbar is an
+    /// overlay on the right edge of this rect, so the scrollbar-mark test uses it
+    /// to locate the bar's painted shapes in the frame output.
+    #[allow(dead_code)]
+    pub fn pane_body_rect(&self, pane_id: PaneId) -> Option<egui::Rect> {
+        self.pane_rects.get(&pane_id).copied()
+    }
+
     /// The ids of every pane with a live terminal, in unspecified order. Used by
     /// tests to enumerate panes for focus routing assertions.
     #[allow(dead_code)]
@@ -1486,7 +1506,18 @@ impl C0pl4ndApp {
                 alt: m.alt,
                 control: m.ctrl,
             };
-            let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+            // BOTH axes. egui folds a wheel notch into a SINGLE axis before the
+            // app sees it: with the horizontal-scroll modifier (Shift by default)
+            // held it rewrites the delta as `vec2(x + y, 0.0)`, leaving `.y` at
+            // ZERO. The mouse-REPORT branch below can keep reading `.y` alone
+            // (Shift forces LOCAL handling, so a reported wheel is never folded),
+            // but the local scrollback branch must consume whichever axis the
+            // notch landed on — see `wheel_scroll_lines`.
+            let scroll = ui.input(|i| i.smooth_scroll_delta);
+            let scroll_y = scroll.y;
+            // egui's own points-per-wheel-line, so a notch count can be recovered
+            // from the points it hands us.
+            let points_per_notch = ui.ctx().options(|o| o.input_options.line_scroll_speed);
             let mode = terms
                 .get(&pane_id)
                 .map(PaneTerm::mouse_mode)
@@ -1729,15 +1760,33 @@ impl C0pl4ndApp {
                         }
                     }
                 }
-                // Local scrollback: wheel up (positive y) goes BACK into history.
+                // Local scrollback: wheel up (positive) goes BACK into history.
                 // A Ctrl/Cmd-held wheel is reserved for font zoom (frame_tick):
                 // egui reroutes it into `zoom_delta` and zeroes `smooth_scroll_delta`
-                // (so `scroll_y` is already 0 here during a zoom), and this `command`
-                // guard is a belt-and-suspenders skip regardless.
-                if scroll_y.abs() > f32::EPSILON && resp.hovered() && !m.command {
-                    if let Some(term) = terms.get_mut(&pane_id) {
-                        let lines = (scroll_y / ch.max(1.0)).round() as i32;
-                        if lines != 0 {
+                // (so `scroll` is already zero here during a zoom), and this
+                // `command` guard is a belt-and-suspenders skip regardless.
+                //
+                // SHIFT is handled here too, and it MUST be: egui moves a
+                // Shift-held notch onto the x-axis and zeroes y, so the old
+                // `scroll_y`-only read made Shift+wheel a complete no-op — which
+                // silently broke the documented "hold Shift to force LOCAL
+                // scrolling" escape (the ONLY route into the scrollback while
+                // vim/tmux/htop has grabbed the mouse). The magnitude comes from
+                // the OS wheel setting rather than a font-size-derived constant.
+                if scroll != egui::Vec2::ZERO && resp.hovered() && !m.command {
+                    let rows = terms
+                        .get(&pane_id)
+                        .map(|t| t.size().1 as usize)
+                        .unwrap_or(0);
+                    let lines = wheel_scroll_lines(
+                        scroll,
+                        m.shift,
+                        points_per_notch,
+                        os_wheel_scroll_lines(),
+                        rows,
+                    );
+                    if lines != 0 {
+                        if let Some(term) = terms.get_mut(&pane_id) {
                             term.scroll_view(lines);
                         }
                     }
@@ -2016,29 +2065,78 @@ impl C0pl4ndApp {
                     // (which does not hold the pointer) still redraws immediately.
                     ui.ctx().request_repaint();
                 }
-                // Marks: the focused pane's search hits, mapped from their visible
-                // display row to an absolute content line via `window_start`.
+                // Marks: three SEMANTIC kinds, each already tracked by core and
+                // each drawn in its own colour + its own slice of the track (see
+                // `scrollbar::mark_rect`) so they stay distinguishable:
+                //
+                // - PROMPTS — the OSC 133 `;A`/`;B` marks core already captures and
+                //   the Ctrl+Shift+Up/Down jump-to-prompt chord already walks. They
+                //   turn the bar into a map of "where did each command start",
+                //   which is the whole point of shell prompt-integration.
+                // - FAILURES — the OSC 133 `;D` command-end marks whose reported
+                //   exit code was non-zero (the same marks the status bar's
+                //   exit-code indicator reads), so a failure deep in history is
+                //   findable without scrolling for it.
+                // - SEARCH HITS — as before: the focused pane's find matches,
+                //   mapped from their visible display row to an absolute content
+                //   line via `window_start`.
+                //
+                // Prompt/failure marks are ALREADY absolute content lines (core
+                // anchors them to `history.len() + row`, the same space
+                // `window_start` lives in), so they need no display-row mapping.
                 let mut marks: Vec<scrollbar::ScrollMark> = Vec::new();
+                let last = metrics.total().saturating_sub(1);
+                if let Some(t) = terms.get(&pane_id) {
+                    // Newest-first + capped: a hostile program may hold thousands of
+                    // marks (core caps prompts at 4096, commands at 8192) and painting
+                    // them all would be both slow and visual mush on a ~700pt track.
+                    // The most RECENT marks are the ones a user is looking for.
+                    let mut push_capped = |lines: Vec<usize>, kind: scrollbar::ScrollMarkKind| {
+                        for abs in lines.into_iter().rev().take(MAX_SEMANTIC_SCROLL_MARKS) {
+                            marks.push(scrollbar::ScrollMark {
+                                abs_line: abs.min(last),
+                                kind,
+                                selected: false,
+                            });
+                        }
+                    };
+                    push_capped(t.prompt_mark_lines(), scrollbar::ScrollMarkKind::Prompt);
+                    push_capped(t.failed_command_lines(), scrollbar::ScrollMarkKind::Error);
+                }
                 if let Some(hl) = search {
                     let ws = metrics.window_start();
-                    let last = metrics.total().saturating_sub(1);
                     for (i, span) in hl.spans.iter().enumerate() {
                         marks.push(scrollbar::ScrollMark {
                             abs_line: (ws + span.line).min(last),
+                            kind: scrollbar::ScrollMarkKind::SearchHit,
                             selected: i == hl.selected,
                         });
                     }
                 }
-                let cursor_color = c0pl4nd_core::theme::parse_hex(&theme.cursor)
-                    .map(|(r, g, b)| egui::Color32::from_rgb(r, g, b))
-                    .unwrap_or(pane_colors.accent);
+                let theme_color = |hex: &str, fallback: egui::Color32| {
+                    c0pl4nd_core::theme::parse_hex(hex)
+                        .map(|(r, g, b)| egui::Color32::from_rgb(r, g, b))
+                        .unwrap_or(fallback)
+                };
+                let mark_colors = scrollbar::MarkColors {
+                    search: pane_colors.fg,
+                    // The selected hit takes the cursor colour — hue-distinct from
+                    // the accent thumb, as before.
+                    selected: theme_color(&theme.cursor, pane_colors.accent),
+                    // Prompts take the theme's bright blue and failures its bright
+                    // red: hue-distinct from each other, from the fg search ticks,
+                    // and from the accent thumb. (Brand Akira-red `#ff0040` stays
+                    // reserved for alarms — a non-zero exit is routine.)
+                    prompt: theme_color(&theme.bright.blue, pane_colors.muted),
+                    error: theme_color(&theme.bright.red, pane_colors.fg),
+                };
                 let active = sb_resp.hovered() || sb_resp.dragged();
                 scrollbar::paint(
                     &painter,
                     track,
                     &metrics,
                     &pane_colors,
-                    cursor_color,
+                    &mark_colors,
                     active,
                     &marks,
                 );
@@ -5591,7 +5689,7 @@ fn paint_grid_native(
     let faux_bold = !fonts::bold_face_available();
     for (row_idx, runs) in rows.iter().enumerate() {
         let row_y = origin.y + row_idx as f32 * ch;
-        let y0 = snap_to_physical(row_y, ppp);
+        let y0 = snap_to_physical(row_y + 1.0, ppp);
         let y1 = snap_to_physical(row_y + ch, ppp);
         for span in pane_term::row_cell_spans(runs) {
             let Some(bg) = span.style.bg else {

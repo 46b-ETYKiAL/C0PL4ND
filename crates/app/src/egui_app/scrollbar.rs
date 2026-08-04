@@ -13,7 +13,9 @@
 //!   fraction of the total content, so its height is ∝ visible/total and its
 //!   position tracks the scroll offset;
 //! - a MARK at absolute content line `L` sits at fraction `L / total` down the
-//!   track (used for search-hit positions);
+//!   track (search hits, OSC 133 shell prompts, and failed commands — each
+//!   drawn in its own colour AND its own half of the track, so the three kinds
+//!   are distinguishable rather than merged into one undifferentiated set);
 //! - dragging the thumb scrubs the view; clicking the trough above/below pages.
 //!
 //! The geometry functions are pure (GPU-free, no `self`) so they are unit-tested
@@ -132,12 +134,100 @@ pub(crate) fn mark_y(m: &ScrollMetrics, track: egui::Rect, abs_line: usize) -> f
     track.top() + frac * track.height()
 }
 
-/// A tick painted on the track: an absolute content line + whether it is the
-/// currently-selected one (drawn in the cursor colour so it stands out).
+/// What a [`ScrollMark`] records. The kind drives BOTH the tick's colour and
+/// its geometry ([`mark_rect`]) so the three are told apart at a glance — and
+/// still told apart by a colour-blind user, or in a screenshot rendered in
+/// greyscale, because each kind occupies a different part of the track.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScrollMarkKind {
+    /// An OSC 133 `;A`/`;B` shell-prompt mark — where a command was typed.
+    /// The same marks the Ctrl+Shift+Up/Down jump-to-prompt chord walks.
+    Prompt,
+    /// An OSC 133 `;D` command-end mark whose reported exit code was NON-ZERO —
+    /// "a command failed here". Only shells with prompt integration emit these.
+    Error,
+    /// A find-overlay (Ctrl+Shift+F) match in the focused pane.
+    SearchHit,
+}
+
+/// A tick painted on the track: an absolute content line, what it records, and
+/// (for a [`ScrollMarkKind::SearchHit`]) whether it is the currently-selected
+/// match — drawn in the cursor colour so it stands out from the other hits.
+/// `selected` is meaningless for the other kinds and is ignored for them.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ScrollMark {
     pub abs_line: usize,
+    pub kind: ScrollMarkKind,
     pub selected: bool,
+}
+
+/// The colours the three mark kinds are painted in. Grouped so [`paint`] keeps
+/// one palette argument instead of one colour per kind.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MarkColors {
+    /// A non-selected search hit.
+    pub search: egui::Color32,
+    /// The CURRENTLY-SELECTED search hit (the cursor colour).
+    pub selected: egui::Color32,
+    /// A shell-prompt mark.
+    pub prompt: egui::Color32,
+    /// A failed-command mark.
+    pub error: egui::Color32,
+}
+
+/// Half-height of a search-hit / prompt tick, in points (so the tick is 2pt).
+const MARK_HALF_THICKNESS: f32 = 1.0;
+/// Half-height of a FAILED-COMMAND tick — deliberately heavier than the others
+/// so a failure reads as the loudest thing on the track.
+const ERROR_MARK_HALF_THICKNESS: f32 = 1.5;
+
+/// The rect a mark of `kind` occupies on `track` at track-y `y`.
+///
+/// The three kinds claim DIFFERENT horizontal extents so they never merge into
+/// one undifferentiated set:
+///
+/// - [`ScrollMarkKind::Prompt`] — the LEFT half of the track,
+/// - [`ScrollMarkKind::Error`] — the RIGHT half (and a heavier tick),
+/// - [`ScrollMarkKind::SearchHit`] — the FULL width, so the thing the user is
+///   actively hunting for is the widest mark and is never hidden behind a
+///   prompt tick that happens to land on the same line.
+///
+/// Pure geometry (no painter, no `self`) so the distinctness is unit-testable.
+pub(crate) fn mark_rect(kind: ScrollMarkKind, track: egui::Rect, y: f32) -> egui::Rect {
+    let mid = track.left() + track.width() * 0.5;
+    let (x0, x1, half_h) = match kind {
+        ScrollMarkKind::Prompt => (track.left(), mid, MARK_HALF_THICKNESS),
+        ScrollMarkKind::Error => (mid, track.right(), ERROR_MARK_HALF_THICKNESS),
+        ScrollMarkKind::SearchHit => (track.left(), track.right(), MARK_HALF_THICKNESS),
+    };
+    egui::Rect::from_min_max(egui::pos2(x0, y - half_h), egui::pos2(x1, y + half_h))
+}
+
+/// The colour a mark of `kind` is painted in. A SELECTED search hit takes the
+/// cursor colour (hue-distinct from the accent thumb); everything else takes
+/// its kind's colour.
+pub(crate) fn mark_color(
+    kind: ScrollMarkKind,
+    selected: bool,
+    colors: &MarkColors,
+) -> egui::Color32 {
+    match kind {
+        ScrollMarkKind::Prompt => colors.prompt,
+        ScrollMarkKind::Error => colors.error,
+        ScrollMarkKind::SearchHit if selected => colors.selected,
+        ScrollMarkKind::SearchHit => colors.search,
+    }
+}
+
+/// Paint order: prompts, then failures, then search hits LAST — so a search hit
+/// that lands on the same line as a prompt is still the visible one (the user is
+/// actively hunting for it).
+fn paint_rank(kind: ScrollMarkKind) -> u8 {
+    match kind {
+        ScrollMarkKind::Prompt => 0,
+        ScrollMarkKind::Error => 1,
+        ScrollMarkKind::SearchHit => 2,
+    }
 }
 
 /// Paint the track, its marks, and the thumb — egui rects only (GPU-free). The
@@ -150,7 +240,7 @@ pub(crate) fn paint(
     track: egui::Rect,
     m: &ScrollMetrics,
     colors: &ChromeColors,
-    cursor_color: egui::Color32,
+    mark_colors: &MarkColors,
     active: bool,
     marks: &[ScrollMark],
 ) {
@@ -165,16 +255,15 @@ pub(crate) fn paint(
         colors.accent.gamma_multiply(0.6)
     };
     painter.rect_filled(thumb, radius, thumb_col);
-    // Marks on top: a thin full-width tick per hit; the selected one in the
-    // cursor colour (hue-distinct from the accent thumb), the rest in the fg.
-    for mk in marks {
+    // Marks on top, in kind order (prompts, failures, then search hits) so an
+    // overlapping search hit wins the pixel. Each kind takes its own colour AND
+    // its own slice of the track width (see `mark_rect`).
+    let mut ordered: Vec<&ScrollMark> = marks.iter().collect();
+    ordered.sort_by_key(|mk| paint_rank(mk.kind));
+    for mk in ordered {
         let y = mark_y(m, track, mk.abs_line);
-        let col = if mk.selected { cursor_color } else { colors.fg };
-        let tick = egui::Rect::from_min_max(
-            egui::pos2(track.left(), y - 1.0),
-            egui::pos2(track.right(), y + 1.0),
-        );
-        painter.rect_filled(tick, 0.0, col);
+        let col = mark_color(mk.kind, mk.selected, mark_colors);
+        painter.rect_filled(mark_rect(mk.kind, track, y), 0.0, col);
     }
 }
 
@@ -374,6 +463,96 @@ mod tests {
             let off = view_offset_for_pointer_y(&m, t, y);
             assert!(off <= 12, "offset {off} exceeded scrollback for y={y}");
         }
+    }
+
+    fn mark_colors() -> MarkColors {
+        MarkColors {
+            search: egui::Color32::from_rgb(1, 0, 0),
+            selected: egui::Color32::from_rgb(2, 0, 0),
+            prompt: egui::Color32::from_rgb(3, 0, 0),
+            error: egui::Color32::from_rgb(4, 0, 0),
+        }
+    }
+
+    /// The three mark kinds must be told apart WITHOUT colour: a prompt tick and
+    /// a failure tick occupy DISJOINT halves of the track, and a search hit spans
+    /// the whole width. Merging them into one geometry (the pre-existing
+    /// full-width-tick-for-everything) fails this.
+    #[test]
+    fn mark_rect_gives_each_kind_a_distinct_slice_of_the_track() {
+        let t = track();
+        let y = 50.0;
+        let prompt = mark_rect(ScrollMarkKind::Prompt, t, y);
+        let error = mark_rect(ScrollMarkKind::Error, t, y);
+        let hit = mark_rect(ScrollMarkKind::SearchHit, t, y);
+
+        assert!(
+            prompt.right() <= error.left() + f32::EPSILON,
+            "a prompt tick ({prompt:?}) must not overlap a failure tick ({error:?}) — \
+             they are what makes the kinds distinguishable in greyscale"
+        );
+        assert!(
+            prompt.left() >= t.left() && error.right() <= t.right(),
+            "both half-width ticks stay inside the track"
+        );
+        assert!(
+            hit.left() <= prompt.left() && hit.right() >= error.right(),
+            "a search hit ({hit:?}) spans the full track so it is never hidden \
+             behind a same-line prompt tick"
+        );
+        assert!(
+            error.height() > prompt.height(),
+            "a failed command ({}) is drawn heavier than a prompt ({})",
+            error.height(),
+            prompt.height()
+        );
+        for (kind, r) in [
+            (ScrollMarkKind::Prompt, prompt),
+            (ScrollMarkKind::Error, error),
+            (ScrollMarkKind::SearchHit, hit),
+        ] {
+            assert!(
+                (r.center().y - y).abs() < f32::EPSILON,
+                "{kind:?} must be centred on its content line's track y"
+            );
+            assert!(
+                r.width() > 0.0 && r.height() > 0.0,
+                "{kind:?} paints nothing"
+            );
+        }
+    }
+
+    /// Every kind takes its OWN colour, and only a SELECTED search hit takes the
+    /// cursor colour. A palette that collapsed two kinds onto one colour would
+    /// re-merge the sets this feature exists to separate.
+    #[test]
+    fn mark_color_is_distinct_per_kind_and_selection() {
+        let c = mark_colors();
+        let prompt = mark_color(ScrollMarkKind::Prompt, false, &c);
+        let error = mark_color(ScrollMarkKind::Error, false, &c);
+        let hit = mark_color(ScrollMarkKind::SearchHit, false, &c);
+        let sel = mark_color(ScrollMarkKind::SearchHit, true, &c);
+        assert_eq!(prompt, c.prompt);
+        assert_eq!(error, c.error);
+        assert_eq!(hit, c.search);
+        assert_eq!(sel, c.selected);
+        let all = [prompt, error, hit, sel];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "two mark states collapsed onto the same colour");
+            }
+        }
+        // `selected` is meaningless for the non-search kinds and must be ignored.
+        assert_eq!(mark_color(ScrollMarkKind::Prompt, true, &c), c.prompt);
+        assert_eq!(mark_color(ScrollMarkKind::Error, true, &c), c.error);
+    }
+
+    /// A search hit is painted AFTER a prompt on the same line, so it wins the
+    /// overlapping pixels. Asserted on the rank function the painter sorts by.
+    #[test]
+    fn search_hits_paint_over_prompt_and_error_marks() {
+        assert!(paint_rank(ScrollMarkKind::SearchHit) > paint_rank(ScrollMarkKind::Error));
+        assert!(paint_rank(ScrollMarkKind::Error) > paint_rank(ScrollMarkKind::Prompt));
     }
 
     #[test]

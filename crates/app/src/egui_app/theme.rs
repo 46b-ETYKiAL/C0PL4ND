@@ -31,32 +31,37 @@ pub fn is_light(c: Color32) -> bool {
     luminance(c) > 0.5
 }
 
-/// WCAG 2.x **relative luminance** (0.0..=1.0) of an opaque colour — the
-/// gamma-linearised, differently-weighted sibling of [`luminance`] (which is the
-/// cheap Rec.601 approximation used for the light/dark polarity pivot). The two
-/// are deliberately separate: polarity only needs a rough split, whereas a
-/// contrast RATIO that claims WCAG conformance must use the WCAG formula.
-pub fn relative_luminance(c: Color32) -> f32 {
-    let lin = |v: u8| {
-        let s = f32::from(v) / 255.0;
-        if s <= 0.04045 {
-            s / 12.92
-        } else {
-            ((s + 0.055) / 1.055).powf(2.4)
-        }
-    };
+/// The opaque sRGB triple of an egui colour, in the `(u8, u8, u8)` vocabulary
+/// the core WCAG helpers take. `Color32::to_array` yields `[r, g, b, a]`; the
+/// alpha is dropped because a contrast ratio is only defined between opaque
+/// colours (every colour these helpers are called with — surfaces, text, the
+/// close-red, the focus ring — is opaque).
+fn rgb_triple(c: Color32) -> (u8, u8, u8) {
     let [r, g, b, _] = c.to_array();
-    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+    (r, g, b)
 }
 
 /// WCAG contrast ratio between two opaque colours — `1.0` (identical) up to
 /// `21.0` (black on white). WCAG 2.4.11 / 2.4.13 require **>= 3:1** for a focus
 /// indicator against BOTH the focused control and its surroundings, which is the
 /// floor [`focus_ring_color`] is built to guarantee.
+///
+/// A thin `Color32` ADAPTER over [`c0pl4nd_core::theme::contrast_ratio`], not a
+/// second implementation. This module used to carry its own `relative_luminance`
+/// (the sRGB linearisation + the 0.2126/0.7152/0.0722 weights) plus its own ratio
+/// arithmetic, duplicating `c0pl4nd_core::theme::color_model` — which the
+/// terminal renderer's minimum-contrast clamp uses. Two private copies of one
+/// standard, and the local test only ever checked this copy against hard-coded
+/// literals, so the two could have drifted apart with nothing failing. Both now
+/// resolve to the single core implementation; the app-side
+/// `relative_luminance` wrapper went with them, having existed only to feed this
+/// function (nothing else called it). Callers wanting the raw WCAG luminance use
+/// [`c0pl4nd_core::theme::relative_luminance`]; [`luminance`] remains the cheap
+/// Rec.601 approximation used for the light/dark polarity pivot, which is a
+/// deliberately different thing — polarity only needs a rough split, whereas a
+/// ratio that claims WCAG conformance must use the WCAG formula.
 pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
-    let (la, lb) = (relative_luminance(a), relative_luminance(b));
-    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
-    (hi + 0.05) / (lo + 0.05)
+    c0pl4nd_core::theme::contrast_ratio(rgb_triple(a), rgb_triple(b))
 }
 
 /// The Windows-standard destructive close-red (`#E81123`) — the hover fill of
@@ -436,6 +441,78 @@ mod tests {
             Color32::from_rgb(0xab, 0xcd, 0xef),
         );
         assert!((contrast_ratio(a, b) - contrast_ratio(b, a)).abs() < 1e-4);
+    }
+
+    /// [`contrast_ratio`] is an ADAPTER over the core implementation
+    /// (`c0pl4nd_core::theme`), not a second copy of the formula — the state this
+    /// replaced, where `contrast_ratio_matches_the_wcag_reference_points` only
+    /// ever compared the app's private copy against literals, so the two copies
+    /// could drift apart with nothing failing.
+    ///
+    /// This pins the adapter to core across a spread of colours, including
+    /// channel-ASYMMETRIC ones (the WCAG weights are 0.2126/0.7152/0.0722, so a
+    /// swapped or dropped channel moves the answer) and probes either side of the
+    /// 0.04045 linear-segment knee. Re-inlining a local copy of the maths fails
+    /// here the moment it disagrees by more than float noise, and the final block
+    /// pins [`rgb_triple`] — the one piece of the conversion this module still
+    /// owns — against the literal triples the probes were built from.
+    #[test]
+    fn wcag_helpers_are_adapters_over_the_core_implementation() {
+        const PROBES: [(u8, u8, u8); 10] = [
+            (0, 0, 0),
+            (255, 255, 255),
+            (255, 0, 0),  // asymmetric: R is weighted 0.2126…
+            (0, 255, 0),  // …G 0.7152…
+            (0, 0, 255),  // …B 0.0722 — a channel swap moves all three
+            (10, 10, 10), // below the 0.04045 knee (the `/ 12.92` segment)
+            (11, 11, 11), // just above it (the `powf(2.4)` segment)
+            (0x12, 0x34, 0x56),
+            (0xab, 0xcd, 0xef),
+            (0xE8, 0x11, 0x23), // CLOSE_RED, a real call-site colour
+        ];
+        let as_color = |(r, g, b): (u8, u8, u8)| Color32::from_rgb(r, g, b);
+
+        for (i, a) in PROBES.iter().enumerate() {
+            for b in PROBES.iter().skip(i) {
+                let app = contrast_ratio(as_color(*a), as_color(*b));
+                let core = c0pl4nd_core::theme::contrast_ratio(*a, *b);
+                assert!(
+                    (app - core).abs() < 1e-6,
+                    "contrast_ratio drifted for {a:?} vs {b:?}: app {app} vs core {core}"
+                );
+            }
+        }
+
+        // The equality above would also hold if BOTH sides were constant, so
+        // prove the probe set actually exercises the scale: the luminances must
+        // span it, and the ratios must reach the 21:1 maximum.
+        let mut lums: Vec<f32> = PROBES
+            .iter()
+            .map(|p| c0pl4nd_core::theme::relative_luminance(*p))
+            .collect();
+        lums.sort_by(f32::total_cmp);
+        let span = lums.last().unwrap() - lums.first().unwrap();
+        assert!(
+            span > 0.9,
+            "probe set does not span the luminance scale: {span}"
+        );
+        assert!(
+            (contrast_ratio(Color32::BLACK, Color32::WHITE) - 21.0).abs() < 0.05,
+            "the adapter must still reach the 21:1 WCAG maximum"
+        );
+
+        // The `Color32 -> (u8, u8, u8)` step is the only thing this module still
+        // owns, so pin it directly: a swapped or dropped channel in `rgb_triple`
+        // would leave every equality above intact if both sides were fed the same
+        // wrong triple, but it CANNOT survive being compared against the literal
+        // triple the colour was built from.
+        for probe in PROBES {
+            assert_eq!(
+                rgb_triple(as_color(probe)),
+                probe,
+                "rgb_triple must preserve channel order and drop only alpha"
+            );
+        }
     }
 
     #[test]

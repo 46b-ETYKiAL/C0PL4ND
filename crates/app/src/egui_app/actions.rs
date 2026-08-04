@@ -212,6 +212,37 @@ fn chord_modifiers(m: &egui::Modifiers) -> (bool, bool, bool) {
     (m.ctrl || m.command || m.mac_cmd, m.shift, m.alt)
 }
 
+/// True while an IME composition owns this frame's keyboard input, so
+/// [`super::C0pl4ndApp::dispatch_keybindings`] must keep its hands off the event
+/// queue: the candidate keys a CJK / complex-script user presses to COMPOSE a
+/// character have to reach the IME, not be swallowed here as commands.
+///
+/// There is no `egui::Memory::owns_ime_events` to ask — the symbol does not exist
+/// in the pinned egui 0.34.3 (nor in egui-winit 0.34.3). egui's own equivalent is
+/// `TextEdit`'s private per-widget `state.ime_enabled`, driven by exactly the
+/// `Event::Ime` stream read below. The shell's counterpart is
+/// [`super::C0pl4ndApp::ime_preedit`], so the gate is built from the two signals
+/// that DO exist:
+///
+/// - `preedit_open` — a composition carried in from an earlier frame
+///   (`ime_preedit.is_some()`);
+/// - a *this-frame* `ImeEvent::Enabled` or non-empty `Preedit` — which covers the
+///   FIRST frame of a composition, since `forward_input_to_focused` (the handler
+///   that sets `ime_preedit`) runs later in the frame than the dispatcher.
+///
+/// `Preedit("")`, `Commit` and `Disabled` deliberately do NOT hold the gate open:
+/// those are precisely how the app's own handler ENDS a composition, so counting
+/// them as "composing" would eat the first chord after a commit.
+#[must_use]
+fn ime_composition_active(preedit_open: bool, events: &[egui::Event]) -> bool {
+    preedit_open
+        || events.iter().any(|ev| match ev {
+            egui::Event::Ime(egui::ImeEvent::Enabled) => true,
+            egui::Event::Ime(egui::ImeEvent::Preedit(text)) => !text.is_empty(),
+            _ => false,
+        })
+}
+
 impl super::C0pl4ndApp {
     /// The (chord, action) table for the LIVE config, rebuilt each frame so a
     /// settings edit or a config hot-reload takes effect immediately. A blank or
@@ -232,9 +263,20 @@ impl super::C0pl4ndApp {
     /// This is the shell's ONLY keyboard-shortcut path. Matching is exact on
     /// modifiers ([`Chord::matches`]), so `mod+t` and `mod+shift+t` stay distinct
     /// actions and a stray Alt never triggers a chord.
+    ///
+    /// While an IME composition is in progress ([`ime_composition_active`]) the
+    /// dispatcher stands down entirely: nothing is matched, nothing is consumed,
+    /// nothing fires. The SHIPPED defaults are all `mod+…` chords (plus bare
+    /// `f11`), which an IME never composes with — but a binding is a
+    /// user-editable string, and once someone rebinds an action onto a bare key
+    /// this gate is the difference between composing 「に」 and opening a tab.
     pub(crate) fn dispatch_keybindings(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let table = self.keybinding_table();
         let mut fired: Vec<Action> = Vec::new();
+        let preedit_open = self.ime_preedit.is_some();
+        if ctx.input(|i| ime_composition_active(preedit_open, &i.events)) {
+            return fired;
+        }
         ctx.input_mut(|i| {
             i.events.retain(|ev| {
                 let egui::Event::Key {
@@ -546,6 +588,145 @@ mod tests {
             .chord(Action::ToggleFullscreen.binding())
             .expect("parses");
         assert!(fs.matches(false, false, false, &egui_key_token(egui::Key::F11)));
+    }
+
+    /// A synthetic `mod+,` press — the default `settings` chord — as egui would
+    /// deliver it from a real keyboard.
+    fn settings_chord_event() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Comma,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Drive one frame's worth of `events` through the dispatcher and report
+    /// `(actions fired, whether a Key event survived in the queue)`.
+    ///
+    /// The survival half matters as much as the firing half: the gate's job is to
+    /// leave the keys ALONE for the IME / PTY path, and a dispatcher that
+    /// declined to fire but still `retain`ed the event away would look correct to
+    /// an actions-only assertion while silently eating the user's keystroke.
+    fn drive_dispatch(
+        app: &mut super::super::C0pl4ndApp,
+        events: Vec<egui::Event>,
+    ) -> (Vec<Action>, bool) {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events,
+            ..Default::default()
+        });
+        let fired = app.dispatch_keybindings(&ctx);
+        let key_survived = ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::Key { .. }))
+        });
+        let _ = ctx.end_pass();
+        (fired, key_survived)
+    }
+
+    #[test]
+    fn ime_composition_active_reads_the_signals_that_actually_exist() {
+        use egui::{Event, ImeEvent};
+        // No composition anywhere → the dispatcher runs normally.
+        assert!(!ime_composition_active(false, &[]));
+        assert!(!ime_composition_active(false, &[settings_chord_event()]));
+        // A pre-edit carried in from an earlier frame holds the gate open even
+        // when THIS frame carries no IME event at all (a composition spans
+        // frames; only the first one carries `Enabled`).
+        assert!(ime_composition_active(true, &[]));
+        assert!(ime_composition_active(true, &[settings_chord_event()]));
+        // First frame of a composition: `ime_preedit` is still None (the handler
+        // that sets it runs later in the frame), so the events must carry it.
+        assert!(ime_composition_active(
+            false,
+            &[Event::Ime(ImeEvent::Enabled)]
+        ));
+        assert!(ime_composition_active(
+            false,
+            &[Event::Ime(ImeEvent::Preedit("に".into()))]
+        ));
+        // The three END-of-composition shapes must NOT hold the gate open, or the
+        // first chord after a commit would be swallowed.
+        assert!(!ime_composition_active(
+            false,
+            &[Event::Ime(ImeEvent::Preedit(String::new()))]
+        ));
+        assert!(!ime_composition_active(
+            false,
+            &[Event::Ime(ImeEvent::Commit("日本".into()))]
+        ));
+        assert!(!ime_composition_active(
+            false,
+            &[Event::Ime(ImeEvent::Disabled)]
+        ));
+    }
+
+    #[test]
+    fn a_chord_fires_and_is_consumed_when_no_ime_is_composing() {
+        // The control for the gate test below: without a composition the SAME
+        // event must fire its action AND be consumed, so a failure there is the
+        // gate and not a broken chord.
+        let mut app = super::super::C0pl4ndApp::bootstrap();
+        assert!(!app.settings_open, "fresh app has settings closed");
+        let (fired, key_survived) = drive_dispatch(&mut app, vec![settings_chord_event()]);
+        assert_eq!(fired, vec![Action::ToggleSettings], "mod+, is `settings`");
+        assert!(app.settings_open, "the action really ran");
+        assert!(!key_survived, "a matched chord is consumed, never leaked");
+    }
+
+    #[test]
+    fn a_chord_is_neither_fired_nor_eaten_while_an_ime_is_composing() {
+        // CJK safety: mid-composition the keys belong to the IME. The dispatcher
+        // must neither act on them nor `retain` them away.
+        let mut app = super::super::C0pl4ndApp::bootstrap();
+
+        // (a) composition announced THIS frame (pre-edit not yet recorded).
+        let (fired, key_survived) = drive_dispatch(
+            &mut app,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Preedit("に".into())),
+                settings_chord_event(),
+            ],
+        );
+        assert!(
+            fired.is_empty(),
+            "no action may fire mid-composition: {fired:?}"
+        );
+        assert!(!app.settings_open, "the action must not have run");
+        assert!(
+            key_survived,
+            "the key must be left in the queue for the IME / PTY path"
+        );
+
+        // (b) composition carried over from an earlier frame: this frame holds
+        // only the chord, and the gate rests entirely on `ime_preedit`.
+        app.ime_preedit = Some("に".into());
+        let (fired, key_survived) = drive_dispatch(&mut app, vec![settings_chord_event()]);
+        assert!(
+            fired.is_empty(),
+            "a carried-over pre-edit still gates: {fired:?}"
+        );
+        assert!(!app.settings_open, "the action must not have run");
+        assert!(key_survived, "the key must survive a carried-over pre-edit");
+
+        // (c) composition finished → the very next chord works again, so the gate
+        // is not a permanent off-switch.
+        app.ime_preedit = None;
+        let (fired, _) = drive_dispatch(&mut app, vec![settings_chord_event()]);
+        assert_eq!(
+            fired,
+            vec![Action::ToggleSettings],
+            "chords resume once the composition ends"
+        );
+        assert!(app.settings_open, "the action ran after the composition");
     }
 
     #[test]

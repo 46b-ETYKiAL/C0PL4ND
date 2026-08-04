@@ -10,7 +10,9 @@ Legend: **P0** = expected-everywhere / correctness or breaks real apps · **P1**
 - ✅ Frameless custom titlebar (min/max/close), double-click-maximize, edge-resize + hover cursor (PR #23)
 - ✅ Splits/panes (H/V, grid, focus-nav, resize, close) — `core/src/layout/`
 - ✅ Tabs (per-cell tab strips, new/close/switch)
-- ✅ Command palette (25 actions), fuzzy filter
+- ✅ Command palette (20 actions — the `define_actions!` arm list in
+  `crates/app/src/egui_app/actions.rs`, counted by the compile-derived
+  `Action::COUNT`), fuzzy filter
 - ✅ Themes + theme files (`assets/themes/*.toml`), opacity, CRT effects
 - ✅ TOML config w/ line-error surfacing, zero-config defaults
 - ✅ Truecolor / 256 / 16-color SGR (foreground)
@@ -115,7 +117,10 @@ sixel decoder pixel-count ceiling added (audit finding).
 - **Multi-window-tab persistence** — DONE. All tabs persist via the core
   multi-tab `WorkspaceSnapshot` v2 (auto-save on close, restore-all on startup).
 
-The entire GAP_LIST is now closed: no remaining items.
+That closes the four items this 2026-05-31 round tracked — it is NOT the end of
+the document. Two later audit rounds follow below (egui-shell parity 2026-06-11,
+the whole-app audit-and-fix program 2026-06-12), and three limitations are still
+open: see "❌ Remaining honest limitations" at the end of the file.
 
 ## Shipped Status (final update — master 2026-05-30)
 

@@ -235,6 +235,12 @@ fn device_replies_are_7bit_clean_with_no_smuggled_controls() {
         let mut t = Terminal::new(4, 20);
         t.advance(inp);
         let reply = t.take_pty_response();
+        assert!(
+            !reply.is_empty(),
+            "no reply was queued for {inp:x?} — an empty reply makes the \
+             7-bit-clean scan below vacuous (it iterates nothing), and a device \
+             query the terminal silently ignores hangs the requesting app"
+        );
         for (i, &b) in reply.iter().enumerate() {
             let is_framing = b == 0x1b || b == 0x5c || b == 0x07; // ESC, '\', BEL
             let is_printable = (0x20..=0x7e).contains(&b);
@@ -2712,6 +2718,130 @@ fn xtgettcap_does_not_disturb_sixel() {
     assert!(
         t.take_pty_response().is_empty(),
         "sixel emits no XTGETTCAP reply"
+    );
+}
+
+#[test]
+fn xtgettcap_answers_a_non_utf8_capability_name() {
+    // "00ff" is well-formed hex but decodes to bytes that are not valid UTF-8,
+    // so it can never name a capability. It must still be ANSWERED with the
+    // unknown-capability form: a query the terminal drops silently hangs an app
+    // that blocks on the reply.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP+q00ff\x1b\\");
+    // The quoted name is re-encoded from the DECODED bytes (normalised upper
+    // hex), never a byte-for-byte reflection of the request.
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP0+r00FF\x1b\\");
+}
+
+#[test]
+fn xtgettcap_answers_a_malformed_hex_name() {
+    // Odd-length / non-hex tokens name nothing at all, so there is no name to
+    // quote back — but the caller still gets the bare unknown form, not silence.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP+qZZZ\x1b\\");
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP0+r\x1b\\");
+}
+
+// ---- DECRQSS (`DCS $ q <setting> ST` — report the current setting) ----
+
+#[test]
+fn decrqss_reports_current_sgr() {
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[1;31m"); // bold + red foreground
+    t.advance(b"\x1bP$qm\x1b\\");
+    // Valid form: DCS 1 $ r <sgr params> m ST, led by 0 so the client can
+    // replay it verbatim.
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1$r0;1;31m\x1b\\");
+}
+
+#[test]
+fn decrqss_reports_default_sgr_when_the_pen_is_clean() {
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP$qm\x1b\\");
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1$r0m\x1b\\");
+}
+
+#[test]
+fn decrqss_reports_extended_sgr_colors_and_underline_style() {
+    let mut t = Terminal::new(4, 20);
+    // Curly underline + 24-bit foreground + bright-index background.
+    t.advance(b"\x1b[4:3;38;2;10;20;30;101m");
+    t.advance(b"\x1bP$qm\x1b\\");
+    assert_eq!(
+        t.take_pty_response().as_slice(),
+        b"\x1bP1$r0;4:3;38;2;10;20;30;101m\x1b\\"
+    );
+}
+
+#[test]
+fn decrqss_reports_scroll_region() {
+    let mut t = Terminal::new(10, 20);
+    t.advance(b"\x1b[3;7r"); // DECSTBM rows 3..7 (1-based)
+    t.advance(b"\x1bP$qr\x1b\\");
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1$r3;7r\x1b\\");
+}
+
+#[test]
+fn decrqss_reports_cursor_style() {
+    let mut t = Terminal::new(4, 20);
+    // Default shape is a steady block → DECSCUSR Ps 2.
+    t.advance(b"\x1bP$q q\x1b\\");
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1$r2 q\x1b\\");
+
+    // A steady underline (CSI 4 SP q) round-trips as Ps 4.
+    t.advance(b"\x1b[4 q");
+    t.advance(b"\x1bP$q q\x1b\\");
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1$r4 q\x1b\\");
+}
+
+#[test]
+fn decrqss_unsupported_setting_gets_the_invalid_form() {
+    let mut t = Terminal::new(4, 20);
+    // DECSCA (`" q`) is not a setting this terminal tracks. The DEC answer is
+    // the invalid form — an explicit "no", never silence.
+    t.advance(b"\x1bP$q\"q\x1b\\");
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP0$r\x1b\\");
+}
+
+#[test]
+fn decrqss_never_echoes_request_bytes() {
+    // SECURITY (device-reply echo-to-stdin): the reply is built from internal
+    // state only. A hostile selector must come back as the fixed invalid form
+    // with none of the request's bytes smuggled into it.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP$q\x07evil\x1b\\");
+    let resp = t.take_pty_response();
+    assert_eq!(resp.as_slice(), b"\x1bP0$r\x1b\\");
+    assert!(
+        !resp.windows(4).any(|w| w == b"evil"),
+        "the reply must not carry request bytes: {resp:x?}"
+    );
+}
+
+#[test]
+fn decrqss_does_not_disturb_sixel() {
+    // `DCS $ q` (DECRQSS) and `DCS q` (Sixel) share the final byte and are
+    // told apart ONLY by the `$` intermediate. Regression guard for the hook
+    // disambiguation in BOTH directions.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP$qm\x1b\\");
+    assert!(
+        t.images().is_empty(),
+        "a DECRQSS request must never be decoded as an image"
+    );
+    assert!(
+        !t.take_pty_response().is_empty(),
+        "a DECRQSS request must be answered"
+    );
+
+    // A plain DCS q is still a Sixel image, and still emits no reply.
+    t.advance(b"\x1bPq#0;2;100;0;0~\x1b\\");
+    assert_eq!(t.images().len(), 1, "sixel still decodes");
+    assert_eq!(t.images()[0].image.height, 6);
+    assert!(
+        t.take_pty_response().is_empty(),
+        "sixel emits no device reply"
     );
 }
 

@@ -33,6 +33,11 @@ pub const DEFAULT_SCROLLBACK: usize = 10_000;
 /// oldest entry is dropped rather than growing without limit.
 const KITTY_KBD_STACK_MAX: usize = 16;
 
+/// Byte cap on an accumulated DECRQSS (`DCS $ q … ST`) setting selector. Real
+/// selectors are 1-2 bytes (`m`, `r`, `SP q`, `" q`); the cap bounds memory
+/// against a hostile stream that never terminates the DCS.
+const DECRQSS_PAYLOAD_MAX: usize = 64;
+
 /// A decoded inline image anchored to a grid position (absolute line + column).
 #[derive(Debug, Clone)]
 pub struct TerminalImage {
@@ -201,9 +206,13 @@ fn clamp_u8(v: u16) -> u8 {
     v.min(255) as u8
 }
 
-/// Decode an ASCII-hex byte string (XTGETTCAP capability name) into a UTF-8
-/// string. Returns `None` on odd length, non-hex bytes, or invalid UTF-8.
-fn hex_decode(hex: &[u8]) -> Option<String> {
+/// Decode an ASCII-hex byte string (an XTGETTCAP capability name) into raw
+/// bytes. Returns `None` only on malformed hex — odd length or a non-hex digit.
+///
+/// Decoding stops at bytes deliberately: a well-formed hex name that is not
+/// valid UTF-8 is still a name the terminal must ANSWER (with the "unknown
+/// capability" form), so the UTF-8 check belongs at the call site, not here.
+fn hex_decode_bytes(hex: &[u8]) -> Option<Vec<u8>> {
     if !hex.len().is_multiple_of(2) {
         return None;
     }
@@ -213,7 +222,21 @@ fn hex_decode(hex: &[u8]) -> Option<String> {
         let lo = (pair[1] as char).to_digit(16)?;
         out.push((hi * 16 + lo) as u8);
     }
-    String::from_utf8(out).ok()
+    Some(out)
+}
+
+/// Append one SGR colour selection to a DECRQSS SGR report. `base` is the
+/// 8-colour code (30 fg / 40 bg), `bright` the aixterm bright base (90 / 100),
+/// and `ext` the extended-colour selector (38 / 48). A [`Color::Default`] pen
+/// contributes nothing — the leading `0` in the report already reset it.
+fn push_sgr_color(out: &mut String, color: Color, base: u16, bright: u16, ext: u16) {
+    match color {
+        Color::Default => {}
+        Color::Indexed(n) if n < 8 => out.push_str(&format!(";{}", base + u16::from(n))),
+        Color::Indexed(n) if n < 16 => out.push_str(&format!(";{}", bright + u16::from(n) - 8)),
+        Color::Indexed(n) => out.push_str(&format!(";{ext};5;{n}")),
+        Color::Rgb(r, g, b) => out.push_str(&format!(";{ext};2;{r};{g};{b}")),
+    }
 }
 
 /// Encode bytes as uppercase ASCII-hex (for XTGETTCAP replies).
@@ -308,6 +331,11 @@ struct Screen {
     /// between hook and unhook when the DCS is an XTGETTCAP request, exclusive
     /// with `sixel_accum`.
     xtgettcap_accum: Option<Vec<u8>>,
+    /// In-progress DECRQSS DCS payload accumulator (`DCS $ q … ST` — "report
+    /// the current value of this setting"). Some between hook and unhook when
+    /// the DCS is a DECRQSS request, exclusive with `sixel_accum` and
+    /// `xtgettcap_accum`.
+    decrqss_accum: Option<Vec<u8>>,
     /// In-progress Kitty transmissions keyed by image id, accumulated across
     /// `m=1` … `m=0` chunk boundaries (decoded once at the `m=0` boundary).
     /// Format/width/height are captured from the FIRST chunk — the Kitty spec
@@ -427,6 +455,7 @@ impl Screen {
             images: Vec::new(),
             sixel_accum: None,
             xtgettcap_accum: None,
+            decrqss_accum: None,
             kitty_chunks: std::collections::HashMap::new(),
             kitty_store: std::collections::HashMap::new(),
             dec_modes: DecModes::default(),
@@ -1496,33 +1525,137 @@ impl Screen {
             if token.is_empty() {
                 continue;
             }
-            let Some(name) = hex_decode(token) else {
+            // Malformed hex names the terminal to nothing at all, so there is
+            // no name to quote back — answer the bare "unknown" form. Every
+            // non-empty token gets an answer; silence hangs the caller.
+            let Some(raw) = hex_decode_bytes(token) else {
+                self.push_pty_response(b"\x1bP0+r\x1b\\");
                 continue;
             };
             // Recognised capabilities. `Co`/`colors` = 256, `TN` (terminal name)
-            // = "xterm-256color", `RGB` = present (truecolor).
-            let value: Option<&str> = match name.as_str() {
-                "Co" | "colors" => Some("256"),
-                "TN" | "name" => Some("xterm-256color"),
-                "RGB" => Some(""), // boolean capability — present, empty value.
+            // = "xterm-256color", `RGB` = present (truecolor). A well-formed hex
+            // name that is not valid UTF-8 cannot match any of them, and falls
+            // through to the "unknown capability" answer below.
+            let value: Option<&str> = match std::str::from_utf8(&raw) {
+                Ok("Co") | Ok("colors") => Some("256"),
+                Ok("TN") | Ok("name") => Some("xterm-256color"),
+                Ok("RGB") => Some(""), // boolean capability — present, empty value.
                 _ => None,
             };
+            // Re-encoded from the DECODED bytes, so the quoted name is
+            // normalised hex the terminal produced — never a byte-for-byte
+            // reflection of the request.
+            let name_hex = hex_encode(&raw);
             let resp = match value {
+                Some("") => format!("\x1bP1+r{name_hex}\x1b\\"),
                 Some(v) => {
-                    let name_hex = hex_encode(name.as_bytes());
-                    if v.is_empty() {
-                        format!("\x1bP1+r{name_hex}\x1b\\")
-                    } else {
-                        let val_hex = hex_encode(v.as_bytes());
-                        format!("\x1bP1+r{name_hex}={val_hex}\x1b\\")
-                    }
+                    let val_hex = hex_encode(v.as_bytes());
+                    format!("\x1bP1+r{name_hex}={val_hex}\x1b\\")
                 }
-                None => {
-                    let name_hex = hex_encode(name.as_bytes());
-                    format!("\x1bP0+r{name_hex}\x1b\\")
-                }
+                None => format!("\x1bP0+r{name_hex}\x1b\\"),
             };
             self.push_pty_response(resp.as_bytes());
+        }
+    }
+
+    /// DECRQSS reply: `DCS $ q <selector> ST` asks the terminal to report the
+    /// CURRENT value of one setting. The answer is
+    /// `DCS 1 $ r <value><selector> ST` when the setting is supported, and the
+    /// DEC "invalid request" form `DCS 0 $ r ST` when it is not.
+    ///
+    /// An unrecognised selector is answered with the invalid form, NEVER with
+    /// silence: an app that issues DECRQSS and blocks on the reply (this is how
+    /// editors probe for styled-underline / cursor-shape support) hangs
+    /// otherwise.
+    ///
+    /// SECURITY (device-reply echo-to-stdin, CVE-2022-45872 et al.): the reply
+    /// is built ONLY from validated internal state. The request payload selects
+    /// a match arm and is never copied into the answer, so a hostile
+    /// `DCS $ q <control bytes> ST` cannot smuggle bytes onto the shell's stdin.
+    fn report_decrqss(&mut self, payload: &[u8]) {
+        let setting: Option<String> = match payload {
+            // SGR — the current pen rendition.
+            b"m" => Some(format!("{}m", self.sgr_setting())),
+            // DECSTBM — the scroll region, reported 1-based inclusive.
+            b"r" => Some(format!(
+                "{};{}r",
+                self.scroll_top + 1,
+                self.scroll_bottom + 1
+            )),
+            // DECSCUSR — cursor shape + blink (`CSI Ps SP q`).
+            b" q" => Some(format!("{} q", self.cursor_style_param())),
+            _ => None,
+        };
+        let resp = match setting {
+            Some(v) => format!("\x1bP1$r{v}\x1b\\"),
+            None => "\x1bP0$r\x1b\\".to_string(),
+        };
+        self.push_pty_response(resp.as_bytes());
+    }
+
+    /// Serialise the current pen as an SGR parameter string (without the
+    /// trailing `m`). Always led by `0` so the DECRQSS answer is a
+    /// self-contained "reset, then apply" sequence a client can replay
+    /// verbatim — the shape xterm reports.
+    fn sgr_setting(&self) -> String {
+        let mut s = String::from("0");
+        let f = self.pen.flags;
+        if f.bold {
+            s.push_str(";1");
+        }
+        if f.dim {
+            s.push_str(";2");
+        }
+        if f.italic {
+            s.push_str(";3");
+        }
+        match f.underline_style {
+            UnderlineStyle::None => {}
+            UnderlineStyle::Single => s.push_str(";4"),
+            UnderlineStyle::Double => s.push_str(";4:2"),
+            UnderlineStyle::Curly => s.push_str(";4:3"),
+            UnderlineStyle::Dotted => s.push_str(";4:4"),
+            UnderlineStyle::Dashed => s.push_str(";4:5"),
+        }
+        if f.blink {
+            s.push_str(";5");
+        }
+        if f.rapid_blink {
+            s.push_str(";6");
+        }
+        if f.inverse {
+            s.push_str(";7");
+        }
+        if f.conceal {
+            s.push_str(";8");
+        }
+        if f.strikeout {
+            s.push_str(";9");
+        }
+        if f.overline {
+            s.push_str(";53");
+        }
+        push_sgr_color(&mut s, self.pen.fg, 30, 90, 38);
+        push_sgr_color(&mut s, self.pen.bg, 40, 100, 48);
+        // SGR 58 (underline colour, C20) has no 8/16-colour short form.
+        match self.pen.underline_color {
+            Some(Color::Indexed(n)) => s.push_str(&format!(";58;5;{n}")),
+            Some(Color::Rgb(r, g, b)) => s.push_str(&format!(";58;2;{r};{g};{b}")),
+            Some(Color::Default) | None => {}
+        }
+        s
+    }
+
+    /// The DECSCUSR `Ps` that reproduces the current cursor shape + blink.
+    /// Inverse of [`Screen::set_cursor_shape`].
+    fn cursor_style_param(&self) -> u8 {
+        match (self.cursor_shape, self.cursor_shape_blink) {
+            (CursorShape::Block, true) => 1,
+            (CursorShape::Block, false) => 2,
+            (CursorShape::Underline, true) => 3,
+            (CursorShape::Underline, false) => 4,
+            (CursorShape::Bar, true) => 5,
+            (CursorShape::Bar, false) => 6,
         }
     }
 
@@ -2253,13 +2386,24 @@ impl Perform for Screen {
     }
 
     fn hook(&mut self, _params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
-        // `DCS + q … ST` is an XTGETTCAP capability request (C30) — the `+`
-        // arrives as an intermediate. `DCS q …` (no intermediate) is a Sixel
-        // image. The two are disambiguated by the intermediate.
-        if action == 'q' && intermediates.contains(&b'+') {
-            self.xtgettcap_accum = Some(Vec::new());
-        } else if action == 'q' {
-            self.sixel_accum = Some(Vec::new());
+        // THREE distinct DCS sequences share the final byte `q` and are
+        // disambiguated ONLY by the intermediate:
+        //
+        //   `DCS + q … ST`  XTGETTCAP terminfo-capability request (C30)
+        //   `DCS $ q … ST`  DECRQSS "report the current setting" request
+        //   `DCS   q … ST`  Sixel image data (no intermediate)
+        //
+        // Missing the `$` case routes DECRQSS into the Sixel decoder, where it
+        // fails to decode and the request is answered with SILENCE — which
+        // hangs any app that waits on the reply.
+        if action == 'q' {
+            if intermediates.contains(&b'+') {
+                self.xtgettcap_accum = Some(Vec::new());
+            } else if intermediates.contains(&b'$') {
+                self.decrqss_accum = Some(Vec::new());
+            } else {
+                self.sixel_accum = Some(Vec::new());
+            }
         }
     }
 
@@ -2272,6 +2416,14 @@ impl Perform for Screen {
         } else if let Some(buf) = &mut self.xtgettcap_accum {
             // XTGETTCAP names are tiny; bound generously against hostile input.
             if buf.len() < 4096 {
+                buf.push(byte);
+            }
+        } else if let Some(buf) = &mut self.decrqss_accum {
+            // DECRQSS setting selectors are 1-2 bytes; anything longer is not a
+            // setting we know. Truncating past the cap can only ever turn the
+            // request into an unrecognised one, which is answered with the
+            // DEC "invalid request" form — never with silence.
+            if buf.len() < DECRQSS_PAYLOAD_MAX {
                 buf.push(byte);
             }
         }
@@ -2289,6 +2441,8 @@ impl Perform for Screen {
             }
         } else if let Some(buf) = self.xtgettcap_accum.take() {
             self.report_xtgettcap(&buf);
+        } else if let Some(buf) = self.decrqss_accum.take() {
+            self.report_decrqss(&buf);
         }
     }
 }

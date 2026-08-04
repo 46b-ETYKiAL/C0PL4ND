@@ -5689,7 +5689,7 @@ fn paint_grid_native(
     let faux_bold = !fonts::bold_face_available();
     for (row_idx, runs) in rows.iter().enumerate() {
         let row_y = origin.y + row_idx as f32 * ch;
-        let y0 = snap_to_physical(row_y + 1.0, ppp);
+        let y0 = snap_to_physical(row_y, ppp);
         let y1 = snap_to_physical(row_y + ch, ppp);
         for span in pane_term::row_cell_spans(runs) {
             let Some(bg) = span.style.bg else {

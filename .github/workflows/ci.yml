@@ -284,11 +284,17 @@ jobs:
         # reported `ok` — a skip that read as a pass. It now FAILS without an
         # adapter, so it has to run where one exists.
         #
-        # qol_pixel_regressions and underline_dotted_4_4_defect are here for the
-        # same reason: both assert on the RASTERISED frame, so a job without an
-        # adapter cannot run them at all, and a test category nothing runs is a
-        # test category with zero protection.
-        run: cargo nextest run -p c0pl4nd --test qa_wide_glyph_snapshot --test egui_term_render --test qol_pixel_regressions --test underline_dotted_4_4_defect --locked --run-ignored only --test-threads 1
+        # qol_pixel_regressions is here for the same reason: it asserts on the
+        # RASTERISED frame, so a job without an adapter cannot run it at all, and
+        # a test category nothing runs is a test category with zero protection.
+        #
+        # It also carries the `ESC[4:4m` dotted-underline guard that used to have
+        # its own underline_dotted_4_4_defect target. That file was a
+        # failing-by-design reproduction of a defect this repo has since fixed;
+        # once fixed it passed while still titled "KNOWN DEFECT ... FAILS by
+        # design", and every assertion in it was a strict subset of the ones
+        # here. It was folded in rather than left to mislead in both directions.
+        run: cargo nextest run -p c0pl4nd --test qa_wide_glyph_snapshot --test egui_term_render --test qol_pixel_regressions --locked --run-ignored only --test-threads 1
 
       - name: Upload the rendered QA frames (eyeball aid)
         if: always()

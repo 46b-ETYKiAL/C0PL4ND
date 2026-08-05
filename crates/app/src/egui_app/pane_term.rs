@@ -16,10 +16,21 @@
 //!   runs ready for the paint layer, reusing [`Theme::cell_colors`] so the
 //!   foreground/background/inverse handling matches the winit renderer exactly.
 //!
-//! The glyphon GPU paint itself lives in [`super::term_render`]; this module is
-//! UI-toolkit-free (no egui, no wgpu) so it can be driven headlessly with
-//! simulated input — which is exactly the "typing reaches the PTY and the grid
-//! updates" class of bug Milestone 2 must guard against.
+//! This module produces no pixels. The paint itself is `paint_grid_native` in
+//! [`super`] (`egui_app/mod.rs`): it consumes the [`RunStyle`]-tagged rows from
+//! [`PaneTerm::grid_rows`] and draws them with egui's OWN text painter — the
+//! same rasteriser that draws the chrome. There is no `term_render` module and
+//! no glyphon paint: the glyphon GPU paths (in-pass callback AND offscreen
+//! texture) composited black inside `egui_tiles` panes on the real eframe/winit
+//! swapchain, so that path was removed in favour of native egui text (see the
+//! `paint_grid_native` doc comment for the full rationale). `glyphon` survives
+//! in the tree only for the legacy winit-driven `c0pl4nd-legacy` binary, which
+//! does not use this module at all.
+//!
+//! Keeping the paint out of here is deliberate: this module is UI-toolkit-free
+//! (no egui, no wgpu) so it can be driven headlessly with simulated input —
+//! which is exactly the "typing reaches the PTY and the grid updates" class of
+//! bug Milestone 2 must guard against.
 
 use std::cell::RefCell;
 use std::rc::Rc;

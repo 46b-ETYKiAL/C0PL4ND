@@ -147,10 +147,20 @@ egui_kittest = { version = "0.34", features = ["wgpu", "snapshot", "eframe"] }
 # dir — so it is available to the round-trip tests without a dev-dep entry.
 minisign = "0.9"
 
-# Proves every BUNDLED font face actually parses with the SAME glyph crate epaint
+# Proves every BUNDLED font face actually parses with the glyph crate epaint
 # uses (already in the lock graph transitively via epaint), so a bad/variable face
 # can never panic epaint's atlas build when the user selects it. VERIFY-only in a
 # test; the app never imports it directly. Pinned to the version epaint pulls.
+#
+# epaint 0.34 parses fonts with SKRIFA, not ab_glyph: `epaint::text::font::
+# FontFace::new` calls `skrifa::FontRef::from_index(bytes, index)?` and
+# `epaint::text::fonts` turns that error into
+# `panic!("Error parsing {name:?} TTF/OTF font file: {err}")`. A test that parsed
+# with ab_glyph was therefore checking a parser this app's render path never
+# runs, so it could not catch its own target class. `ab_glyph` is kept ONLY as
+# the negative control that proves the two parsers really do disagree (see
+# `a_face_skrifa_accepts_can_still_be_rejected_by_ab_glyph` in fonts.rs).
+skrifa = "=0.40.0"
 ab_glyph = "=0.2.32"
 
 # Round-trip test for the persisted layout snapshot. eframe serializes its

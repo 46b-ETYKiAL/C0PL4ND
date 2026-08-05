@@ -6,6 +6,19 @@
 //! Run on demand (needs a renderer — see [`require_gpu`]; FAILS, never skips,
 //! without one):
 //!   cargo test -p c0pl4nd --test qa_wide_glyph_snapshot -- --ignored --nocapture
+//!
+//! Each saved frame is announced twice: once as the human `QA-SNAPSHOT[…]` line,
+//! and once in the S4F3 platform driver's contract format
+//! `[visual-qa] wrote <path> (WxH)` (pinned by
+//! [`every_saved_frame_is_announced_to_the_platform_driver`]). To drive this file
+//! from the platform, pass the scene-name filter explicitly:
+//!   python .s4f3/scripts/tools/native_gui_render_qa.py \
+//!       --repo <c0pl4nd> --crate c0pl4nd --module qa_
+//! The driver's DEFAULT `--module visual_qa` matches nothing here — C0PL4ND's
+//! scenes are named `qa_*` in this integration-test target rather than living in
+//! an in-crate `mod visual_qa`, so the default filter selects zero tests and the
+//! driver reports "harness produced no rendered scenes". Pass `--module qa_`.
+//!
 //! Each test prints the absolute PNG path it wrote. The PNGs themselves are not
 //! gated — pixel output is non-deterministic across GPU drivers, so nothing here
 //! diffs against a committed baseline. The driver-independent assertions below
@@ -352,6 +365,21 @@ fn snapshot(h: &mut Harness<'_, egui_app::C0pl4ndApp>, name: &str) -> image::Rgb
 
     let out = std::env::temp_dir().join(format!("c0pl4nd-qa-{name}.png"));
     img.save(&out).expect("save QA snapshot PNG");
+    // MACHINE-READABLE line, in the platform's contract format:
+    //   `[visual-qa] wrote <path> (WxH)`
+    // `.s4f3/scripts/tools/native_gui_render_qa.py` parses exactly this to build
+    // its scene list; a frame that is rendered and saved but never announced in
+    // this shape is INVISIBLE to the driver, which then reports "harness
+    // produced no rendered scenes" and exits 1 — a red that looks like a broken
+    // renderer while the renderer is fine. It is emitted ALONGSIDE (not instead
+    // of) the human QA-SNAPSHOT line below, which carries the extra per-scene
+    // diagnostics the pane-content assertions print.
+    eprintln!(
+        "[visual-qa] wrote {} ({}x{})",
+        out.display(),
+        img.width(),
+        img.height()
+    );
     eprintln!(
         "QA-SNAPSHOT[{name}]: {}x{} -> {}",
         img.width(),
@@ -359,6 +387,39 @@ fn snapshot(h: &mut Harness<'_, egui_app::C0pl4ndApp>, name: &str) -> image::Rgb
         out.display()
     );
     img
+}
+
+/// STRUCTURAL GUARD — every saved frame is announced in the platform driver's
+/// contract format. Needs no GPU, so it runs in the ordinary suite.
+///
+/// The failure this pins is silent in both directions: the scenes rendered
+/// correctly, saved real PNGs and passed, while
+/// `native_gui_render_qa.py --repo . --crate c0pl4nd` exited 1 with "harness
+/// produced no rendered scenes" — because it looks for
+/// `[visual-qa] wrote <path> (WxH)` and this file only ever printed
+/// `QA-SNAPSHOT[name]: WxH -> path`. Nothing in the Rust suite could observe
+/// that, so the guard has to be structural: exactly one save site, and that site
+/// emits the marker.
+#[test]
+fn every_saved_frame_is_announced_to_the_platform_driver() {
+    const SRC: &str = include_str!("qa_wide_glyph_snapshot.rs");
+    // Split so this test's own needles are not counted as call sites.
+    let save_sites = SRC.matches(concat!("img.save", "(&out)")).count();
+    let marker_sites = SRC
+        .matches(concat!("\"[visual-qa]", " wrote {} ({}x{})\""))
+        .count();
+    assert_eq!(
+        save_sites, 1,
+        "frames must be saved in exactly ONE place (snapshot), so the driver \
+         announcement cannot be bypassed by adding a scene; found {save_sites}"
+    );
+    assert_eq!(
+        marker_sites, 1,
+        "that single save site must print the driver's contract line \
+         `[visual-qa] wrote <path> (WxH)` — native_gui_render_qa.py parses only \
+         this shape, and a saved-but-unannounced frame makes it exit 1 with \
+         \"harness produced no rendered scenes\"; found {marker_sites} emitters"
+    );
 }
 
 /// Type a line into the focused pane and submit it, then poll for it to land.

@@ -80,9 +80,16 @@ macro_rules! bundled {
 /// Display / variable faces (Wallpoet, Michroma, Zen Dots, and the variable-axis
 /// files Doto / Red Hat Mono / Teko / Saira / Spline Sans Mono) are NOT monospace,
 /// which is fine for an opt-in terminal font CHOICE — the built-in monospace stays
-/// the default. egui 0.34's `ab_glyph` backend has no variable-axis selection, so a
-/// variable `.ttf` loads its DEFAULT named instance (identical to how SCR1B3 embeds
-/// them) — no special handling needed, none skipped.
+/// the default.
+///
+/// A variable `.ttf` here loads its DEFAULT instance (identical to how SCR1B3
+/// embeds them) — no special handling needed, none skipped. That is this app's
+/// CHOICE, not a backend limitation: epaint 0.34 rasterises through `skrifa`
+/// (not `ab_glyph`) and DOES expose variable-axis selection — it resolves a
+/// `skrifa` `Location` from `FontTweak::coords` chained with the per-`TextFormat`
+/// coords. This app sets neither, so every axis stays at its default coordinate.
+/// Wiring a weight/width axis would mean populating `FontTweak::coords` on the
+/// registered face; nothing in the backend prevents it.
 pub const BUNDLED_FONTS: &[BundledFont] = &[
     // Monospace coding faces.
     bundled!(
@@ -872,29 +879,113 @@ mod tests {
         assert_eq!(BUNDLED_JP_FALLBACK_KEY, "c0pl4nd-bundled-jp");
     }
 
+    /// A copy of `src` whose sfnt version tag is clobbered — the corrupted-face
+    /// fixture the parse guards below are calibrated against. `skrifa` reads that
+    /// tag first and rejects the blob outright, which is exactly what makes it a
+    /// usable CONTROL: it proves the assertion can fire, so a green run is
+    /// evidence rather than a vacuous pass.
+    fn with_broken_sfnt_tag(src: &[u8]) -> Vec<u8> {
+        let mut bytes = src.to_vec();
+        bytes[0..4].copy_from_slice(b"XXXX");
+        bytes
+    }
+
     /// Every bundled face — including the 5 VARIABLE fonts (Doto/RedHatMono/Saira/
-    /// SplineSansMono/Teko) and the JP fallback — MUST parse with `ab_glyph`, the
-    /// exact glyph crate epaint builds its atlas with. epaint `panic!`s ("Error
-    /// parsing … font") when a selected family's bytes fail to parse, so a face that
-    /// only *registers* but cannot be parsed would crash the app the moment the user
-    /// picks it — a class the registration-only tests cannot catch. Asserting a
-    /// successful `FontRef` parse here proves that selection path is panic-free.
+    /// SplineSansMono/Teko) and the JP fallback — MUST parse with **`skrifa`**, the
+    /// glyph crate epaint actually builds its atlas with. `epaint::text::font::
+    /// FontFace::new` calls `skrifa::FontRef::from_index(bytes, index)?` — the ONLY
+    /// fallible step in it — and `epaint::text::fonts` turns that error into
+    /// `panic!("Error parsing {name:?} TTF/OTF font file: {err}")`. So a face that
+    /// only *registers* but cannot be parsed crashes the app the moment the user
+    /// picks it, a class the registration-only tests cannot catch.
+    ///
+    /// This test previously parsed with `ab_glyph`, on the stale premise that
+    /// `ab_glyph` was "the exact glyph crate epaint builds its atlas with". epaint
+    /// 0.34 moved to `skrifa` (see its `Cargo.lock` deps: `skrifa`, no `ab_glyph`),
+    /// so the guard was exercising a parser this app's render path never runs — it
+    /// could not catch its own target class. The two parsers provably disagree; see
+    /// [`a_face_skrifa_accepts_can_still_be_rejected_by_ab_glyph`].
     #[test]
-    fn every_bundled_face_parses_with_ab_glyph() {
-        use ab_glyph::FontRef;
+    fn every_bundled_face_parses_with_skrifa() {
+        // CONTROL FIRST: a corrupted face must be REJECTED, or the loop below is
+        // an assertion that cannot fail.
+        let corrupt = with_broken_sfnt_tag(BUNDLED_FONTS[0].bytes);
+        assert!(
+            skrifa::FontRef::from_index(&corrupt, 0).is_err(),
+            "control: a face with a clobbered sfnt tag must be REJECTED by skrifa, \
+             otherwise the per-face assertions below can never fire"
+        );
+
         for bf in BUNDLED_FONTS {
             assert!(
-                FontRef::try_from_slice(bf.bytes).is_ok(),
-                "bundled face {} ({}) must parse with ab_glyph so epaint never \
-                 panics when it is selected",
+                skrifa::FontRef::from_index(bf.bytes, 0).is_ok(),
+                "bundled face {} ({}) must parse with skrifa so epaint never \
+                 panics (\"Error parsing … TTF/OTF font file\") when it is selected",
                 bf.display,
                 bf.key
             );
         }
         assert!(
-            FontRef::try_from_slice(NOTO_SANS_JP_SUBSET).is_ok(),
-            "the bundled JP fallback must parse with ab_glyph"
+            skrifa::FontRef::from_index(NOTO_SANS_JP_SUBSET, 0).is_ok(),
+            "the bundled JP fallback must parse with skrifa"
         );
+    }
+
+    /// Pins WHY the guard above had to change parsers: `ab_glyph` and `skrifa` do
+    /// not agree on what a font is, so an `ab_glyph` verdict carries no information
+    /// about whether epaint will panic.
+    ///
+    /// Both fixtures below are real JetBrains Mono bytes with one targeted
+    /// mutation. `ab_glyph` (ttf-parser) eagerly requires `head`/`hhea`/`maxp` and
+    /// rejects both; `skrifa::FontRef::from_index` only reads the table directory
+    /// and accepts both — and epaint, which uses skrifa, would therefore load them
+    /// without panicking. So the old test could go RED on a face epaint is
+    /// perfectly happy with (a false alarm), which is the same thing as saying its
+    /// GREEN was never evidence about epaint either.
+    ///
+    /// `ab_glyph` stays a dev-dependency purely to hold this control in place; the
+    /// app never parses with it.
+    #[test]
+    fn a_face_skrifa_accepts_can_still_be_rejected_by_ab_glyph() {
+        let base = BUNDLED_FONTS[0].bytes;
+
+        // (1) Rename the `head` table tag in the directory.
+        let mut renamed_head = base.to_vec();
+        let table_count = u16::from_be_bytes([renamed_head[4], renamed_head[5]]) as usize;
+        let mut renamed = false;
+        for i in 0..table_count {
+            let at = 12 + i * 16;
+            if &renamed_head[at..at + 4] == b"head" {
+                renamed_head[at..at + 4].copy_from_slice(b"zzzz");
+                renamed = true;
+            }
+        }
+        assert!(
+            renamed,
+            "fixture setup: the base face must carry a `head` table"
+        );
+
+        // (2) Keep the directory, zero every byte of table DATA.
+        let mut hollow = base.to_vec();
+        for byte in &mut hollow[12 + table_count * 16..] {
+            *byte = 0;
+        }
+
+        for (label, bytes) in [
+            ("head-tag-renamed", &renamed_head),
+            ("body-zeroed", &hollow),
+        ] {
+            assert!(
+                skrifa::FontRef::from_index(bytes, 0).is_ok(),
+                "{label}: skrifa (the parser epaint runs) is expected to ACCEPT this"
+            );
+            assert!(
+                ab_glyph::FontRef::try_from_slice(bytes).is_err(),
+                "{label}: ab_glyph is expected to REJECT this — if it ever agrees \
+                 with skrifa here, this control has stopped proving the two \
+                 parsers diverge and the parser choice above needs re-deriving"
+            );
+        }
     }
 
     #[test]

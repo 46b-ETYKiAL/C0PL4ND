@@ -164,8 +164,12 @@ pub enum ToastOutcome {
 ///   that just printed the message; a toast for the window you are staring at
 ///   is the notification-spam every peer emulator suppresses too. `focused ==
 ///   None` (before the first focus event, i.e. startup) is treated as focused,
-///   matching [`super::should_request_attention`] so a notification during
-///   launch cannot spuriously fire.
+///   so a notification during launch cannot spuriously fire.
+///
+/// The focus rule is not reimplemented here: it DELEGATES to
+/// [`crate::egui_app::taskbar::should_request_attention`], the predicate that
+/// already governed the taskbar flash this toast escalates. Two copies of one
+/// decision drift; one call site cannot.
 /// - Unfocused → toast the LAST report of the frame, plus the flash. Last-wins
 ///   mirrors `super::latest_progress`: a program that emits three notifications
 ///   in one 16 ms frame gets one toast, not a stack of three.
@@ -175,7 +179,7 @@ pub fn plan(drained: &[Notification], focused: Option<bool>) -> NotifyPlan {
     let Some(last) = drained.last() else {
         return NotifyPlan::default();
     };
-    if focused.unwrap_or(true) {
+    if !crate::egui_app::taskbar::should_request_attention(!drained.is_empty(), focused) {
         return NotifyPlan::default();
     }
     NotifyPlan {

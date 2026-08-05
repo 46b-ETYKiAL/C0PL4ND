@@ -316,7 +316,7 @@ fn main() -> eframe::Result<()> {
         "C0PL4ND",
         options,
         Box::new(|cc| {
-            let app = egui_app::C0pl4ndApp::new(cc);
+            let mut app = egui_app::C0pl4ndApp::new(cc);
             // Windows 11 Snap Layouts: prime the additive `win_chrome` caption
             // subclass with the REAL eframe HWND (same handle `caption_close` /
             // `win_foreground` use), then drive its per-frame maximize-button-rect
@@ -369,9 +369,17 @@ fn main() -> eframe::Result<()> {
                     }
                 }
             }
-            if let Some(icon) = load_app_icon() {
-                tray::init(&cc.egui_ctx, icon.rgba, icon.width, icon.height);
-            }
+            // REPORT the answer to the app. `close_to_tray` hides the window
+            // instead of exiting, and hiding it with no icon to restore it from
+            // strands the process running and unreachable — so `close_action`
+            // exits unless a tray is proven to exist. Dropping this call would
+            // leave the field at its fail-safe `false` and silently make the
+            // whole close-to-tray preference inert.
+            let tray_available = match load_app_icon() {
+                Some(icon) => tray::init(&cc.egui_ctx, icon.rgba, icon.width, icon.height),
+                None => false,
+            };
+            app.set_tray_available(tray_available);
             // Quake mode (drop-down terminal). Primed + armed HERE for the same
             // reasons as the tray: the real HWND must exist and we must be on the
             // event-loop thread, because `RegisterHotKey` targets that window's

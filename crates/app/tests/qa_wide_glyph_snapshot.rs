@@ -104,6 +104,18 @@ fn build_harness(
     }
     builder.wgpu().build_eframe(move |cc| {
         let mut app = egui_app::C0pl4ndApp::new(cc);
+        // PIN THE CARET'S BLINK PHASE. Its phase is a function of the frame
+        // clock, so every scene captured it wherever the clock happened to
+        // land: the SAME scene produced a solid block on one run, a hollow
+        // outline on another, and no caret at all on a third. This file's own
+        // module doc names "cursor placement" as an eyeball target, so those
+        // PNGs could not serve the purpose they are captured for, and a human
+        // diffing two runs saw a difference that meant nothing.
+        //
+        // Pinned ON (not OFF) because the caret must be IN the frame to be
+        // eyeballed at all. Set before `mutate` so a scene that ever needs the
+        // other phase can override it.
+        app.set_cursor_blink_phase(Some(egui_app::CursorBlinkPhase::On));
         mutate(&mut app);
         app
     })
@@ -144,6 +156,123 @@ fn no_scene_can_bypass_the_config_isolation() {
         isolate_sites, 1,
         "the isolation must be invoked from that single constructor, not sprinkled \
          per scene; found {isolate_sites} invocations"
+    );
+}
+
+/// STRUCTURAL GUARD — the cursor-blink phase is pinned in BOTH pixel files.
+/// Needs no GPU, so it runs in the ordinary suite.
+///
+/// An unpinned caret blinks off the frame clock, so a scene captures it wherever
+/// the clock lands: the SAME scene produced a solid block, a hollow outline, and
+/// no caret at all across runs. This file's module doc names "cursor placement"
+/// as an eyeball target — so without the pin the PNGs cannot serve the purpose
+/// they exist for, and a human diffing two runs sees a difference that means
+/// nothing.
+///
+/// This is asserted structurally rather than by rendering because the failure is
+/// *intermittent by construction*: a render-based check would pass on the runs
+/// where the clock happened to land ON, which is most of them. A missing pin is
+/// only reliably visible in the source.
+#[test]
+fn both_pixel_files_pin_the_cursor_blink_phase() {
+    // Split so this test's own needles do not count as call sites.
+    const PIN: &str = concat!("set_cursor_blink", "_phase(Some(");
+    for (name, src) in [
+        (
+            "qa_wide_glyph_snapshot.rs",
+            include_str!("qa_wide_glyph_snapshot.rs"),
+        ),
+        (
+            "qol_pixel_regressions.rs",
+            include_str!("qol_pixel_regressions.rs"),
+        ),
+    ] {
+        assert_eq!(
+            src.matches(PIN).count(),
+            1,
+            "{name} must pin the caret's blink phase exactly once, in its single \
+             harness constructor — an unpinned caret makes every cursor-related \
+             visual comparison in that file unreliable"
+        );
+    }
+}
+
+/// STRUCTURAL GUARD — the same isolation, for the SIBLING pixel file.
+///
+/// `qol_pixel_regressions.rs` measures exact colours through the same real
+/// harness, and it carried its OWN copy of the isolation: a `OnceLock<TempDir>`
+/// handing every scene in the process the SAME directory. That is verbatim the
+/// shape [`isolate_config_dir`] documents as having produced wrong eyeballed
+/// PNGs here — one scene's persisted `opacity`/`tint` becoming the next scene's
+/// starting config — and a local copy could not inherit the fix.
+///
+/// It was latent rather than firing (that file's two scenes persist no
+/// non-default config) and MASKED in CI, which runs under nextest's
+/// process-per-test isolation — so the leak can only ever appear on the local
+/// `cargo test` path a human uses to produce PNGs to look at. That is the worse
+/// of the two places for it to hide.
+///
+/// Checked from here because this file already owns the isolation discipline and
+/// its guards; a guard living in the file it guards can be deleted in the same
+/// edit that reintroduces the copy.
+#[test]
+fn the_sibling_pixel_file_uses_the_shared_config_isolation() {
+    const SRC: &str = include_str!("qol_pixel_regressions.rs");
+    // Split so this test's own needles do not count as call sites.
+    assert_eq!(
+        SRC.matches(concat!("OnceLock", "<tempfile::TempDir>"))
+            .count(),
+        0,
+        "qol_pixel_regressions.rs must not re-declare a process-wide config dir: \
+         one shared dir lets an earlier scene's persisted config render every \
+         later scene, which is exactly how the wrong PNGs were produced here"
+    );
+    assert_eq!(
+        SRC.matches(concat!("fn isolate_config", "_dir(")).count(),
+        0,
+        "it must not define its own isolation either — a copy cannot inherit the \
+         fresh-dir-per-harness fix"
+    );
+    assert_eq!(
+        SRC.matches(concat!("common::isolate_config", "_dir"))
+            .count(),
+        1,
+        "it must import the SHARED common::isolate_config_dir exactly once"
+    );
+}
+
+/// STRUCTURAL GUARD — the reason the shell-quiescence wait cannot silently
+/// regress to the first-sighting wait it replaced. Needs no GPU, so it runs in
+/// the ordinary suite rather than only in `visual-qa`.
+///
+/// The bug this guards is not a wrong constant; it is the shape of the wait.
+/// Returning as soon as the shell has emitted ANYTHING hands every scene in this
+/// file a grid the shell is still writing to, and the resulting failure is a
+/// once-in-a-few-runs `both spans must paint` that reproduces nowhere in
+/// isolation — the most expensive kind of red there is. Asserting the wait is
+/// invoked from the single harness constructor, and that no scene grew its own
+/// "wait until the shell said something" loop, keeps that checkable instead of a
+/// comment.
+#[test]
+fn no_scene_can_bypass_the_shell_quiescence_wait() {
+    const SRC: &str = include_str!("qa_wide_glyph_snapshot.rs");
+    // Split so this test's own needles do not count as call sites.
+    let quiescent_sites = SRC.matches(concat!("await_shell", "_quiescent(")).count();
+    let first_sighting_sites = SRC
+        .matches(concat!("test_focused", "_buffer_text()"))
+        .count();
+    assert_eq!(
+        quiescent_sites, 1,
+        "every pixel scene must reach its harness through the ONE px_harness \
+         constructor, which waits for the shell to go quiet exactly once; found \
+         {quiescent_sites} call sites"
+    );
+    assert_eq!(
+        first_sighting_sites, 0,
+        "no scene may poll the shell's grid text itself: that is the \
+         first-sighting wait whose mid-banner return let late shell output wipe \
+         the fed row. Wait via common::await_shell_quiescent instead; found \
+         {first_sighting_sites} direct poll(s)"
     );
 }
 
@@ -884,27 +1013,16 @@ fn px_harness() -> Harness<'static, egui_app::C0pl4ndApp> {
         app.config.effects.vhs_tracking = false;
         app.config.effects.chromatic_aberration_enabled = false;
     });
-    // Let the pane spawn and its shell emit its banner, so a late line of
+    // Let the pane spawn and its shell finish its banner, so a late line of
     // startup output cannot land on top of the fed content mid-assert.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while Instant::now() < deadline {
-        h.step();
-        if h.state()
-            .test_focused_buffer_text()
-            .is_some_and(|t| !t.trim().is_empty())
-        {
-            for _ in 0..10 {
-                h.step();
-            }
-            return h;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!(
-        "the focused pane never produced startup output — a still-booting shell \
-         can overwrite the fed grid mid-render, so these pixel asserts would be \
-         measuring a race rather than the paint path"
-    );
+    //
+    // This waits for the shell to go QUIET, not merely to have spoken. The
+    // previous wait returned on the shell's FIRST non-empty read, which is
+    // mid-banner: the rest of the banner then arrived after a test's `ESC[2J` +
+    // payload and wiped the row it had just fed, and the test measured an empty
+    // grid. See `common::await_shell_quiescent` for the measurement.
+    common::await_shell_quiescent(&mut h, "px_harness");
+    h
 }
 
 /// Clear the screen, feed `payload` into the focused pane's emulator, and render
@@ -1463,11 +1581,14 @@ fn sgr58_colours_the_underline_only_and_falls_back_to_the_foreground() {
 /// | `4:3`   | curly  | >= 3 scanlines (the sine amplitude)                     |
 /// | `4:5`   | dashed | 1 scanline, GAPPED (interior columns with no paint)     |
 ///
-/// `4:4` (dotted) is deliberately absent — it currently paints nothing at all.
-/// That is a real, reproducible defect in the renderer, NOT an omission of
-/// convenience: see `underline_dotted_4_4_defect.rs`, which carries the failing
-/// reproduction and the shape-level evidence. Adding it here would make this
-/// test red for a cause the test file cannot fix.
+/// `4:4` (dotted) is absent from the table above because it is asserted, in
+/// more detail than a single signature row, by
+/// `qol_pixel_regressions::dotted_underline_paints_visible_gapped_dots_on_one_scanline`.
+/// It used to paint NOTHING — its dots fell at or under epaint's 1px
+/// antialiasing feather and rasterised away entirely — so it was carried as a
+/// separate failing reproduction until the renderer was fixed to floor each dot
+/// at three physical pixels. That guard now lives with the fix, measured against
+/// the solid and dashed runs rather than against a written-down pixel count.
 #[test]
 #[ignore = "needs a real GPU; run with --ignored"]
 fn styled_underline_variants_are_visually_distinct() {

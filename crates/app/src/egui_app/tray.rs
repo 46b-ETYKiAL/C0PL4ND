@@ -128,12 +128,25 @@ pub fn prime_hwnd(hwnd: isize) {
 ///
 /// Call this AFTER the window exists (from the eframe creation closure) and after
 /// [`prime_hwnd`], on the event-loop thread.
-pub fn init(ctx: &eframe::egui::Context, icon_rgba: Vec<u8>, width: u32, height: u32) {
+///
+/// **Returns whether an icon actually exists**, and the caller MUST report it via
+/// `C0pl4ndApp::set_tray_available`. This is not bookkeeping: `close_to_tray`
+/// HIDES the window instead of exiting, and hiding it when no icon exists strands
+/// the process running and unreachable, holding the user's shells with nothing to
+/// restore it from. `WindowConfig::close_action` therefore exits whenever no tray
+/// is reported, and `false` is the default — so a caller that drops this answer
+/// degrades safely to "always exit" rather than to an invisible window. `false`
+/// off Windows.
+#[must_use]
+pub fn init(ctx: &eframe::egui::Context, icon_rgba: Vec<u8>, width: u32, height: u32) -> bool {
     #[cfg(windows)]
-    imp::init(ctx, icon_rgba, width, height);
+    {
+        imp::init(ctx, icon_rgba, width, height)
+    }
     #[cfg(not(windows))]
     {
         let _ = (ctx, icon_rgba, width, height);
+        false
     }
 }
 
@@ -192,12 +205,13 @@ mod imp {
     }
 
     /// Build the tray icon + menu and wire the click/menu handlers.
-    pub fn init(ctx: &eframe::egui::Context, icon_rgba: Vec<u8>, width: u32, height: u32) {
+    /// Returns whether an icon now exists (see the public wrapper).
+    pub fn init(ctx: &eframe::egui::Context, icon_rgba: Vec<u8>, width: u32, height: u32) -> bool {
         let icon = match Icon::from_rgba(icon_rgba, width, height) {
             Ok(icon) => icon,
             Err(err) => {
                 tracing::warn!(target: "c0pl4nd::tray", detail = ?err, "tray icon decode failed; no tray");
-                return;
+                return false;
             }
         };
 
@@ -231,7 +245,7 @@ mod imp {
             Ok(tray) => tray,
             Err(err) => {
                 tracing::warn!(target: "c0pl4nd::tray", detail = ?err, "tray icon build failed; no tray");
-                return;
+                return false;
             }
         };
         TRAY.with(|slot| *slot.borrow_mut() = Some(tray));
@@ -273,6 +287,10 @@ mod imp {
                 None => {}
             }
         }));
+
+        // The icon is built and stored: close-to-tray now has somewhere to
+        // restore the window FROM, so the caller may enable it.
+        true
     }
 
     /// Toggle the window between minimized/hidden and restored-to-foreground.
@@ -356,10 +374,23 @@ mod imp {
     }
 
     /// Quit the app gracefully by posting `WM_CLOSE`, so the existing
-    /// `frame_tick` fast-close path runs the real shutdown (persist config + reap
+    /// `frame_tick` close path runs the real shutdown (persist config + reap
     /// every PTY child) rather than a hard `process::exit` that skips it. Falls
     /// back to `exit(0)` only if the window was never primed.
+    ///
+    /// **The `request_explicit_quit` flag is load-bearing, not telemetry.** The
+    /// `WM_CLOSE` posted below arrives at the SAME `close_requested` path as an
+    /// ordinary caption ✕ and is otherwise indistinguishable from one. With
+    /// `close_to_tray` on, that path HIDES the window instead of exiting — so
+    /// without this flag the tray's own Quit would hide the window it was asked
+    /// to quit, and the app could never be closed at all. The flag is consumed
+    /// once, by the close path (`take_explicit_quit`), so it cannot leak into
+    /// later closes.
+    ///
+    /// Set BEFORE the post, never after: the message can be dispatched as soon
+    /// as it is queued.
     fn request_quit_main() {
+        crate::egui_app::request_explicit_quit();
         let Some(hwnd) = cached() else {
             std::process::exit(0);
         };

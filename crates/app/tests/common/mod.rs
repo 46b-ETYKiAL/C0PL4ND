@@ -135,6 +135,19 @@ pub const SHELL_OUTPUT_TIMEOUT: Duration = Duration::from_secs(20);
 /// running costs ~100ms and removes that window.
 pub const STABLE_OUTPUT_POLLS: u32 = 5;
 
+/// Consecutive polls on which the focused pane's grid text must be UNCHANGED
+/// before [`await_shell_quiescent`] is satisfied.
+///
+/// Deliberately larger than [`STABLE_OUTPUT_POLLS`], because it answers a harder
+/// question. That constant asks "is output present?", and presence is settled by
+/// the first byte. This one asks "has the shell finished?", and the honest
+/// failure mode is catching a PAUSE mid-banner — a loaded machine can stall
+/// between a shell's banner and its prompt for longer than the ~100ms five polls
+/// buy. Twenty-five polls is ~500ms of no movement, which costs ~12s across the
+/// whole 25-scene suite (a ~2% add on a ~520s run) and is far longer than any
+/// mid-banner gap measured here.
+pub const QUIESCENT_OUTPUT_POLLS: u32 = 25;
+
 /// Minimum painted (non-background) pixels a pane body must carry to count as
 /// "showing terminal content".
 ///
@@ -205,6 +218,74 @@ pub fn await_every_pane_has_output(h: &mut Harness<'_, egui_app::C0pl4ndApp>, sc
          {SHELL_OUTPUT_TIMEOUT:?}. This scene renders a frame a human is asked to \
          eyeball for terminal content, so snapshotting an empty pane here would \
          be a picture of nothing that passes."
+    );
+}
+
+/// Drive the real frame loop until the focused pane's shell has STOPPED writing.
+///
+/// [`await_every_pane_has_output`] waits for output to be PRESENT on
+/// [`STABLE_OUTPUT_POLLS`] consecutive polls, which is what a snapshot scene
+/// needs — it photographs whatever the shell produced. A PIXEL test needs
+/// something stricter, because it does not photograph the shell's output at all:
+/// it clears the grid with `ESC[2J`, feeds its OWN content, and measures that.
+/// What breaks it is therefore not an empty grid but a shell write that arrives
+/// AFTER the feed and clears or scrolls the row just written.
+///
+/// The wait this replaces returned on the FIRST non-empty read. A real shell's
+/// banner and prompt arrive over several PTY writes, and the pane's PTY is
+/// resized to fit its rect on the first laid-out frames — so the remaining
+/// writes, plus whatever the shell redraws in response to that resize, landed
+/// after a test's feed and wiped it. The grid the test then measured was the
+/// shell's, or nothing at all.
+///
+/// Measured, on this tree, before the change:
+/// `adjacent_bg_spans_tile_with_no_seam_and_no_overlap` failed its `both spans
+/// must paint` precondition on 1 of 4 consecutive full-suite runs — the fed row
+/// was simply gone by render time — while passing in isolation and on the other
+/// three. A second batch lost `underline_strikeout_and_overline_land_at_the_
+/// bottom_middle_and_top_of_the_cell` the same way, so this is a property of the
+/// harness, not of either test.
+///
+/// Waiting for QUIESCENCE closes it at the cause: a shell that has printed its
+/// prompt and is blocked reading input writes nothing more, so its grid text
+/// stops changing. This returns only once that text has been non-empty AND
+/// byte-identical across [`QUIESCENT_OUTPUT_POLLS`] consecutive polls.
+///
+/// It is NOT a retry, and deliberately so: it runs BEFORE any content is fed and
+/// before any assertion exists, it re-runs no measurement, and it can turn no
+/// failing assertion into a passing one. It only establishes the precondition
+/// every pixel scene in this crate already claims in its comments — that the
+/// grid belongs to the test.
+///
+/// Bounded, and a hard PANIC on timeout. A shell that never settles must fail
+/// loudly: returning early would hand the test a racing grid, which is the exact
+/// defect, and skipping would report green without measuring anything.
+pub fn await_shell_quiescent(h: &mut Harness<'_, egui_app::C0pl4ndApp>, scene: &str) {
+    let deadline = Instant::now() + SHELL_OUTPUT_TIMEOUT;
+    let mut last: Option<String> = None;
+    let mut stable = 0u32;
+    while Instant::now() < deadline {
+        h.step();
+        let text = h.state().test_focused_buffer_text();
+        let has_output = text.as_deref().is_some_and(|t| !t.trim().is_empty());
+        if has_output && text == last {
+            stable += 1;
+            if stable >= QUIESCENT_OUTPUT_POLLS {
+                return;
+            }
+        } else {
+            stable = 0;
+            last = text;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "{scene}: the focused pane's shell never went quiet within \
+         {SHELL_OUTPUT_TIMEOUT:?} — its grid text never held still for \
+         {QUIESCENT_OUTPUT_POLLS} consecutive polls. These scenes clear the grid \
+         and feed their own content, so a shell still writing would overwrite it \
+         and every pixel assertion below would be measuring that race instead of \
+         the paint path."
     );
 }
 

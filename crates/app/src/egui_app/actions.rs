@@ -982,7 +982,11 @@ mod tests {
         super::super::push_forwarded_launch(Some(want.clone()));
         app.drain_forwarded_launches(&ctx);
 
-        assert_eq!(pane_count(&app), before + 1, "the forwarded launch opened a pane");
+        assert_eq!(
+            pane_count(&app),
+            before + 1,
+            "the forwarded launch opened a pane"
+        );
         assert_eq!(
             app.last_spawn_cwd.as_deref(),
             Some(want.as_str()),
@@ -1000,7 +1004,11 @@ mod tests {
         super::super::push_forwarded_launch(None);
         app.drain_forwarded_launches(&ctx);
 
-        assert_eq!(pane_count(&app), before + 1, "a plain forward still opens a pane");
+        assert_eq!(
+            pane_count(&app),
+            before + 1,
+            "a plain forward still opens a pane"
+        );
         assert_eq!(
             app.last_spawn_cwd, None,
             "no directory was requested, so the shell default is used"

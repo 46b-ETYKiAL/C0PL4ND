@@ -22,6 +22,25 @@
 //!   per-channel tolerance of 90/255, while the same run gave 94px solid and
 //!   60px dashed. Only reading the frame catches that.
 //!
+//!   The measured survey that isolated it, on this harness (1100x720, ppp 1.0,
+//!   a 12-cell run, SGR-58 colour `#FF8000`, underline band at scanline y=63):
+//!
+//!   | SGR   | style  | pixels of the underline colour, before the fix |
+//!   |-------|--------|------------------------------------------------|
+//!   | `4`   | single | 94 (one continuous rule)                       |
+//!   | `4:1` | single | 94                                             |
+//!   | `4:2` | double | 188 (two rules, y=62 and y=64)                 |
+//!   | `4:3` | curly  | ~110 within tolerance, spanning y=62..64       |
+//!   | `4:5` | dashed | 60 (gapped)                                    |
+//!   | `4:4` | dotted | **0**, and still 0 at a tolerance of 90/255    |
+//!
+//!   Every row except `4:4` is asserted by
+//!   `qa_wide_glyph_snapshot::styled_underline_variants_are_visually_distinct`;
+//!   `4:4` is asserted here. After the fix it measures 48 pixels in 16 dots on
+//!   the single scanline y=63 — visible, gapped, and finer-grained than dashed,
+//!   which is what the test below checks against the solid and dashed runs the
+//!   same harness renders rather than against those numbers.
+//!
 //! * **Nothing measures the find highlight's painted WIDTH.** The search tests
 //!   assert span bookkeeping — `search_match_count`, `search_selected`,
 //!   `byte_to_col` — and `byte_to_col` is correct, so a span→rect off-by-one in
@@ -57,25 +76,9 @@ const HARNESS_H: u32 = 720;
 const DECO: [u8; 3] = [255, 128, 0];
 const CAL_BG: [u8; 3] = [173, 41, 209];
 
-/// Point the config loader at a throwaway dir for this process.
-///
-/// `C0pl4ndApp::new` both LOADS and SAVES the user's config, so without this a
-/// run would read (and rewrite) the developer's real
-/// `%APPDATA%\c0pl4nd\config.toml`, and a persisted tint/opacity would change
-/// the very pixels this file measures.
-fn isolate_config_dir() {
-    use std::sync::OnceLock;
-    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
-    let dir = DIR.get_or_init(|| {
-        tempfile::Builder::new()
-            .prefix("c0pl4nd-qol-px-")
-            .tempdir()
-            .expect("create the throwaway config dir")
-    });
-    std::env::set_var("APPDATA", dir.path());
-    std::env::set_var("XDG_CONFIG_HOME", dir.path());
-    std::env::set_var("HOME", dir.path());
-}
+mod common;
+
+use common::isolate_config_dir;
 
 /// Assert this host can actually render, with an ACTIONABLE message if it
 /// cannot. It must NEVER skip: every test here is `#[ignore]`d, so it runs only
@@ -116,6 +119,14 @@ fn px_harness() -> Harness<'static, egui_app::C0pl4ndApp> {
             app.config.effects.flicker = false;
             app.config.effects.vhs_tracking = false;
             app.config.effects.chromatic_aberration_enabled = false;
+            // PIN THE CARET'S BLINK PHASE, for the same reason the effects above
+            // are disabled: an exact colour count must not depend on when the
+            // frame happened to be captured. The caret's phase is a function of
+            // the frame clock, so an unpinned caret is present in some runs and
+            // absent in others — and it paints in the theme's CURSOR colour,
+            // which is close enough to this file's measured colours to matter if
+            // it ever moved over a measured cell.
+            app.set_cursor_blink_phase(Some(egui_app::CursorBlinkPhase::On));
             app
         });
     // Wait out the deferred first-frame PTY spawn and the shell banner, so a
@@ -302,12 +313,17 @@ fn dotted_underline_paints_visible_gapped_dots_on_one_scanline() {
     );
 
     // --- the regression ----------------------------------------------------
-    let dashed = px_mask(
-        &px_feed_until(&mut h, &underline_row("\x1b[4:5m"), |i| {
-            !px_mask(i, DECO, 0).is_empty()
-        }),
-        DECO,
-        0,
+    let dashed_img = px_feed_until(&mut h, &underline_row("\x1b[4:5m"), |i| {
+        !px_mask(i, DECO, 0).is_empty()
+    });
+    let dashed = px_mask(&dashed_img, DECO, 0);
+    assert!(
+        !dashed.is_empty() && dashed.ys.len() == 1,
+        "PROBE BROKEN: `4:5` (dashed) is the yardstick the dotted style is \
+         measured against below, so it must itself paint on exactly one \
+         scanline; got {} pixels on {:?}",
+        dashed.n,
+        dashed.ys
     );
     let dotted_img = px_feed_until(&mut h, &underline_row("\x1b[4:4m"), |i| {
         !px_mask(i, DECO, 0).is_empty()
@@ -366,6 +382,29 @@ fn dotted_underline_paints_visible_gapped_dots_on_one_scanline() {
         dotted_runs > 6,
         "a DOTTED underline is many small dots, got {dotted_runs} run(s) across \
          the 12-cell span"
+    );
+    // …and finer than DASHED specifically, measured against the dashed run this
+    // same harness just rendered rather than against a written-down number.
+    // `4:4` and `4:5` are the only two GAPPED variants, so "dotted is not just
+    // gapped but finer-grained than dashed" is the whole difference between
+    // them: a dotted arm that regressed into the dashed geometry satisfies every
+    // other assertion here (visible, one scanline, gapped, substantially drawn,
+    // spans the run, more than six runs) and would ship `4:4` and `4:5` as the
+    // same style.
+    let dashed_runs = px_runs_on_scanline(&dashed_img, DECO, dashed.ys[0]);
+    eprintln!(
+        "dotted={} px in {dotted_runs} runs | dashed={} px in {dashed_runs} runs \
+         | solid={} px",
+        dotted.n, dashed.n, solid.n
+    );
+    assert!(
+        dotted_runs > dashed_runs,
+        "a DOTTED underline must be finer-grained than a DASHED one: dotted \
+         painted {dotted_runs} run(s) ({} px) against dashed's {dashed_runs} \
+         run(s) ({} px) on the same 12-cell span. At or below dashed's run count \
+         the two styles are indistinguishable to a user.",
+        dotted.n,
+        dashed.n
     );
 }
 

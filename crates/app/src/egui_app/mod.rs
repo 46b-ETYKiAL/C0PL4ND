@@ -1,9 +1,8 @@
-//! Milestone 1 of the C0PL4ND egui chrome modernization (recon dossier
-//! `.s4f3-data/recon-c0pl4nd-egui-modernization.md`, steps 1–4).
+//! The C0PL4ND egui chrome shell.
 //!
-//! This module is the modern `eframe`/`egui` application shell, shipped as a
-//! SEPARATE binary (`c0pl4nd-egui`) so the existing winit-driven `c0pl4nd`
-//! binary keeps building and shipping unchanged. The chrome (frameless
+//! This module is the modern `eframe`/`egui` application shell and the
+//! CANONICAL `c0pl4nd` binary; the original winit-driven terminal is preserved
+//! beside it as `c0pl4nd-legacy` (see `crates/app/Cargo.toml`). The chrome (frameless
 //! titlebar, two-tone wordmark, tab strip, caption buttons, status bar) and the
 //! `egui_tiles` pane grid are real and clickable; each pane body hosts a live
 //! PTY whose visible grid is drawn with egui's NATIVE coloured-text painter (see
@@ -47,7 +46,11 @@ pub(crate) use crt::*;
 pub(crate) use motion_fx::*;
 mod grid_interaction;
 mod scrollbar;
-mod taskbar;
+// `pub(crate)` (not private) so `crate::notify::plan` can reach the ONE
+// focused-suppression predicate rather than reimplementing it. The toast and the
+// taskbar flash are two escalations of the same decision; two copies of it would
+// drift.
+pub(crate) mod taskbar;
 pub(crate) use grid_interaction::*;
 mod config_load;
 pub(crate) use config_load::*;
@@ -94,6 +97,73 @@ pub enum WindowCmd {
     ToggleMaximize,
     /// Close the window.
     Close,
+}
+
+/// What a close request actually did — the resolved product of BOTH window-close
+/// decisions, in the order the close path applies them:
+/// `WindowConfig::close_guard` (is a shell command still running?) then
+/// `WindowConfig::close_action` (exit, or hide to the tray?).
+///
+/// Recorded in [`C0pl4ndApp::last_close_outcome`] because the real effects are
+/// invisible to a headless harness: `Exit` calls `process::exit`, `HideToTray`
+/// issues an OS viewport command. The outcome is what a test can assert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseOutcome {
+    /// Run the shutdown side effects and exit the process.
+    Exit,
+    /// Hold the close and show the running-command confirmation instead.
+    Confirm {
+        /// How many panes report a command still in flight (always `>= 1`).
+        busy_panes: usize,
+    },
+    /// Keep the process alive and hide the window to the tray.
+    HideToTray,
+}
+
+/// A pinned terminal-cursor blink phase, for deterministic visual-QA capture.
+///
+/// The caret's phase is normally a function of the frame clock, so a snapshot
+/// scene captures it wherever the clock happens to land — the same scene showed
+/// the caret painted on one run and gone the next, which makes "cursor
+/// placement" un-eyeball-able from the PNGs. [`C0pl4ndApp::set_cursor_blink_phase`]
+/// pins it for the frames a test is capturing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorBlinkPhase {
+    /// The caret is painted this frame, whatever the clock says.
+    On,
+    /// The caret is not painted this frame, whatever the clock says.
+    Off,
+}
+
+/// Set when a real "quit" affordance asked the app to close — today the tray
+/// menu's own Quit item.
+///
+/// A process-wide flag rather than a field on [`C0pl4ndApp`] for exactly the
+/// reason [`FORWARDED_LAUNCHES`] is: the producer is the tray's global
+/// `MenuEvent` handler in the binary-local `tray` module, which runs on the
+/// event-loop thread with no `&mut App` to write into, and which signals the
+/// close by posting `WM_CLOSE` — i.e. it arrives at the SAME `close_requested`
+/// path an ordinary caption-✕ takes and is otherwise indistinguishable from it.
+///
+/// That indistinguishability is the whole point: without this flag,
+/// close-to-tray would swallow the tray's own Quit and the app could never be
+/// closed at all (see `WindowConfig::close_action`'s `explicit_quit`).
+static EXPLICIT_QUIT_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record that the NEXT close request is a real quit, and must exit rather than
+/// hide to the tray. Called from the tray menu's Quit handler immediately before
+/// it posts `WM_CLOSE`.
+pub fn request_explicit_quit() {
+    EXPLICIT_QUIT_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// CONSUME the explicit-quit flag: `true` once per [`request_explicit_quit`].
+///
+/// Consuming (rather than peeking) is what stops one tray Quit from making every
+/// later close in the session bypass close-to-tray.
+pub fn take_explicit_quit() -> bool {
+    EXPLICIT_QUIT_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The modern egui chrome application. Holds the tiling grid, the focused pane,
@@ -330,6 +400,42 @@ pub struct C0pl4ndApp {
     /// tests can assert that clicking a caption button had its real effect (the
     /// OS command itself is not observable in a headless harness).
     pub(crate) last_window_cmd: Option<WindowCmd>,
+    /// Whether a system-tray icon actually EXISTS for this process.
+    ///
+    /// The tray is a binary-local module of the shipping `c0pl4nd` binary (it
+    /// needs the real HWND + the winit message loop), so the lib cannot ask it
+    /// directly; the binary reports in via [`Self::set_tray_available`]. It
+    /// starts `false` and that default is load-bearing rather than lazy: a
+    /// close-to-tray hide with NO icon would strand the window invisible with no
+    /// way back, so the whole feature degrades to a real exit until something
+    /// proves a tray exists (see `WindowConfig::close_action`).
+    pub(crate) tray_available: bool,
+    /// `Some(busy_panes)` while the running-command close confirmation is on
+    /// screen — the count `WindowConfig::close_guard` reported. `None` when no
+    /// confirmation is pending.
+    pub(crate) close_confirm: Option<usize>,
+    /// The user's answer to that confirmation ("Close anyway"). Fed straight
+    /// into `close_guard`'s `already_confirmed`, which short-circuits to
+    /// `Proceed` so the second pass through the close path cannot re-prompt (the
+    /// commands are still running when the user says yes). Reset whenever a
+    /// close does NOT end in an exit, so a later close prompts again.
+    pub(crate) close_confirmed: bool,
+    /// The most recent close DECISION ([`Self::close_decision`]). Observable for
+    /// the same reason as [`last_window_cmd`](Self::last_window_cmd): the real
+    /// effects (`process::exit`, hiding the OS window) are invisible to a
+    /// headless harness, so this is what a test asserts the config decision
+    /// actually reached.
+    pub(crate) last_close_outcome: Option<CloseOutcome>,
+    /// How many close requests reached the real exit branch. In a live window
+    /// the process is gone before this is read; in the headless harness it is
+    /// the observable proof that a close was NOT swallowed by the guard or by
+    /// close-to-tray.
+    pub(crate) exit_requests: u32,
+    /// Deterministic override for the terminal cursor's blink phase, for visual
+    /// QA capture. `None` (the default, and the only state the shipping app ever
+    /// runs in) leaves the phase free-running off the frame clock. See
+    /// [`Self::set_cursor_blink_phase`].
+    pub(crate) cursor_blink_phase: Option<CursorBlinkPhase>,
     /// Last known UN-maximized inner size (logical points). Updated every frame
     /// the window is not maximized, and used to drive an EXPLICIT restore size
     /// when the user un-maximizes: eframe's persisted window state can leave
@@ -552,6 +658,62 @@ fn line_height_multiplier(line_height_px: f32) -> f32 {
 /// pitch changes). Pure + GPU-free → unit-testable without an egui frame.
 fn effective_row_pitch(natural_line_h: f32, line_height_px: f32) -> f32 {
     (natural_line_h * line_height_multiplier(line_height_px)).max(1.0)
+}
+
+/// The active shell profile, as a deferred first-spawn needs it: the program to
+/// launch (`None` = the platform default shell) and its arguments.
+///
+/// A borrowed bundle rather than two more loose parameters because it is
+/// threaded into [`C0pl4ndApp::render_pane_body`], which is a FREE function (so
+/// the egui_tiles closure can borrow `terms`/`theme` disjointly from
+/// `grid_tree`) and already carries a long argument list.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SpawnProfile<'a> {
+    /// The program to launch; `None` means the platform default shell.
+    pub(crate) program: Option<&'a str>,
+    /// Arguments passed to `program` (empty for a bare interactive shell).
+    pub(crate) args: &'a [String],
+}
+
+/// THE ONE PANE-SPAWN FUNNEL: turn a shell profile (`program` + `args`, where
+/// `None` is the platform default shell) plus an optional working directory into
+/// a live [`PaneTerm`].
+///
+/// Both spawn paths route through here — [`C0pl4ndApp::spawn_term_in`] (split /
+/// new tab / reopen-closed-pane) and the DEFERRED first-spawn in
+/// [`C0pl4ndApp::render_pane_body`] (the initial pane and every restored one).
+/// That is the point of the funnel: the two used to make the profile-vs-cwd
+/// choice independently, and they disagreed. `spawn_term_in`'s named-profile arm
+/// dropped the cwd (it called the directory-less `PaneTerm::spawn_program`), and
+/// the deferred arm ignored the profile entirely and always spawned the default
+/// shell — so a restored layout under PowerShell/WSL came back as the default
+/// shell, in the default directory. One funnel, one answer.
+///
+/// `cwd = None` keeps the pre-existing cwd-less spawn EXACTLY as it was (the
+/// shell's own default directory); a `cwd` that no longer exists falls back to
+/// home inside the core spawn, and a failed spawn degrades to an error pane —
+/// never a panic.
+fn spawn_pane_term(
+    theme: c0pl4nd_core::Theme,
+    program: Option<&str>,
+    args: &[String],
+    cols: u16,
+    rows: u16,
+    term: Option<&str>,
+    cwd: Option<&str>,
+) -> PaneTerm {
+    match program {
+        // A NAMED profile: its program wins, and the cwd now travels with it.
+        Some(program) => {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            PaneTerm::spawn_program_in(theme, program, &arg_refs, cols, rows, cwd)
+        }
+        // The platform default shell.
+        None => match cwd {
+            Some(dir) => PaneTerm::spawn_in_with_term(theme, cols, rows, term, Some(dir)),
+            None => PaneTerm::spawn_with_term(theme, cols, rows, term),
+        },
+    }
 }
 
 impl C0pl4ndApp {
@@ -804,6 +966,14 @@ impl C0pl4ndApp {
             update_rx: None,
             last_update_notice: None,
             last_window_cmd: None,
+            // Fail-safe default: no tray until the shipping binary proves one
+            // exists, so a hide can never strand the window (see the field doc).
+            tray_available: false,
+            close_confirm: None,
+            close_confirmed: false,
+            last_close_outcome: None,
+            exit_requests: 0,
+            cursor_blink_phase: None,
             restore_size: None,
             cursor_trail: std::collections::VecDeque::new(),
             first_frame_time: None,
@@ -893,15 +1063,13 @@ impl C0pl4ndApp {
     /// once `split_in` landed, and a dead pass-through is how a second spawn path
     /// starts drifting from the first.
     ///
-    /// **The cwd applies to the DEFAULT shell only.** When the user has switched
-    /// to a NAMED profile from the ▾ menu, the profile's program wins and the cwd
-    /// is not applied: `PaneTerm` exposes `spawn_program` (no directory) but no
-    /// `spawn_program_in`, so honouring both would mean either launching the
-    /// WRONG shell in the right directory — a much worse failure than the right
-    /// shell in the default directory — or widening `pane_term.rs`, which is
-    /// outside this change's ownership. The restore-from-layout path has exactly
-    /// the same limitation today (it always spawns the default shell), so this
-    /// adds no new inconsistency.
+    /// **The cwd now applies to a NAMED profile too.** It used to apply to the
+    /// DEFAULT shell only: this branch called `PaneTerm::spawn_program`, which
+    /// had no directory parameter at all, so reopening a closed pane (or
+    /// restoring a layout) while a named profile was active silently landed in
+    /// the default directory. `PaneTerm::spawn_program_in` closed that gap; the
+    /// shared [`spawn_pane_term`] funnel below is where both arms consume it, so
+    /// the immediate and deferred spawn paths cannot drift apart again.
     fn spawn_term_in(&mut self, pid: PaneId, cwd: Option<&str>) {
         let theme = self.theme.clone();
         let term_name = self.config.term.clone();
@@ -911,34 +1079,19 @@ impl C0pl4ndApp {
         // Record the directory the shell was ACTUALLY asked to start in, at the
         // exact branch that asks for it. Mirrors `last_window_cmd`: it makes an
         // otherwise-invisible spawn argument observable, so the reopen wiring
-        // test asserts the cwd reached `spawn_in_with_term` rather than merely
-        // that a pane appeared (which a pane opened in the wrong directory would
-        // also satisfy).
-        self.last_spawn_cwd = None;
-        let term = match program {
-            Some(program) => {
-                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                PaneTerm::spawn_program(theme, &program, &arg_refs, SPAWN_COLS, SPAWN_ROWS)
-            }
-            None => match cwd {
-                Some(dir) => {
-                    self.last_spawn_cwd = Some(dir.to_string());
-                    PaneTerm::spawn_in_with_term(
-                        theme,
-                        SPAWN_COLS,
-                        SPAWN_ROWS,
-                        Some(term_name.as_str()),
-                        Some(dir),
-                    )
-                }
-                None => PaneTerm::spawn_with_term(
-                    theme,
-                    SPAWN_COLS,
-                    SPAWN_ROWS,
-                    Some(term_name.as_str()),
-                ),
-            },
-        };
+        // test asserts the cwd reached the spawn rather than merely that a pane
+        // appeared (which a pane opened in the wrong directory would also
+        // satisfy). Set for BOTH profile arms now that both honour it.
+        self.last_spawn_cwd = cwd.map(str::to_string);
+        let term = spawn_pane_term(
+            theme,
+            program.as_deref(),
+            &args,
+            SPAWN_COLS,
+            SPAWN_ROWS,
+            Some(term_name.as_str()),
+            cwd,
+        );
         self.terms.insert(pid, term);
     }
 
@@ -1302,9 +1455,16 @@ impl C0pl4ndApp {
         // The configured `TERM` advertised to a deferred-first-spawn pane, so the
         // initial pane's child PTY sees the same `TERM` as every later pane.
         term: &str,
+        // The ACTIVE shell profile, so a deferred first-spawn runs the same shell
+        // the immediate `spawn_term_in` path would (it used to always spawn the
+        // platform default, ignoring the profile entirely).
+        spawn_profile: SpawnProfile<'_>,
         font_size: f32,
         line_height_px: f32,
         cursor_cfg: c0pl4nd_core::config::CursorConfig,
+        // Deterministic cursor-blink phase override for visual-QA capture; `None`
+        // leaves the caret's phase free-running off the frame clock.
+        cursor_blink_phase: Option<CursorBlinkPhase>,
         effects: c0pl4nd_core::config::EffectsConfig,
         padding: f32,
         bg_alpha: u8,
@@ -1442,15 +1602,23 @@ impl C0pl4ndApp {
             // opens in the default dir. Both `remove` and `take_startup_cwd`
             // CONSUME their entry, so a later re-use of the id can never inherit
             // a stale cwd and later tabs/splits never inherit the CLI flag.
-            let pane_term = match restored_cwds
+            //
+            // Routed through the SHARED `spawn_pane_term` funnel so this arm
+            // honours the active shell profile exactly like the immediate path.
+            // It used to call the default-shell spawns directly, so a deferred
+            // pane under a named profile came back running the WRONG shell.
+            let cwd = restored_cwds
                 .remove(&pane_id)
-                .or_else(crate::cli_cwd::take_startup_cwd)
-            {
-                Some(cwd) => {
-                    PaneTerm::spawn_in_with_term(theme.clone(), cols, rows, Some(term), Some(&cwd))
-                }
-                None => PaneTerm::spawn_with_term(theme.clone(), cols, rows, Some(term)),
-            };
+                .or_else(crate::cli_cwd::take_startup_cwd);
+            let pane_term = spawn_pane_term(
+                theme.clone(),
+                spawn_profile.program,
+                spawn_profile.args,
+                cols,
+                rows,
+                Some(term),
+                cwd.as_deref(),
+            );
             terms.insert(pane_id, pane_term);
         }
 
@@ -1533,6 +1701,7 @@ impl C0pl4ndApp {
                         theme,
                         focused,
                         cursor_cfg,
+                        cursor_blink_phase,
                         effects,
                         pad,
                     );
@@ -2673,6 +2842,20 @@ impl C0pl4ndApp {
             // The configured TERM, read alongside the other LIVE config reads so a
             // deferred-first-spawn pane advertises the same `TERM` as later panes.
             let term = self.config.term.as_str();
+            // The ACTIVE shell profile, borrowed disjointly (separate fields from
+            // `terms` / `grid_tree`) so a DEFERRED first-spawn runs the SAME shell
+            // the immediate `spawn_term_in` path would. It used to always spawn the
+            // platform default, so a restored layout captured under a named profile
+            // came back running the wrong shell.
+            let active_profile = self.shell_profiles.get(self.active_shell);
+            let spawn_profile = SpawnProfile {
+                program: active_profile.and_then(|p| p.program.as_deref()),
+                args: active_profile.map_or(&[][..], |p| p.args.as_slice()),
+            };
+            // Deterministic cursor-blink phase for visual-QA capture. `None` in the
+            // shipping app (and by default in every test), which leaves the phase
+            // free-running off the frame clock exactly as before.
+            let cursor_blink_phase = self.cursor_blink_phase;
             let font_size = self.config.font.size;
             // Read the line-height LIVE from the config so a Settings change
             // reflows the row pitch (and the PTY rows/cursor/highlight) without a
@@ -2733,9 +2916,11 @@ impl C0pl4ndApp {
                     image_textures,
                     theme,
                     term,
+                    spawn_profile,
                     font_size,
                     line_height_px,
                     cursor_cfg,
+                    cursor_blink_phase,
                     effects,
                     padding,
                     bg_alpha,
@@ -4107,6 +4292,205 @@ impl C0pl4ndApp {
         }
     }
 
+    // ---- the close path: guard → action → exit / hide / confirm ----
+    //
+    // Every close surface funnels through `handle_close_request`, which applies
+    // the two `WindowConfig` decisions in order and is the ONLY place that
+    // decides whether the app actually goes away.
+
+    /// Report whether a system-tray icon actually exists.
+    ///
+    /// Called by the shipping binary right after its best-effort `tray::init`
+    /// (the tray is binary-local — it needs the real HWND and the winit message
+    /// loop — so the lib cannot ask it directly). Until something calls this the
+    /// answer is `false`, and close-to-tray degrades to a real exit rather than
+    /// hiding the window behind an icon that does not exist.
+    pub fn set_tray_available(&mut self, available: bool) {
+        self.tray_available = available;
+    }
+
+    /// Whether a system-tray icon exists (see [`Self::set_tray_available`]).
+    pub fn tray_available(&self) -> bool {
+        self.tray_available
+    }
+
+    /// Pin the terminal caret's blink phase for deterministic visual-QA capture,
+    /// or `None` to restore the free-running phase.
+    ///
+    /// Snapshot scenes render a handful of frames and then read the pixels; the
+    /// caret's phase is a function of the frame clock, so the same scene showed a
+    /// painted caret on one run and none on the next. Pin it with
+    /// `Some(CursorBlinkPhase::On)` before capturing and the caret is in the
+    /// frame every time.
+    pub fn set_cursor_blink_phase(&mut self, phase: Option<CursorBlinkPhase>) {
+        self.cursor_blink_phase = phase;
+    }
+
+    /// The pinned cursor-blink phase, if any (see [`Self::set_cursor_blink_phase`]).
+    pub fn cursor_blink_phase(&self) -> Option<CursorBlinkPhase> {
+        self.cursor_blink_phase
+    }
+
+    /// How many panes have a shell command STILL RUNNING — the count
+    /// `WindowConfig::close_guard` decides on.
+    ///
+    /// Reads each pane's OSC 133 marks via [`PaneTerm::has_running_command`]. A
+    /// shell with no prompt integration emits no marks and reports `false`, so
+    /// the guard MISSES rather than nags — the documented and deliberate
+    /// direction (a spurious "something is running" prompt on every close would
+    /// be worse than an occasional silent kill).
+    pub fn busy_pane_count(&self) -> usize {
+        self.terms
+            .values()
+            .filter(|t| t.has_running_command())
+            .count()
+    }
+
+    /// Apply BOTH window-close decisions, in order, and record the result.
+    ///
+    /// 1. `close_guard(busy_panes, already_confirmed)` — is a shell command still
+    ///    running? If so the close is HELD for confirmation. `close_confirmed`
+    ///    (the user's "Close anyway") short-circuits it, so the second pass
+    ///    cannot re-prompt: the commands are still running when they say yes, and
+    ///    without the short-circuit the prompt would loop forever.
+    /// 2. `close_action(tray_available, explicit_quit)` — exit, or hide to the
+    ///    tray? Two of its inputs are load-bearing rather than cosmetic: with NO
+    ///    tray it always exits (a hide would strand the window with no icon to
+    ///    restore it), and an explicit quit always exits (the tray menu's own
+    ///    Quit posts `WM_CLOSE` into this very path, so without it close-to-tray
+    ///    would swallow the one affordance that closes the app).
+    pub(crate) fn close_decision(&mut self, explicit_quit: bool) -> CloseOutcome {
+        let busy = self.busy_pane_count();
+        let outcome = match self.config.window.close_guard(busy, self.close_confirmed) {
+            c0pl4nd_core::config::CloseGuard::Confirm { busy_panes } => {
+                CloseOutcome::Confirm { busy_panes }
+            }
+            c0pl4nd_core::config::CloseGuard::Proceed => {
+                match self
+                    .config
+                    .window
+                    .close_action(self.tray_available, explicit_quit)
+                {
+                    c0pl4nd_core::config::CloseAction::HideToTray => CloseOutcome::HideToTray,
+                    c0pl4nd_core::config::CloseAction::Exit => CloseOutcome::Exit,
+                }
+            }
+        };
+        self.last_close_outcome = Some(outcome);
+        outcome
+    }
+
+    /// Run [`Self::close_decision`] and carry out whatever it decided.
+    ///
+    /// `os_close` marks a request the OS already accepted (the `close_requested`
+    /// viewport flag): those must be CANCELLED when the close does not proceed,
+    /// or winit tears the window down anyway and the guard/tray decision is
+    /// cosmetic. An in-app request (`WindowCmd::Close`, the Alt+F4 the caption
+    /// subclass swallowed) has nothing to cancel.
+    fn handle_close_request(&mut self, ctx: &egui::Context, explicit_quit: bool, os_close: bool) {
+        match self.close_decision(explicit_quit) {
+            CloseOutcome::Confirm { busy_panes } => {
+                self.close_confirm = Some(busy_panes);
+                if os_close {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
+            }
+            CloseOutcome::HideToTray => {
+                self.close_confirm = None;
+                // The close did not happen, so a later one must be able to warn
+                // again about whatever is still running.
+                self.close_confirmed = false;
+                if os_close {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+            CloseOutcome::Exit => {
+                self.close_confirm = None;
+                // Fast clean shutdown: persist config + reap every PTY child so
+                // none orphan, then exit immediately. This skips eframe/wgpu's
+                // slow graceful GPU-device + swapchain + winit-window-destroy
+                // teardown — the real source of the slow-to-close latency.
+                self.prepare_shutdown();
+                self.exit_requests += 1;
+                // Gated on `live_window` so the headless egui_kittest harness —
+                // which has no real viewport — records the exit instead of
+                // killing the test process mid-run.
+                if self.live_window {
+                    std::process::exit(0);
+                }
+            }
+        }
+    }
+
+    /// The most recent close decision, or `None` if no close has been requested.
+    pub fn last_close_outcome(&self) -> Option<CloseOutcome> {
+        self.last_close_outcome
+    }
+
+    /// How many close requests reached the real exit branch.
+    pub fn exit_requests(&self) -> u32 {
+        self.exit_requests
+    }
+
+    /// The busy-pane count the pending close confirmation is showing, or `None`
+    /// when no confirmation is up.
+    pub fn close_confirm_busy_panes(&self) -> Option<usize> {
+        self.close_confirm
+    }
+
+    /// The running-command close confirmation: a small centred modal naming how
+    /// many panes still have a command in flight, with "Close anyway" / "Keep
+    /// working". Closing kills every child outright, so an in-flight
+    /// `cargo build` / `rsync` / migration would otherwise die with no prompt.
+    /// Enter = close anyway, Esc = keep working (so the modal is keyboard-drivable,
+    /// mirroring the paste confirm).
+    fn close_confirm_window(&mut self, ctx: &egui::Context) {
+        let Some(busy_panes) = self.close_confirm else {
+            return;
+        };
+        let (confirm, cancel) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        let mut do_close = confirm;
+        let mut do_cancel = cancel;
+        let win = egui::Window::new("Close while a command is running?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let panes = if busy_panes == 1 { "pane" } else { "panes" };
+                ui.label(format!(
+                    "{busy_panes} {panes} still have a command running. Closing \
+                     ends them immediately."
+                ));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Close anyway (Enter)").clicked() {
+                        do_close = true;
+                    }
+                    if ui.button("Keep working (Esc)").clicked() {
+                        do_cancel = true;
+                    }
+                });
+            });
+        // Exclude the confirm modal from the whole-window motion overlays.
+        self.note_overlay_rect(win.map(|w| w.response.rect));
+        if do_close {
+            // Record the answer, then re-enter the SAME close path: the guard now
+            // short-circuits to Proceed and `close_action` gets its say.
+            self.close_confirmed = true;
+            self.close_confirm = None;
+            self.handle_close_request(ctx, false, false);
+        } else if do_cancel {
+            self.close_confirm = None;
+            self.close_confirmed = false;
+        }
+    }
+
     pub fn prepare_shutdown(&mut self) {
         // 1) Persist config — real-window-only, best-effort (a write failure must
         //    never wedge the close path). Mirrors the settings-handler save.
@@ -4148,27 +4532,34 @@ impl C0pl4ndApp {
     /// top-level path (same compromise the reference app documents).
     #[allow(deprecated)]
     pub fn frame_tick(&mut self, ctx: &egui::Context) {
-        // Fast close for an OS-initiated window-close (Alt+F4, taskbar → Close,
-        // the system menu). The in-app caption-× already takes the fast path
-        // (`WindowCmd::Close` → `prepare_shutdown` + `process::exit(0)`); without
-        // this, an OS close falls through to eframe/wgpu's slow graceful
-        // GPU-device + swapchain + winit-window teardown — the real source of the
-        // slow-to-close latency (the PTY teardown is ~2ms). Mirror the fast path.
-        // Gated on `live_window` so the headless egui_kittest harness, which has
-        // no real viewport, never calls `process::exit` mid-test.
-        if self.live_window && ctx.input(|i| i.viewport().close_requested()) {
-            self.prepare_shutdown();
-            std::process::exit(0);
+        // Fast close for an OS-initiated window-close (taskbar → Close, the system
+        // menu, and the tray menu's Quit — which posts WM_CLOSE). The in-app
+        // caption-× reaches the same decision via `WindowCmd::Close`; without this,
+        // an OS close falls through to eframe/wgpu's slow graceful GPU-device +
+        // swapchain + winit-window teardown — the real source of the slow-to-close
+        // latency (the PTY teardown is ~2ms).
+        //
+        // Routed through `handle_close_request` so the running-command guard and
+        // the close-to-tray preference actually apply here. `os_close = true`
+        // because winit has ALREADY accepted this close and will tear the window
+        // down unless the decision cancels it. `take_explicit_quit` consumes the
+        // flag the tray's Quit sets — the ONLY thing distinguishing that Quit from
+        // an ordinary ✕ by the time it arrives here, and without it close-to-tray
+        // would swallow the one affordance that closes the app.
+        //
+        // No longer gated on `live_window`: the exit itself is (inside
+        // `handle_close_request`), so the headless egui_kittest harness can drive
+        // the real decision without `process::exit` killing the test process.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.handle_close_request(ctx, take_explicit_quit(), true);
         }
         // Alt+F4 close, restored in-app. Removing WS_SYSMENU (to kill the doubled
         // native close button — see `caption_close`) means DefWindowProc no longer
         // translates Alt+F4 into a WM_CLOSE, so egui/winit still delivers the key
-        // event but the OS never turns it into a close_requested. Handle it here
-        // and take the same fast-exit path as the caption-× / OS close. Gated on
-        // `live_window` so the headless harness never calls `process::exit`.
-        if self.live_window && ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::F4)) {
-            self.prepare_shutdown();
-            std::process::exit(0);
+        // event but the OS never turns it into a close_requested — hence
+        // `os_close = false`: there is no accepted OS close to cancel here.
+        if ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::F4)) {
+            self.handle_close_request(ctx, take_explicit_quit(), false);
         }
         // Config HOT RELOAD: pick up an external `config.toml` edit live, with
         // no relaunch. Runs BEFORE the theme/motion ticks below so a reloaded
@@ -4907,16 +5298,13 @@ impl C0pl4ndApp {
                     self.toggle_maximize(ctx, is_max);
                 }
                 WindowCmd::Close => {
-                    // Fast clean shutdown: run the necessary cleanup (persist
-                    // config + reap every PTY child so none orphan), then exit
-                    // immediately. This skips eframe/wgpu's slow graceful
-                    // GPU-device + swapchain + winit-window-destroy teardown —
-                    // the OS reclaims the GPU/window handles instantly — which is
-                    // what made the window slow to close. `prepare_shutdown` does
-                    // the load-bearing work; `process::exit(0)` is safe under
-                    // `#![forbid(unsafe_code)]`.
-                    self.prepare_shutdown();
-                    std::process::exit(0);
+                    // The caption ✕. Same decision funnel as the OS close and
+                    // Alt+F4: the running-command guard may hold it for
+                    // confirmation, and close-to-tray may hide instead of exit.
+                    // `os_close = false` — nothing accepted a close to cancel;
+                    // `explicit_quit = false` — the ✕ means "close this window",
+                    // which is exactly what close-to-tray reinterprets.
+                    self.handle_close_request(ctx, false, false);
                 }
             }
         }
@@ -4956,6 +5344,14 @@ impl C0pl4ndApp {
         //     discards it. Rendered before the tint so the wash sits over it too.
         if self.pending_paste.is_some() {
             self.paste_confirm_window(ctx);
+        }
+
+        // 5c-bis) the running-command close confirmation, if a close was HELD by
+        //     `close_guard`. Enter closes anyway (re-entering the same close path
+        //     with the answer recorded), Esc keeps working. Only ever up when a
+        //     pane reported an unfinished OSC 133 command AND the preference is on.
+        if self.close_confirm.is_some() {
+            self.close_confirm_window(ctx);
         }
 
         // 5d) W1TN3SS opt-in reporting dialogs (float above the chrome). The
@@ -5165,13 +5561,13 @@ impl C0pl4ndApp {
     fn pump_pane_effects(&mut self, ctx: &egui::Context) {
         let mut clipboard: Vec<String> = Vec::new();
         let mut colors: Vec<ColorSet> = Vec::new();
-        let mut notified = false;
+        let mut notifications: Vec<c0pl4nd_core::term::Notification> = Vec::new();
         let mut progress: Vec<c0pl4nd_core::term::osc::Progress> = Vec::new();
         for pane in self.terms.values_mut() {
             let fx = pane.pump_host_effects();
             clipboard.extend(fx.clipboard_writes);
             colors.extend(fx.color_sets);
-            notified |= fx.notified;
+            notifications.extend(fx.notifications);
             progress.extend(fx.progress);
         }
         // OSC 52 → OS clipboard (write only; reads stay default-off in core).
@@ -5188,14 +5584,32 @@ impl C0pl4ndApp {
             }
             ctx.request_repaint();
         }
-        // OSC 9/777 desktop notification while the window is unfocused → request
-        // user attention (taskbar flash). The notification TEXT is never read
-        // here (privacy: it can carry a 2FA code / secret URL — never log it).
-        // The focused-suppression predicate lives in `taskbar` so it is unit-
-        // testable without a live window (`focused == None` at startup is
-        // treated as focused, so a startup notification does not flash).
+        // OSC 9/777 desktop notification while the window is unfocused → a real
+        // OS toast AND the taskbar flash.
+        //
+        // The flash is KEPT alongside the toast deliberately: it is the only
+        // signal on a host where no toast can be shown (non-Windows, notifications
+        // disabled by policy, no installed Start-Menu shortcut carrying the
+        // AUMID), and it is what leaves the taskbar button highlighted after the
+        // toast auto-dismisses. Dropping it would weaken shipped behaviour.
+        //
+        // `notify::plan` owns BOTH decisions so they cannot drift apart, and it
+        // reaches the same focused-suppression predicate this block used to call
+        // directly (`taskbar::should_request_attention`) rather than reimplementing
+        // it — `focused == None` at startup is treated as focused, so an rc-file's
+        // notification during launch neither toasts nor flashes.
+        //
+        // The notification TEXT is read here and shown. That is not a privacy
+        // regression: the old "never surface the text" rule was about LOGGING
+        // (an OSC payload can carry a 2FA code or a secret URL), and nothing on
+        // this path traces, logs, or persists it — `notify::show` builds it into
+        // a toast XML string, hands it to the shell, and drops it.
         let focused = ctx.input(|i| i.viewport().focused);
-        if taskbar::should_request_attention(notified, focused) {
+        let plan = crate::notify::plan(&notifications, focused);
+        if let Some(text) = &plan.toast {
+            crate::notify::show(text);
+        }
+        if plan.flash {
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                 egui::UserAttentionType::Informational,
             ));
@@ -5306,6 +5720,37 @@ impl C0pl4ndApp {
 /// otherwise-quiescent screen. Matches the 530 ms cadence the cursor painter and
 /// the legacy winit shell use.
 const CURSOR_BLINK_HALF_PERIOD_MS: u64 = 530;
+
+/// Whether the terminal caret is PAINTED this frame.
+///
+/// * `forced` — the visual-QA phase pin ([`C0pl4ndApp::set_cursor_blink_phase`]).
+///   When set it wins outright, which is the whole point: the free-running form
+///   below made a snapshot scene capture the caret solid on one run and gone on
+///   the next, so the PNGs could not serve the "cursor placement" eyeball their
+///   module doc claims. `None` — the shipping app's only state — leaves the
+///   behaviour exactly as it was.
+/// * Otherwise the caret blinks only on the FOCUSED pane and only when
+///   configured to; an unfocused or blink-disabled caret is steady-on (it is
+///   drawn as a hollow outline instead, so it must not also vanish).
+///
+/// Pure, so the phase wiring is unit-testable without a frame.
+fn cursor_blink_on(
+    forced: Option<CursorBlinkPhase>,
+    blink: bool,
+    focused: bool,
+    time_secs: f64,
+) -> bool {
+    if let Some(phase) = forced {
+        return phase == CursorBlinkPhase::On;
+    }
+    if !(blink && focused) {
+        return true;
+    }
+    // Full period = two half-periods, tied to the same constant the idle repaint
+    // tick schedules from, so the caret cannot toggle at a rate nothing repaints.
+    let period = 2.0 * (CURSOR_BLINK_HALF_PERIOD_MS as f64) / 1000.0;
+    (time_secs / period).fract() < 0.5
+}
 
 /// Frames the atlas-warmup gate holds the grid's glyphs off (and GPU-fences in
 /// `ui`) after a (re)warm, so the warmed atlas is uploaded + resident before any
@@ -5826,6 +6271,9 @@ fn paint_grid_native(
     theme: &c0pl4nd_core::Theme,
     focused: bool,
     cursor_cfg: c0pl4nd_core::config::CursorConfig,
+    // Deterministic cursor-blink phase override for visual-QA capture; `None`
+    // leaves the caret's phase free-running off the frame clock.
+    cursor_blink_phase: Option<CursorBlinkPhase>,
     effects: c0pl4nd_core::config::EffectsConfig,
     padding: f32,
 ) {
@@ -6052,14 +6500,14 @@ fn paint_grid_native(
         let cell = egui::Rect::from_min_size(cell_min, egui::vec2(cw, ch));
         let cur = c0pl4nd_core::theme::parse_hex(&theme.cursor).unwrap_or((0, 255, 144));
         let col32 = egui::Color32::from_rgb(cur.0, cur.1, cur.2);
-        // Blink only on the focused pane (and only if configured). The live
-        // window repaints every frame, so the phase animates without an explicit
-        // repaint request; headless tests see a steady ON frame.
-        let on = if cursor_cfg.blink && focused {
-            (painter.ctx().input(|i| i.time) / 1.06).fract() < 0.5
-        } else {
-            true
-        };
+        // Blink only on the focused pane (and only if configured), with an
+        // optional pinned phase for deterministic visual-QA capture.
+        let on = cursor_blink_on(
+            cursor_blink_phase,
+            cursor_cfg.blink,
+            focused,
+            painter.ctx().input(|i| i.time),
+        );
         if on {
             match cursor_cfg.style {
                 c0pl4nd_core::config::CursorStyle::Block => {
@@ -6328,6 +6776,9 @@ mod resize_tests {
     }
 }
 
+#[cfg(test)]
+#[path = "close_path_tests.rs"]
+mod close_path_tests;
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;

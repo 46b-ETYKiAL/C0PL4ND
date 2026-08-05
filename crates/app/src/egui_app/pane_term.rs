@@ -26,7 +26,7 @@ use std::rc::Rc;
 
 use c0pl4nd_core::term::{
     encode_key, encode_key_kitty, ColorSet, KeyEventKind, KeyModifiers, LogicalKey, MouseButton,
-    MouseEventKind, MouseMode, MouseModifiers, Progress,
+    MouseEventKind, MouseMode, MouseModifiers, Notification, Progress,
 };
 use c0pl4nd_core::{Session, Theme};
 
@@ -342,11 +342,18 @@ pub struct HostEffects {
     /// OSC 4 / 10 / 11 / 12 / 104 color set/reset requests. The app applies each
     /// to its live theme and repaints.
     pub color_sets: Vec<ColorSet>,
-    /// `true` if a desktop notification (OSC 9 / OSC 777) fired this drain. The
-    /// app requests user attention (taskbar flash) when the window is unfocused.
-    /// The notification TEXT is deliberately not surfaced — it can carry 2FA
-    /// codes / secret URLs and must never be logged (privacy).
-    pub notified: bool,
+    /// Desktop notifications (OSC 9 / OSC 777) drained this frame, in emit
+    /// order. The app raises the LAST one as a real OS toast and flashes the
+    /// taskbar, both while the window is unfocused (`crate::notify::plan`).
+    ///
+    /// This used to be a bare `notified: bool` that threw the text away, on the
+    /// stated ground that a payload can carry a 2FA code or a secret URL. That
+    /// constraint is about **logging**, not about **showing**: showing it to the
+    /// user at the moment they asked for it is the entire point of OSC 9, and
+    /// every peer emulator does it. Nothing here or downstream traces, logs, or
+    /// persists the payload — it is built into a toast XML string, handed to the
+    /// shell, and dropped (see `crate::notify`).
+    pub notifications: Vec<Notification>,
     /// `OSC 9 ; 4` taskbar-progress reports (C26) drained this frame, in emit
     /// order. The app drives the Windows taskbar-button progress segment from
     /// the LATEST one (`super::taskbar`). Empty in the common case; a build tool
@@ -585,7 +592,12 @@ impl PaneTerm {
     /// error label, never a panic — identical to
     /// [`spawn_program`](Self::spawn_program), which now delegates here so the
     /// two can never drift apart.
-    #[allow(dead_code)]
+    ///
+    /// WIRED: `egui_app::spawn_pane_term` — the ONE spawn funnel both
+    /// `spawn_term_in` (the split / new-tab / reopen path) and the deferred
+    /// first-spawn in `render_pane_body` go through — calls this for every named
+    /// profile. The `allow(dead_code)` it carried while that call site was
+    /// outside the owning change is gone.
     pub fn spawn_program_in(
         theme: Theme,
         program: &str,
@@ -762,9 +774,11 @@ impl PaneTerm {
                 out.clipboard_writes.push(std::mem::take(&mut cw.text));
             }
             out.color_sets = term.take_color_sets();
-            if !term.take_notifications().is_empty() {
-                out.notified = true;
-            }
+            // OSC 9 / OSC 777 → surfaced WITH their text, so `crate::notify` can
+            // raise a real OS toast. The text used to be fetched here and thrown
+            // away (only its length was tested, into a `notified: bool`), which
+            // made the whole notification a taskbar flash carrying no message.
+            out.notifications = term.take_notifications();
             // OSC 9 ; 4 taskbar progress → surfaced for the app's taskbar wiring
             // (`super::taskbar`) to drive the Windows taskbar-button segment.
             // Draining here also keeps the queue from growing unbounded while a
@@ -1247,12 +1261,14 @@ impl PaneTerm {
     /// failed-spawn pane, a dead shell, or a poisoned lock (the close path must
     /// never be blocked by an unreadable pane).
     ///
-    /// `allow(dead_code)`: the consuming branch is the close path in
-    /// `egui_app/mod.rs` (`prepare_shutdown` / `WindowCmd::Close` / the
-    /// `close_requested` + Alt+F4 fast-exits), which is outside this change's
-    /// file ownership — same deliberate accessor-ahead-of-its-call-site pattern
-    /// as [`spawn_program`](Self::spawn_program) and [`is_alive`](Self::is_alive).
-    #[allow(dead_code)]
+    /// WIRED: the consuming branch is the close path in `egui_app/mod.rs` —
+    /// [`C0pl4ndApp::busy_pane_count`](super::C0pl4ndApp::busy_pane_count) counts
+    /// the panes reporting `true` and hands that count to
+    /// `config.window.close_guard`, which every close path
+    /// (`close_requested` / Alt+F4 / `WindowCmd::Close`) routes through. The
+    /// `allow(dead_code)` this carried while that call site was outside the
+    /// owning change is therefore gone: a future edit that unwires the count now
+    /// fails the build here instead of silently going dormant.
     pub fn has_running_command(&self) -> bool {
         let Some(session) = self.session.as_ref() else {
             return false;
@@ -2194,7 +2210,15 @@ mod tests {
             }],
             "OSC 4 set must surface as an indexed color set"
         );
-        assert!(fx.notified, "OSC 9 must mark a notification as received");
+        assert_eq!(
+            fx.notifications,
+            vec![Notification {
+                title: String::new(),
+                body: "Build complete".to_string(),
+            }],
+            "OSC 9 must surface the notification WITH its text — a bare \
+             `notified` flag cannot be turned into a toast"
+        );
         assert_eq!(
             fx.progress,
             vec![Progress {

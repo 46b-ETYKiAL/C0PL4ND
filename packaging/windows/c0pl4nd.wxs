@@ -192,6 +192,23 @@
       <ComponentRef Id="MainExecutable" />
       <ComponentRef Id="ApplicationShortcut" />
       <ComponentRef Id="ShellOpenHereVerb" />
+      <!--
+        License texts. MANDATORY, not decoration: C0PL4ND include_bytes!-embeds
+        22 typefaces, and OFL-1.1 s2 requires the license text to accompany
+        EVERY copy. A font compiled into the executable cannot self-serve its
+        own license, so if the installer does not place the text on disk it is
+        nowhere on the user's machine. Until this ref existed this package
+        carried exactly ONE File - c0pl4nd.exe.
+
+        The group is NOT hand-authored. `heat` harvests the tree that
+        packaging/collect-licenses.sh stages, so adding or removing a font
+        changes the package without anyone remembering to edit this file. A
+        hand-written list of 22 font directories is precisely the thing that
+        rots silently. The collector fails closed when a bundled font has no
+        license text, so an incomplete tree fails the build rather than shipping
+        a package that quietly under-delivers.
+      -->
+      <ComponentGroupRef Id="LicenseComponents" />
     </Feature>
 
     <!-- Add/Remove Programs metadata + branded icon. -->

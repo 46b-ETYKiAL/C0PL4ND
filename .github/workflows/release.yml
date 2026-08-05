@@ -571,8 +571,21 @@ jobs:
         with:
           name: c0pl4nd-x86_64-pc-windows-msvc
           path: winbin
-      - name: Stage the released binary as the MSI payload
+      - name: Assemble payload (binary + licenses)
         shell: bash
+        # License delivery is MANDATORY here for the same reason it is in
+        # the native-CRT installer job. C0PL4ND include_bytes!-embeds 22
+        # typefaces; OFL-1.1 s2 requires the license text to accompany EVERY
+        # copy, and a font compiled into the .exe cannot serve its own
+        # license. This package previously carried ONE file - c0pl4nd.exe -
+        # so an MSI install put 22 fonts on disk with the license text
+        # nowhere on the machine.
+        #
+        # The collector exits non-zero (failing the job) when any bundled
+        # font has no license text, so an unlicensed MSI cannot be produced.
+        # It stages into its OWN directory rather than payload/ so `heat` can
+        # harvest the license tree without re-harvesting c0pl4nd.exe, which
+        # c0pl4nd.wxs already declares.
         run: |
           set -euo pipefail
           zip="$(find winbin -name '*.zip' | head -1)"
@@ -583,6 +596,10 @@ jobs:
           mkdir -p payload
           cp "$exe" payload/
           ls -la payload/c0pl4nd.exe
+          sh packaging/collect-licenses.sh "${PWD}" licstage
+          n=$(find licstage/licenses/fonts -type f | wc -l)
+          echo "font license files staged: $n"
+          [ "$n" -gt 0 ] || { echo "::error::no font licenses staged"; exit 1; }
       - name: Install WiX 3.14 (pinned + checksum-verified)
         shell: bash
         run: |
@@ -599,7 +616,7 @@ jobs:
             echo "::error::no archive extractor available (tried unzip, 7z)"
             exit 1
           fi
-          for t in candle.exe light.exe dark.exe; do
+          for t in candle.exe light.exe dark.exe heat.exe; do
             [ -f "$RUNNER_TEMP/wix/$t" ] || { echo "::error::WiX archive did not contain $t"; exit 1; }
           done
       - name: Compile the installer source (candle)
@@ -618,10 +635,33 @@ jobs:
           # candle runs from the repo root, which is what the .wxs's
           # packaging\windows\... SourceFile/Value paths are relative to.
           BIN_DIR="$(pwd -W)/payload"
+          LIC_DIR="$(pwd -W)/licstage"
+          # Harvest the staged license tree into a WiX fragment. Generated,
+          # not hand-authored: a hand-written list of 22 font directories
+          # rots the moment a font is added or dropped, and the whole point
+          # of the collector is that the set is dynamic. The XSL adds the
+          # RemoveFolder rows heat never emits, so an uninstall does not
+          # leave the licenses tree behind as empty directories under
+          # Program Files.
+          "$RUNNER_TEMP/wix/heat.exe" dir "$LIC_DIR" -nologo \
+            -cg LicenseComponents -dr INSTALLFOLDER \
+            -ag -srd -sfrag -var var.LicenseStageDir \
+            -t packaging/windows/license-harvest.xsl \
+            -out licenses.wxs
+          # Non-vacuity: a harvest that produced nothing would compile and
+          # link perfectly and ship an MSI with no license texts at all --
+          # the exact silent under-delivery this step exists to prevent.
+          harvested=$(grep -c '<File ' licenses.wxs || true)
+          echo "harvested license files: $harvested"
+          [ "$harvested" -ge 23 ] || { echo "::error::heat harvested only $harvested license file(s); expected >= 23 (22 fonts + top-level docs)"; exit 1; }
           "$RUNNER_TEMP/wix/candle.exe" -nologo -arch x64 \
             -dVersion="$VER" -dCargoTargetBinDir="$BIN_DIR" \
             -out c0pl4nd.wixobj packaging/windows/c0pl4nd.wxs
           [ -s c0pl4nd.wixobj ] || { echo "::error::candle reported success but produced no .wixobj"; exit 1; }
+          "$RUNNER_TEMP/wix/candle.exe" -nologo -arch x64 \
+            -dLicenseStageDir="$LIC_DIR" \
+            -out licenses.wixobj licenses.wxs
+          [ -s licenses.wixobj ] || { echo "::error::candle produced no .wixobj for the license fragment"; exit 1; }
       - name: Link the installer (light, with ICE validation)
         shell: bash
         # ICE validation is ON and NOTHING is suppressed. Unlike SCR1B3 — which
@@ -644,7 +684,7 @@ jobs:
           set -euo pipefail
           "$RUNNER_TEMP/wix/light.exe" -nologo \
             -ext WixUIExtension -ext WixUtilExtension \
-            -out c0pl4nd-installer.msi c0pl4nd.wixobj
+            -out c0pl4nd-installer.msi c0pl4nd.wixobj licenses.wixobj
           [ -f c0pl4nd-installer.msi ] || { echo "::error::light reported success but produced no .msi"; exit 1; }
           # light writes the .msi BEFORE ICE validation runs, so "the file
           # exists" is not by itself proof the link succeeded -- `set -e` on
@@ -679,6 +719,18 @@ jobs:
           verbs=$(grep -c 'C0pl4ndOpenHere' decompiled.wxs || true)
           echo "shell-verb registry rows in the compiled MSI: $verbs"
           [ "$verbs" -ge 8 ] || { echo "::error::the 'Open C0PL4ND here' shell verb did not make it into the package (found $verbs rows)"; exit 1; }
+          # License delivery, asserted against the BUILT package rather than
+          # the staging directory. A staged tree only proves the collector
+          # ran; the File table is what proves the texts actually SHIP. This
+          # package carried exactly one File row (c0pl4nd.exe) before the
+          # license components existed, so this is the check that would have
+          # caught it.
+          licfiles=$(grep -cE '<File [^>]*Name="(OFL|LICENSE|UFL)[^"]*"' decompiled.wxs || true)
+          echo "license files in the compiled MSI: $licfiles"
+          [ "$licfiles" -ge 22 ] || { echo "::error::the compiled MSI carries only $licfiles font license file(s) (expected >= 22) -- OFL-1.1 s2 requires the text to accompany every copy."; exit 1; }
+          for doc in LICENSE-MIT THIRD-PARTY-LICENSES.md; do
+            grep -q "Name=\"$doc\"" decompiled.wxs || { echo "::error::the compiled MSI does not carry $doc"; exit 1; }
+          done
       - name: Name + checksum the release asset
         shell: bash
         env:

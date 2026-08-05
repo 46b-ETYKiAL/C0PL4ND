@@ -71,6 +71,20 @@ ARTIFACT_MARKERS = (
     "appimagetool",
     "hdiutil create",
     "build_native_installer",
+    # The MSI linker. `light` is what turns the .wixobj set into the shipped
+    # .msi, so the step that runs it is an artifact-producing step exactly
+    # like `tar -czf` or `hdiutil create`. Without this entry the windows-msi
+    # job was INVISIBLE to check 3: the gate reported OK over four steps and
+    # the MSI was not one of them, while that MSI carried a single File row
+    # (the .exe) and no license text at all. A gate that cannot see an
+    # artifact cannot protect it.
+    #
+    # Matched as "wix/light.exe" rather than bare "light.exe" on purpose: the
+    # WiX install step contains the line `for t in candle.exe light.exe
+    # dark.exe heat.exe`, which a bare needle would match, wrongly marking a
+    # download-and-verify step as artifact-producing and demanding a
+    # collector call in it.
+    "wix/light.exe",
 )
 
 # NOTE: there is deliberately NO step-name exemption list here.

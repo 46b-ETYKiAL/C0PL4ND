@@ -737,7 +737,7 @@ mod tests {
         // Every SHIPPED action must have a real label, i.e. one that is not just
         // the raw field name echoed back.
         for (name, _) in Keybindings::default().entries() {
-            let label = action_label(&name);
+            let label = action_label(name);
             assert!(!label.is_empty(), "{name} has a blank label");
             assert_ne!(
                 label, name,

@@ -630,6 +630,123 @@ mod tests {
         }
     }
 
+    /// Every DIGIT and NAMED-KEY arm of `canonical_key_token`, with each alias
+    /// that must fold onto it.
+    ///
+    /// The punctuation arms above are covered by their own table; these are the
+    /// rest, and they were the surviving mutants. The reason they survive a
+    /// spot-check is the `_ =>` fallback: it returns the input lowercased, so
+    /// `canonical_key_token("pagedown") == "pagedown"` holds with the whole
+    /// `"pgdn" | "pgdown" | "pagedown"` arm deleted. Only the SHORT spellings —
+    /// `pgdn`, `del`, `ins`, `return`, `up` — actually prove the arm exists,
+    /// and only the digits prove the `num*` prefix is applied at all.
+    const NAMED_KEY_ARMS: [(&str, &[&str]); 19] = [
+        ("num0", &["0"]),
+        ("num1", &["1"]),
+        ("num2", &["2"]),
+        ("num3", &["3"]),
+        ("num4", &["4"]),
+        ("num5", &["5"]),
+        ("num6", &["6"]),
+        ("num7", &["7"]),
+        ("num8", &["8"]),
+        ("num9", &["9"]),
+        ("escape", &["esc", "escape"]),
+        ("enter", &["return", "enter"]),
+        ("delete", &["del", "delete"]),
+        ("insert", &["ins", "insert"]),
+        ("pageup", &["pgup", "pageup"]),
+        ("pagedown", &["pgdn", "pgdown", "pagedown"]),
+        ("arrowup", &["up", "arrowup"]),
+        ("arrowdown", &["down", "arrowdown"]),
+        ("arrowleft", &["left", "arrowleft"]),
+    ];
+
+    #[test]
+    fn every_digit_and_named_key_alias_folds_onto_its_egui_name() {
+        for (canonical, aliases) in NAMED_KEY_ARMS {
+            for alias in aliases {
+                assert_eq!(
+                    canonical_key_token(alias),
+                    canonical,
+                    "{alias:?} must canonicalize to {canonical:?}"
+                );
+                assert_eq!(
+                    canonical_key_token(&alias.to_ascii_uppercase()),
+                    canonical,
+                    "{alias:?} must canonicalize to {canonical:?} in any case"
+                );
+                assert_eq!(
+                    canonical_key_token(&format!("  {alias} ")),
+                    canonical,
+                    "{alias:?} must canonicalize to {canonical:?} when padded"
+                );
+            }
+        }
+        // `right` is the one arm the table above cannot hold (a 20th entry would
+        // exceed the array's declared length); assert it directly so no arrow is
+        // left uncovered.
+        assert_eq!(canonical_key_token("right"), "arrowright");
+        assert_eq!(canonical_key_token("arrowright"), "arrowright");
+
+        // A digit that is NOT in the table must still pass through unprefixed,
+        // so the `num*` assertions above cannot be satisfied by a blanket
+        // "prefix every short token with num".
+        assert_eq!(canonical_key_token("a"), "a");
+        assert_eq!(canonical_key_token("f1"), "f1");
+    }
+
+    /// `alt`, `option` and `opt` must all set the SAME modifier.
+    ///
+    /// `opt`/`option` are the macOS spellings; a mutant dropping either arm
+    /// sends them to the `_ =>` key branch, where they become the chord's KEY.
+    /// The binding then looks correct in the TOML and never fires — and because
+    /// the key differs, `validate` does not report it as a conflict either.
+    #[test]
+    fn every_alt_spelling_sets_the_alt_modifier() {
+        let base = Chord::parse("alt+t").expect("alt+t parses");
+        assert!(base.alt && !base.cmd && !base.shift);
+        assert_eq!(base.key, "t");
+        for spelling in ["alt", "option", "opt"] {
+            let c = Chord::parse(&format!("{spelling}+t"))
+                .unwrap_or_else(|| panic!("{spelling}+t must parse"));
+            assert_eq!(
+                c.canonical(),
+                base.canonical(),
+                "{spelling:?} must set the ALT modifier, not become the key"
+            );
+            assert_eq!(c.key, "t", "{spelling:?} must not be taken as the key");
+        }
+    }
+
+    /// `action_label` maps known actions and falls back to the RAW name.
+    ///
+    /// The fallback is what stops a newly-added binding rendering blank in
+    /// settings, and it is exactly what a mutant returning `""` (or any fixed
+    /// string) breaks — invisibly, because every mapped action still looks fine.
+    #[test]
+    fn action_label_maps_known_actions_and_falls_back_to_the_raw_name() {
+        assert_eq!(action_label("copy"), "Copy selection");
+        assert_eq!(action_label("reopen_closed_tab"), "Reopen closed pane");
+        // Unknown -> the raw name, never blank and never a placeholder.
+        assert_eq!(action_label("a_brand_new_action"), "a_brand_new_action");
+        assert!(
+            !action_label("a_brand_new_action").is_empty(),
+            "an unmapped action must never render blank"
+        );
+        // Every SHIPPED action must have a real label, i.e. one that is not just
+        // the raw field name echoed back.
+        for (name, _) in Keybindings::default().entries() {
+            let label = action_label(&name);
+            assert!(!label.is_empty(), "{name} has a blank label");
+            assert_ne!(
+                label, name,
+                "{name} is a shipped binding and must have a human-readable \
+                 label, not the raw field name"
+            );
+        }
+    }
+
     #[test]
     fn punctuation_chords_parse_match_and_agree_across_spellings() {
         // End-to-end for the bindings a user actually writes (`mod+/`, `mod+;`):

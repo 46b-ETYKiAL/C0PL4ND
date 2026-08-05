@@ -233,11 +233,17 @@ fn the_sibling_pixel_file_uses_the_shared_config_isolation() {
         "it must not define its own isolation either — a copy cannot inherit the \
          fresh-dir-per-harness fix"
     );
+    // Matched on the `mod common;` + `use common::…` pair rather than a fully
+    // qualified call, so merging the import (`use common::{a, b};`) does not
+    // read as "the shared helper is gone".
     assert_eq!(
-        SRC.matches(concat!("common::isolate_config", "_dir"))
-            .count(),
+        SRC.matches("mod common;").count(),
         1,
-        "it must import the SHARED common::isolate_config_dir exactly once"
+        "it must pull in the shared tests/common module"
+    );
+    assert!(
+        SRC.contains(concat!("isolate_config", "_dir")),
+        "it must use the SHARED isolate_config_dir"
     );
 }
 
@@ -253,27 +259,50 @@ fn the_sibling_pixel_file_uses_the_shared_config_isolation() {
 /// invoked from the single harness constructor, and that no scene grew its own
 /// "wait until the shell said something" loop, keeps that checkable instead of a
 /// comment.
+/// It checks BOTH pixel files. It used to read only its own — while its failure
+/// message named `px_harness`, which is the SIBLING's constructor, not this
+/// file's (`build_harness`). So the guard was written for the sibling and
+/// pointed at the wrong source: this file had already been fixed and reported
+/// clean, while `qol_pixel_regressions.rs` still ran the replaced
+/// first-sighting poll and the guard could not see it.
+///
+/// That miss was invisible in CI for a second reason: CI runs these under
+/// nextest, one process per test, so the cross-scene timing the wait protects
+/// against cannot occur there. The suite was green for a reason unrelated to
+/// correctness, and only the LOCAL `cargo test` path — the one a human uses to
+/// produce PNGs to look at — was exposed.
 #[test]
 fn no_scene_can_bypass_the_shell_quiescence_wait() {
-    const SRC: &str = include_str!("qa_wide_glyph_snapshot.rs");
     // Split so this test's own needles do not count as call sites.
-    let quiescent_sites = SRC.matches(concat!("await_shell", "_quiescent(")).count();
-    let first_sighting_sites = SRC
-        .matches(concat!("test_focused", "_buffer_text()"))
-        .count();
-    assert_eq!(
-        quiescent_sites, 1,
-        "every pixel scene must reach its harness through the ONE px_harness \
-         constructor, which waits for the shell to go quiet exactly once; found \
-         {quiescent_sites} call sites"
-    );
-    assert_eq!(
-        first_sighting_sites, 0,
-        "no scene may poll the shell's grid text itself: that is the \
-         first-sighting wait whose mid-banner return let late shell output wipe \
-         the fed row. Wait via common::await_shell_quiescent instead; found \
-         {first_sighting_sites} direct poll(s)"
-    );
+    let quiescent = concat!("await_shell", "_quiescent(");
+    let first_sighting = concat!("test_focused", "_buffer_text()");
+    for (name, src) in [
+        (
+            "qa_wide_glyph_snapshot.rs",
+            include_str!("qa_wide_glyph_snapshot.rs"),
+        ),
+        (
+            "qol_pixel_regressions.rs",
+            include_str!("qol_pixel_regressions.rs"),
+        ),
+    ] {
+        assert_eq!(
+            src.matches(quiescent).count(),
+            1,
+            "{name}: every pixel scene must reach its harness through that \
+             file's ONE harness constructor, which waits for the shell to go \
+             QUIET exactly once"
+        );
+        assert_eq!(
+            src.matches(first_sighting).count(),
+            0,
+            "{name}: no scene may poll the shell's grid text itself. That is the \
+             first-sighting wait, which returns mid-banner: the rest of the \
+             banner then lands after the test's ESC[2J and wipes the row under \
+             test, so the assertion measures a race instead of the paint path. \
+             Wait via common::await_shell_quiescent instead"
+        );
+    }
 }
 
 /// Render the current frame, ASSERT it is a real image, and save it to

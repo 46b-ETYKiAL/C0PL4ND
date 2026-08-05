@@ -63,7 +63,6 @@
 //! the colour being counted, so "some pixel happened to be orange" cannot pass.
 
 use c0pl4nd::egui_app;
-use std::time::{Duration, Instant};
 
 use egui_kittest::Harness;
 
@@ -78,23 +77,7 @@ const CAL_BG: [u8; 3] = [173, 41, 209];
 
 mod common;
 
-use common::isolate_config_dir;
-
-/// Assert this host can actually render, with an ACTIONABLE message if it
-/// cannot. It must NEVER skip: every test here is `#[ignore]`d, so it runs only
-/// when something explicitly asked for it, and reporting green without a frame
-/// would assert nothing at all.
-fn require_gpu() {
-    let backends =
-        wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY | wgpu::Backends::GL);
-    let adapters = pollster::block_on(wgpu::Instance::default().enumerate_adapters(backends));
-    assert!(
-        !adapters.is_empty(),
-        "no wgpu adapter for backends {backends:?} — these pixel tests cannot \
-         render. On a headless Linux runner: `apt-get install -y \
-         mesa-vulkan-drivers` (lavapipe). Override with WGPU_BACKEND=<vulkan|gl>."
-    );
-}
+use common::{isolate_config_dir, require_gpu};
 
 /// THE harness for this file: the real app at 1 physical pixel per point with
 /// every effect that would tint, fade or overlay the grid turned OFF.
@@ -129,28 +112,18 @@ fn px_harness() -> Harness<'static, egui_app::C0pl4ndApp> {
             app.set_cursor_blink_phase(Some(egui_app::CursorBlinkPhase::On));
             app
         });
-    // Wait out the deferred first-frame PTY spawn and the shell banner, so a
-    // late line of startup output cannot land on top of the fed content
-    // mid-assert (that race is measurable: it silently blanks the fed row).
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        h.step();
-        if h.state()
-            .test_focused_buffer_text()
-            .is_some_and(|t| !t.trim().is_empty())
-        {
-            for _ in 0..10 {
-                h.step();
-            }
-            return h;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!(
-        "the focused pane never produced startup output — a still-booting shell \
-         can overwrite the fed grid mid-render, so these pixel asserts would be \
-         measuring a race rather than the paint path"
-    );
+    // Wait for the shell to go QUIET, not merely to have spoken.
+    //
+    // This used to return on the shell's FIRST non-empty read, which is
+    // mid-banner: the rest of the banner then arrived after a test's ESC[2J +
+    // payload and wiped the row it had just fed, and the assertion measured an
+    // empty grid. Every scene here clears the grid and feeds its own content, so
+    // the precondition it needs is that the grid BELONGS to the test.
+    //
+    // Shared with the sibling snapshot file rather than copied — a local copy
+    // is how this file kept the replaced wait after the sibling was fixed.
+    common::await_shell_quiescent(&mut h, "px_harness");
+    h
 }
 
 /// The set of pixels exactly matching one colour.

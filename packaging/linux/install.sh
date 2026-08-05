@@ -147,8 +147,23 @@ stage="${BIN}-${version}-${target}"
 archive="${stage}.tar.gz"
 base_url="https://github.com/${REPO}/releases/download/${version}"
 archive_url="${base_url}/${archive}"
-checksum_url="${archive_url}.sha256"
-signature_url="${archive_url}.minisig"
+# Releases publish ONE signed aggregate checksum manifest (SHA256SUMS +
+# SHA256SUMS.minisig) instead of a per-artifact `.sha256` / `.minisig` pair.
+#
+# THIS SCRIPT WAS BROKEN BY THAT CHANGE AND COULD NOT INSTALL ANY RELEASE FROM
+# THE FIRST ONE THAT PRUNED THEM. It fetched `${archive}.sha256` and
+# `${archive}.minisig`; the release workflow's "Prune redundant signature
+# sidecars before publish" step deletes both before upload, so `download` got a
+# 404 on the checksum and the `.minisig` fetch hit its explicit
+# `err "no .minisig signature published ... refusing to install an unverified
+# binary"`. Every `curl | sh` install aborted.
+#
+# Binding to SHA256SUMS is also strictly stronger than what this script did
+# before: the old per-artifact `.sha256` was UNSIGNED, so the checksum gate it
+# fed had no authenticity value (see the header note). SHA256SUMS is signed with
+# the SAME key as the release, so its digests are AUTHENTICATED.
+checksums_url="${base_url}/SHA256SUMS"
+checksums_sig_url="${base_url}/SHA256SUMS.minisig"
 
 # --- work in a temp dir ---------------------------------------------------
 tmp="$(mktemp -d 2>/dev/null || mktemp -d -t c0pl4nd)"
@@ -159,18 +174,40 @@ trap "rm -rf \"${tmp}\"" EXIT INT TERM
 info "Downloading ${archive_url}"
 download "${archive_url}" "${tmp}/${archive}"
 
-info "Downloading checksum"
-download "${checksum_url}" "${tmp}/${archive}.sha256"
+info "Downloading checksum manifest"
+download "${checksums_url}" "${tmp}/SHA256SUMS" \
+	|| err "no SHA256SUMS published in release ${version} — refusing to install an unverified binary"
+[ -s "${tmp}/SHA256SUMS" ] || err "checksum manifest is empty"
 
-info "Downloading signature"
-download "${signature_url}" "${tmp}/${archive}.minisig" \
-	|| err "no .minisig signature published for ${archive} — refusing to install an unverified binary"
-[ -s "${tmp}/${archive}.minisig" ] \
+info "Downloading checksum-manifest signature"
+download "${checksums_sig_url}" "${tmp}/SHA256SUMS.minisig" \
+	|| err "no SHA256SUMS.minisig published — refusing to trust an unsigned checksum manifest"
+[ -s "${tmp}/SHA256SUMS.minisig" ] \
 	|| err "signature file is empty — refusing to install an unverified binary"
 
-# --- verify checksum (integrity / corruption) -----------------------------
-expected="$(awk '{print $1}' "${tmp}/${archive}.sha256")"
-[ -n "${expected}" ] || err "checksum file is empty or malformed"
+# --- verify the checksum manifest's signature (authenticity) ---------------
+# The signature is checked against the key embedded above, NOT against a key
+# fetched from the download host. This is the control that actually detects a
+# malicious or substituted artifact. It runs BEFORE any digest is read out of
+# SHA256SUMS, so the digest we compare against is an AUTHENTICATED value.
+keyfile="${tmp}/minisign.pub"
+printf 'untrusted comment: minisign public key: %s\n%s\n' "${PUBKEY_ID}" "${PUBKEY}" > "${keyfile}"
+
+if [ "${VERIFIER}" = "minisign" ]; then
+	minisign -V -p "${keyfile}" -x "${tmp}/SHA256SUMS.minisig" -m "${tmp}/SHA256SUMS" >/dev/null 2>&1 \
+		|| err "SIGNATURE VERIFICATION FAILED for SHA256SUMS — the checksum manifest is not authentic. Aborting."
+else
+	rsign verify -p "${keyfile}" -x "${tmp}/SHA256SUMS.minisig" "${tmp}/SHA256SUMS" >/dev/null 2>&1 \
+		|| err "SIGNATURE VERIFICATION FAILED for SHA256SUMS — the checksum manifest is not authentic. Aborting."
+fi
+info "Checksum manifest signature verified (${VERIFIER}, key ${PUBKEY_ID})."
+
+# --- verify the archive against the SIGNED digest --------------------------
+# Exact match on the filename field (either the `sha256sum` two-space form or
+# the `*name` binary-mode form), never a substring grep.
+expected="$(awk -v a="${archive}" '$2 == a || $2 == "*" a { print $1; exit }' "${tmp}/SHA256SUMS")"
+[ -n "${expected}" ] \
+	|| err "SHA256SUMS has no entry for ${archive} — refusing to install an unverified binary"
 
 actual=""
 if command -v sha256sum >/dev/null 2>&1; then
@@ -184,23 +221,7 @@ fi
 if [ "${expected}" != "${actual}" ]; then
 	err "checksum mismatch: expected ${expected}, got ${actual}"
 fi
-info "Checksum verified."
-
-# --- verify signature (authenticity) --------------------------------------
-# The signature is checked against the key embedded above, NOT against a key
-# fetched from the download host. This is the control that actually detects a
-# malicious or substituted artifact.
-keyfile="${tmp}/minisign.pub"
-printf 'untrusted comment: minisign public key: %s\n%s\n' "${PUBKEY_ID}" "${PUBKEY}" > "${keyfile}"
-
-if [ "${VERIFIER}" = "minisign" ]; then
-	minisign -V -p "${keyfile}" -x "${tmp}/${archive}.minisig" -m "${tmp}/${archive}" >/dev/null 2>&1 \
-		|| err "SIGNATURE VERIFICATION FAILED for ${archive} — the download is not authentic. Aborting."
-else
-	rsign verify -p "${keyfile}" -x "${tmp}/${archive}.minisig" "${tmp}/${archive}" >/dev/null 2>&1 \
-		|| err "SIGNATURE VERIFICATION FAILED for ${archive} — the download is not authentic. Aborting."
-fi
-info "Signature verified (${VERIFIER}, key ${PUBKEY_ID})."
+info "Archive verified against the signed checksum manifest."
 
 # --- extract --------------------------------------------------------------
 need tar

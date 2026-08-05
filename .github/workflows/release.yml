@@ -250,7 +250,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "license collection failed" }
           Compress-Archive -Path "dist/$stage/*" -DestinationPath "dist/$stage.zip" -Force
           $hash = (Get-FileHash "dist/$stage.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $stage.zip" | Out-File -Encoding ascii "dist/$stage.zip.sha256"
+          # NOT `Out-File`: it terminates the line with CRLF, so the filename
+          # field in the published SHA256SUMS ends with a stray CR. Verified in
+          # the shipped v0.4.25 SHA256SUMS - both Windows .zip lines read
+          # `...-pc-windows-msvc.zip\r` while every Unix line is clean. That
+          # breaks any exact-name lookup (`awk '$2 == name'`, `grep -E 'name$'`)
+          # and makes `sha256sum -c SHA256SUMS` look for a file whose name
+          # contains a carriage return.
+          # `-NoNewline` suppresses Set-Content's own CRLF terminator; the
+          # backtick-n inside the string is the single LF we do want.
+          Set-Content -Path "dist/$stage.zip.sha256" -Encoding ascii -NoNewline `
+            -Value "$hash  $stage.zip`n"
           "artifact=dist/$stage.zip" | Out-File -Encoding ascii -Append $env:GITHUB_ENV
 
       - name: Attest build provenance (SLSA)
@@ -698,9 +708,319 @@ jobs:
           path: dist-msi/
           if-no-files-found: error
 
+  # --------------------------------------------------------------------------
+  # Brand rasters. C0PL4ND commits only SVG sources (assets/svg/) plus a single
+  # 256px PNG + .ico under packaging/windows — there is NO hicolor PNG tree and
+  # no .icns, which is why the .deb / AppImage / .dmg first-install artifacts
+  # could not be built. `packaging/gen-icons.sh` renders the whole size ladder
+  # (16..1024) from the SVG masters; it is run ONCE here on Linux (clean librsvg
+  # rasterization, the same rationale the Windows-installer job already states)
+  # and handed to the packaging jobs as an artifact, so macOS does not need a
+  # brew librsvg install and both platforms rasterize identically.
+  # --------------------------------------------------------------------------
+  brand-icons:
+    name: Brand rasters (librsvg)
+    needs: license-delivery
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner (egress audit)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920
+        with:
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install librsvg
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y librsvg2-bin
+      - name: Render icon ladder
+        run: |
+          set -euo pipefail
+          sh packaging/gen-icons.sh
+          ls -la packaging/icons
+          # gen-icons.sh warns-and-skips .ico/.icns when ImageMagick/iconutil are
+          # absent (both are absent on this runner), which is fine — the PNG
+          # ladder is what the packaging jobs consume. But a MISSING ladder would
+          # silently produce an icon-less .deb/.dmg, so assert it.
+          for s in 16 32 48 64 128 256 512 1024; do
+            [ -s "packaging/icons/c0pl4nd-${s}.png" ] \
+              || { echo "::error::packaging/icons/c0pl4nd-${s}.png was not rendered"; exit 1; }
+          done
+      - name: Upload brand rasters
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: brand-icons
+          path: packaging/icons/*.png
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Linux first-install artifacts (.deb + AppImage) built from the SAME compiled
+  # x86_64 binary the `build` job produced. C0PL4ND previously shipped only raw
+  # .tar.gz archives on Linux while the sibling SCR1B3 shipped both installers;
+  # this closes that gap. These are NOT auto-update targets — the in-app updater
+  # swaps the binary in place via the signed latest.json, which lists only the
+  # archives/installers. `packaging/linux/build-deb.sh` and `build-appimage.sh`
+  # are deliberately NOT used: they are maintainer's-machine skeletons that read
+  # `packaging/icons/c0pl4nd.png` (previously absent) and auto-download an
+  # UNPINNED linuxdeploy. This job instead mirrors SCR1B3's proven, shipping
+  # release path, including the pinned + sha256-verified appimagetool.
+  # --------------------------------------------------------------------------
+  linux-installers:
+    name: Linux installers (.deb + AppImage)
+    needs: [build, brand-icons]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Harden the runner (egress audit)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920
+        with:
+          egress-policy: audit
+      - name: Checkout C0PL4ND (packaging + assets)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: app
+          persist-credentials: false
+      - name: Download Linux binary artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: c0pl4nd-x86_64-unknown-linux-gnu
+          path: linbin
+      - name: Download brand rasters
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: brand-icons
+          path: icons
+      - name: Build .deb (dpkg-deb) + AppImage (appimagetool, pinned)
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Asset-name tag: the release tag on a tag push; the dispatch input
+          # otherwise. The .deb Version field needs a clean semver, so derive
+          # that from the workspace Cargo.toml — valid for both trigger types.
+          TAG="${TAG//\//-}"
+          VER="$(grep -m1 '^version' app/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          tgz="$(find linbin -name '*x86_64-unknown-linux-gnu.tar.gz' | head -1)"
+          [ -n "$tgz" ] || { echo "::error::no linux tarball under linbin/"; exit 1; }
+          mkdir -p dist stage-bin
+          # C0PL4ND's tarball wraps its payload in a `c0pl4nd-<tag>-<target>/`
+          # directory (SCR1B3's does not), so strip that level.
+          tar -xzf "$tgz" -C stage-bin --strip-components=1
+          [ -f stage-bin/c0pl4nd ] || { echo "::error::c0pl4nd not found in tarball"; exit 1; }
+          chmod 0755 stage-bin/c0pl4nd
+
+          # Stage the hicolor icon tree once; both artifacts consume it.
+          hic=stage-icons/hicolor
+          rm -rf stage-icons
+          for s in 16 32 48 64 128 256 512; do
+            mkdir -p "${hic}/${s}x${s}/apps"
+            cp "icons/c0pl4nd-${s}.png" "${hic}/${s}x${s}/apps/c0pl4nd.png"
+          done
+
+          # ---- .deb (dpkg-deb, preinstalled on ubuntu-latest) ----------------
+          deb=stage-deb
+          rm -rf "$deb"
+          mkdir -p "$deb/usr/bin" "$deb/usr/share/applications" \
+                   "$deb/usr/share/icons/hicolor" "$deb/usr/share/man/man1" "$deb/DEBIAN"
+          install -m0755 stage-bin/c0pl4nd "$deb/usr/bin/c0pl4nd"
+          # License texts at the Debian-standard location. Mandatory: the
+          # collector fails the job if any bundled font's license is missing
+          # (OFL-1.1 s2 — the license must accompany every copy).
+          mkdir -p "$deb/usr/share/doc/c0pl4nd"
+          sh app/packaging/collect-licenses.sh app "$deb/usr/share/doc/c0pl4nd"
+          install -m0644 app/packaging/linux/c0pl4nd.desktop "$deb/usr/share/applications/c0pl4nd.desktop"
+          cp -r "${hic}/." "$deb/usr/share/icons/hicolor/"
+          gzip -9nc app/man/c0pl4nd.1 > "$deb/usr/share/man/man1/c0pl4nd.1.gz"
+          # Control file: reuse the committed BINARY control template. NOTE the
+          # repo also has `packaging/linux/debian/control`, which is a SOURCE
+          # control carrying `${shlibs:Depends}, ${misc:Depends}` — debhelper
+          # substvars that dpkg-deb does NOT expand, so using it directly would
+          # emit a package whose Depends field contains literal `${...}` and is
+          # uninstallable. `debian-control` is the binary template.
+          size_kb="$(du -ks "$deb/usr" | cut -f1)"
+          sed -E "s/^Version: .*/Version: ${VER}/" app/packaging/linux/debian-control > "$deb/DEBIAN/control"
+          printf 'Installed-Size: %s\n' "$size_kb" >> "$deb/DEBIAN/control"
+          if grep -q '[$]{' "$deb/DEBIAN/control"; then
+            echo "::error::unexpanded substvar in DEBIAN/control"; exit 1
+          fi
+          dpkg-deb --build --root-owner-group "$deb" "dist/c0pl4nd-${TAG}-amd64.deb"
+          echo "----- .deb info -----";     dpkg-deb --info     "dist/c0pl4nd-${TAG}-amd64.deb"
+          echo "----- .deb contents -----"; dpkg-deb --contents "dist/c0pl4nd-${TAG}-amd64.deb"
+          command -v desktop-file-validate >/dev/null && \
+            desktop-file-validate "$deb/usr/share/applications/c0pl4nd.desktop" || true
+
+          # ---- AppImage (appimagetool 1.9.1, pinned + sha256-verified) -------
+          appdir=AppDir
+          rm -rf "$appdir"
+          mkdir -p "$appdir/usr/bin" "$appdir/usr/share/applications" "$appdir/usr/share/icons/hicolor"
+          install -m0755 stage-bin/c0pl4nd "$appdir/usr/bin/c0pl4nd"
+          mkdir -p "$appdir/usr/share/doc/c0pl4nd"
+          sh app/packaging/collect-licenses.sh app "$appdir/usr/share/doc/c0pl4nd"
+          install -m0644 app/packaging/linux/c0pl4nd.desktop "$appdir/usr/share/applications/c0pl4nd.desktop"
+          install -m0644 app/packaging/linux/c0pl4nd.desktop "$appdir/c0pl4nd.desktop"   # top-level (required)
+          cp -r "${hic}/." "$appdir/usr/share/icons/hicolor/"
+          install -m0644 "icons/c0pl4nd-256.png" "$appdir/c0pl4nd.png"                   # top-level icon
+          # AppRun via printf (NOT a heredoc — a YAML-indented heredoc would inject
+          # leading spaces into the `#!` shebang line and break it).
+          printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/bin/c0pl4nd" "$@"\n' > "$appdir/AppRun"
+          chmod 0755 "$appdir/AppRun"
+          # Pinned, immutable appimagetool release + digest (supply-chain: no
+          # rolling `continuous` tag; sha256 verified before exec). Same pin the
+          # sibling SCR1B3 release already uses.
+          AIT_URL="https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
+          AIT_SHA="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+          curl -fsSL --retry 3 -o appimagetool "$AIT_URL"
+          echo "${AIT_SHA}  appimagetool" | sha256sum -c -
+          chmod +x appimagetool
+          # `--appimage-extract-and-run` avoids needing FUSE on the CI runner.
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run "$appdir" "dist/C0PL4ND-${TAG}-x86_64.AppImage"
+
+          # ---- checksums (the release job aggregates these into SHA256SUMS) --
+          cd dist
+          for f in *.deb *.AppImage; do
+            [ -f "$f" ] || { echo "::error::expected artifact $f was not produced"; exit 1; }
+            sha256sum "$f" > "$f.sha256"
+          done
+          ls -la; cat *.sha256
+      - name: Attest Linux installer provenance (SLSA)
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
+        with:
+          subject-path: |
+            dist/*.deb
+            dist/*.AppImage
+      - name: Upload Linux installers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: linux-installers
+          path: dist/*
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # macOS first-install artifact (.dmg) built from the compiled binary, one per
+  # arch. C0PL4ND previously shipped raw .tar.gz on macOS only, so a Mac user got
+  # no drag-to-Applications install at all. `packaging/macos/build-dmg.sh` is not
+  # used: it requires a committed `packaging/macos/c0pl4nd.icns` that does not
+  # exist in the repo. The .icns is generated here from the rendered PNG ladder
+  # via iconutil (preinstalled on macOS runners).
+  # --------------------------------------------------------------------------
+  macos-installer:
+    name: macOS installer (.app + .dmg, ${{ matrix.arch }})
+    needs: [build, brand-icons]
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            target: x86_64-apple-darwin
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Harden the runner (egress audit)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920
+        with:
+          egress-policy: audit
+      - name: Checkout C0PL4ND (packaging + assets)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: app
+          persist-credentials: false
+      - name: Download macOS binary artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: c0pl4nd-${{ matrix.target }}
+          path: macbin
+      - name: Download brand rasters
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: brand-icons
+          path: icons
+      - name: Build .app bundle + .dmg
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG="${TAG//\//-}"
+          VER="$(grep -m1 '^version' app/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          tgz="$(find macbin -name '*.tar.gz' | head -1)"
+          [ -n "$tgz" ] || { echo "::error::no macOS tarball under macbin/"; exit 1; }
+          mkdir -p dist stage-bin
+          tar -xzf "$tgz" -C stage-bin --strip-components=1
+          [ -f stage-bin/c0pl4nd ] || { echo "::error::c0pl4nd not found in tarball"; exit 1; }
+
+          # ---- C0PL4ND.app bundle --------------------------------------------
+          appbundle="C0PL4ND.app"
+          rm -rf "$appbundle"
+          mkdir -p "$appbundle/Contents/MacOS" "$appbundle/Contents/Resources"
+          install -m0755 stage-bin/c0pl4nd "$appbundle/Contents/MacOS/c0pl4nd"
+          # License texts inside the bundle (OFL-1.1 s2). Mandatory: the
+          # collector fails the job rather than shipping a breach.
+          sh app/packaging/collect-licenses.sh app "$appbundle/Contents/Resources/licenses"
+          # Info.plist: reuse the committed template, substituting the real
+          # version into the two 0.1.0 placeholders (CFBundleVersion +
+          # CFBundleShortVersionString).
+          sed -E "s|<string>0\.1\.0</string>|<string>${VER}</string>|g" \
+            app/packaging/macos/Info.plist > "$appbundle/Contents/Info.plist"
+          # .icns from the rendered ladder (iconutil is preinstalled). The plist
+          # declares CFBundleIconFile c0pl4nd.icns, so the name must match.
+          iconset="c0pl4nd.iconset"
+          rm -rf "$iconset"; mkdir -p "$iconset"
+          cp icons/c0pl4nd-16.png   "$iconset/icon_16x16.png"
+          cp icons/c0pl4nd-32.png   "$iconset/icon_16x16@2x.png"
+          cp icons/c0pl4nd-32.png   "$iconset/icon_32x32.png"
+          cp icons/c0pl4nd-64.png   "$iconset/icon_32x32@2x.png"
+          cp icons/c0pl4nd-128.png  "$iconset/icon_128x128.png"
+          cp icons/c0pl4nd-256.png  "$iconset/icon_128x128@2x.png"
+          cp icons/c0pl4nd-256.png  "$iconset/icon_256x256.png"
+          cp icons/c0pl4nd-512.png  "$iconset/icon_256x256@2x.png"
+          cp icons/c0pl4nd-512.png  "$iconset/icon_512x512.png"
+          cp icons/c0pl4nd-1024.png "$iconset/icon_512x512@2x.png"
+          iconutil -c icns "$iconset" -o "$appbundle/Contents/Resources/c0pl4nd.icns"
+
+          # ---- .dmg (hdiutil, preinstalled) — drag-to-Applications layout ----
+          stage="dmg-stage"
+          rm -rf "$stage"; mkdir -p "$stage"
+          cp -R "$appbundle" "$stage/"
+          ln -s /Applications "$stage/Applications"
+          dmg="dist/c0pl4nd-${TAG}-${{ matrix.arch }}.dmg"
+          hdiutil create -volname "C0PL4ND" -srcfolder "$stage" -ov -format UDZO "$dmg"
+
+          # ---- checksum. macOS ships `shasum`, NOT `sha256sum`; using the
+          # latter unguarded would fail the step, and using it GUARDED
+          # (`if command -v sha256sum`) would silently skip the checksum, drop
+          # this artifact's line from SHA256SUMS, and leave the .dmg with no
+          # integrity record at all.
+          cd dist
+          for f in *.dmg; do shasum -a 256 "$f" > "$f.sha256"; done
+          ls -la; cat *.sha256
+      - name: Attest macOS installer provenance (SLSA)
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
+        with:
+          subject-path: dist/*.dmg
+      - name: Upload macOS installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: macos-installer-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
   release:
     name: Publish Release
-    needs: [build, sbom, windows-installer, windows-msi]
+    needs: [build, sbom, windows-installer, windows-msi, brand-icons, linux-installers, macos-installer]
     runs-on: ubuntu-latest
     permissions:
       # The only job that needs write to create the release + upload assets.
@@ -748,9 +1068,31 @@ jobs:
           set -euo pipefail
           mkdir -p release
           find artifacts -type f \
-            \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.msi' -o -name '*.sha256' -o -name '*.cdx.json' -o -name 'BUILD-PROVENANCE.txt' \) \
+            \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.msi' \
+               -o -name '*.deb' -o -name '*.AppImage' -o -name '*.dmg' \
+               -o -name '*.sha256' -o -name '*.cdx.json' -o -name 'BUILD-PROVENANCE.txt' \) \
             -exec cp {} release/ \;
-          ( cd release && cat *.sha256 > SHA256SUMS 2>/dev/null || true )
+          # NOT `cat *.sha256 > SHA256SUMS 2>/dev/null || true`. That form
+          # publishes an EMPTY SHA256SUMS when the glob misses - and an empty
+          # SHA256SUMS still satisfies the `[ -f ]` keep-guard in the prune step
+          # while making every consumer's digest lookup fail. Since the prune
+          # deletes the per-binary sidecars, SHA256SUMS is the ONLY checksum
+          # record that ships; producing it silently empty is the worst
+          # available outcome. Fail loudly instead.
+          mapfile -t shas < <(find release -maxdepth 1 -type f -name '*.sha256' | sort)
+          if [ "${#shas[@]}" -eq 0 ]; then
+            echo "::error::no .sha256 sidecars staged - refusing to publish a release with no checksum manifest"
+            exit 1
+          fi
+          # `tr -d '\r'` is defence-in-depth for the CRLF a Windows producer can
+          # introduce (see the `Package (Windows)` step). A single stray CR in a
+          # filename field silently breaks every exact-name lookup downstream.
+          cat "${shas[@]}" | tr -d '\r' | sort -u > release/SHA256SUMS
+          [ -s release/SHA256SUMS ] || { echo "::error::SHA256SUMS is empty"; exit 1; }
+          if LC_ALL=C grep -q $'\r' release/SHA256SUMS; then
+            echo "::error::SHA256SUMS still contains a carriage return"; exit 1
+          fi
+          echo "----- release/SHA256SUMS -----"; cat release/SHA256SUMS
           ls -la release
 
       - name: Generate update manifest (latest.json, Tier 1)
@@ -998,9 +1340,19 @@ jobs:
         run: |
           set -euo pipefail
           before=$(find release -type f | wc -l | tr -d ' ')
+          # `.msi` entries added alongside `.exe`: the MSI job publishes an
+          # installer whose `.msi.sha256` and `.msi.minisig` are redundant with
+          # the signed SHA256SUMS + latest.json in exactly the same way as every
+          # other binary's. Without them in this list a new MSI silently
+          # re-introduces the per-binary sidecar clutter this step exists to
+          # remove - the prune list must be extended for every new artifact KIND.
           find release -type f \( \
               -name '*.tar.gz.minisig' -o -name '*.zip.minisig' -o -name '*.exe.minisig' \
+              -o -name '*.msi.minisig' -o -name '*.deb.minisig' \
+              -o -name '*.AppImage.minisig' -o -name '*.dmg.minisig' \
               -o -name '*.tar.gz.sha256' -o -name '*.zip.sha256' -o -name '*.exe.sha256' \
+              -o -name '*.msi.sha256' -o -name '*.deb.sha256' \
+              -o -name '*.AppImage.sha256' -o -name '*.dmg.sha256' \
               -o -name '*.sha256.minisig' -o -name '*.cdx.json.minisig' \
               -o -name 'BUILD-PROVENANCE.txt.minisig' \
             \) -delete
@@ -1010,6 +1362,20 @@ jobs:
           for keep in latest.json latest.json.minisig SHA256SUMS SHA256SUMS.minisig; do
             [ -f "release/$keep" ] || { echo "::error::prune removed required $keep"; exit 1; }
           done
+          # Guard: after the prune, SHA256SUMS is the ONLY integrity record any
+          # consumer has for a binary (packaging/linux/install.sh reads it, and
+          # the in-app updater cross-checks the signed manifest). Every published
+          # artifact MUST therefore have a line in it. A missing line is a
+          # silently-skipped checksum upstream, not a cosmetic gap.
+          missing=0
+          for a in release/*.tar.gz release/*.zip release/*.exe release/*.msi \
+                   release/*.deb release/*.AppImage release/*.dmg; do
+            [ -f "$a" ] || continue
+            base=$(basename "$a")
+            grep -qE "[ *]${base}\$" release/SHA256SUMS \
+              || { echo "::error::no SHA256SUMS entry for $base"; missing=1; }
+          done
+          [ "$missing" -eq 0 ] || exit 1
           ls -la release
 
       - name: Attest published release assets (SLSA provenance, Tier 2)
@@ -1029,6 +1395,10 @@ jobs:
             release/*.zip
             release/*.tar.gz
             release/*.exe
+            release/*.msi
+            release/*.deb
+            release/*.AppImage
+            release/*.dmg
             release/latest.json
             release/*.cdx.json
             release/SHA256SUMS

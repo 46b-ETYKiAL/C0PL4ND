@@ -1,0 +1,14 @@
+Package: c0pl4nd
+Version: 0.1.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: Itasha.Corp <c0pl4nd@itasha-corp.example>
+Depends: libc6, libxcb1, libxcb-render0, libxcb-shape0, libxcb-xfixes0, libxkbcommon0, libwayland-client0, libfontconfig1
+Homepage: https://github.com/46b-ETYKiAL/C0PL4ND
+Description: Fast, cross-platform terminal emulator
+ C0PL4ND is a cross-platform terminal emulator written in Rust. It provides
+ a fast rendering pipeline and runs on Windows, Linux, and macOS.
+ .
+ This package installs the c0pl4nd binary, an XDG desktop entry, icons, the
+ man page, and the license texts the bundled typefaces require.

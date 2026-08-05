@@ -183,7 +183,6 @@ const KEYBINDING_SEARCH_LABELS: &[&str] = &[
 
 /// The release channels the Updates section offers. Mirrors the channels the
 /// `c0pl4nd update` checker understands; a free choice list, not invented.
-const UPDATE_CHANNELS: &[&str] = &["stable", "beta", "nightly"];
 
 /// The usable range of the chromatic-aberration INTENSITY slider.
 ///
@@ -3016,30 +3015,26 @@ fn render_sections(
                 ui.end_row();
             }
 
-            // ---- Release channel ----
-            if row_visible(q, "channel release stable beta nightly") {
-                let networked = config.update.mode != UpdateMode::Off;
-                ui.add_enabled_ui(networked, |ui| {
-                    ui.label("Release channel")
-                        .on_hover_text("Which release line update checks follow.");
-                });
-                let channel_variants: Vec<(String, &str)> = UPDATE_CHANNELS
-                    .iter()
-                    .map(|c| (c.to_string(), *c))
-                    .collect();
-                let cur_channel = config.update.channel.clone();
-                ui.add_enabled_ui(networked, |ui| {
-                    changed |= dropdown_with_stepper(
-                        ui,
-                        "c0pl4nd-update-channel",
-                        &mut config.update.channel,
-                        &channel_variants,
-                        Some(&cur_channel),
-                    );
-                });
-                changed |= reset_to_default(ui, &mut config.update.channel, &def.update.channel);
-                ui.end_row();
-            }
+            // ---- Release channel: DELIBERATELY NOT RENDERED ----
+            //
+            // There was a "Release channel" (stable/beta/nightly) dropdown here.
+            // It wrote `config.update.channel`, which the IN-APP updater never
+            // reads: nothing under `update_engine/` references it, and
+            // `update_engine::net` refuses any prerelease/draft release
+            // UNCONDITIONALLY as a channel-pin security gate, whatever the
+            // setting said. The "Check for updates" button a few rows below
+            // calls `start_check(ctx, kind)` and takes no channel at all.
+            //
+            // So the control sat immediately above a button it did not affect,
+            // and picking "beta" silently changed nothing. A setting that does
+            // not do what it says is worse than an absent one.
+            //
+            // The CONFIG FIELD stays. The legacy CLI path
+            // (`update::latest_version(channel)`) genuinely consumes it, and
+            // dropping it would be a breaking config change for anyone who set
+            // it. Wiring the UI properly is the other option, but it means
+            // relaxing that unconditional prerelease refusal -- a security gate
+            // -- which is not a change to make alongside a release.
         });
 
         // ---- Check for updates + inline status + action buttons ----
@@ -4147,16 +4142,6 @@ mod tests {
         // matching row. The row labels ARE the search labels by construction.
         assert!(MOTION_SEARCH_LABELS.contains(&"chromatic aberration"));
         assert!(MOTION_SEARCH_LABELS.contains(&"cursor trail"));
-    }
-
-    #[test]
-    fn update_channels_include_the_default_channel() {
-        // The channel combo must offer the default channel, or selecting it back
-        // would be impossible.
-        assert!(
-            UPDATE_CHANNELS.contains(&Config::default().update.channel.as_str()),
-            "the default update channel must be one of the offered choices"
-        );
     }
 
     #[test]

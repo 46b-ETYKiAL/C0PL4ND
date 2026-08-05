@@ -398,6 +398,32 @@ mod tests {
         assert_eq!(parse_tag(r#"{"message":"Not Found"}"#), None);
     }
 
+    /// The SHIPPED default channel must be the one that takes the
+    /// prerelease-excluding endpoint.
+    ///
+    /// This lives here, beside `latest_version` — the only surviving consumer of
+    /// `config.update.channel` — rather than in the Settings UI, where it used to
+    /// assert that a dropdown offered the default value. That dropdown is gone:
+    /// it wrote a field the in-app updater never read, so the property worth
+    /// pinning is not "the combo lists it" but "the default routes to the stable
+    /// endpoint".
+    ///
+    /// `latest_version` branches on `eq_ignore_ascii_case("stable")`: that arm
+    /// reads `releases/latest`, which EXCLUDES prereleases. Any other value falls
+    /// through to scanning the full release list, where a prerelease can match —
+    /// and `update_engine::net` then refuses it as a channel-pin violation. So a
+    /// default of anything but `stable` would ship an updater that finds
+    /// candidates its own security gate rejects.
+    #[test]
+    fn the_default_channel_takes_the_prerelease_excluding_endpoint() {
+        let default_channel = c0pl4nd_core::Config::default().update.channel;
+        assert!(
+            default_channel.eq_ignore_ascii_case("stable"),
+            "the shipped default update channel must be `stable` so checks read \
+             the prerelease-excluding releases/latest endpoint; got {default_channel:?}"
+        );
+    }
+
     #[test]
     fn pick_channel_tag_prefers_channel_then_falls_back() {
         // Newest-first list with a beta and two stables.

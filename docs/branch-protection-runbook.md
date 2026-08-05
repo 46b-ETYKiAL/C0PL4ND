@@ -36,7 +36,7 @@ informational. Recommended contexts (exact check names):
 ## Enable (PUT replaces the whole protection object — send all four keys)
 
 ```bash
-gh api -X PUT repos/46b-ETYKiAL/Itasha.Corp_C0PL4ND/branches/master/protection \
+gh api -X PUT repos/46b-ETYKiAL/C0PL4ND/branches/master/protection \
   --input - <<'JSON'
 {
   "required_status_checks": {
@@ -90,6 +90,6 @@ rule documents the pattern.
 
 ## Drift probe
 
-`gh api repos/46b-ETYKiAL/Itasha.Corp_C0PL4ND/branches/master/protection/required_status_checks --jq '.checks[].context'`
+`gh api repos/46b-ETYKiAL/C0PL4ND/branches/master/protection/required_status_checks --jq '.checks[].context'`
 should list exactly the set above; a `404 "Required status checks not enabled"`
 means protection is off.

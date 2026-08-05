@@ -190,8 +190,8 @@ Hit a snag? See **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** for fixes to common
 C0PL4ND is built with Rust. You'll need a recent stable toolchain (install via [rustup](https://rustup.rs)).
 
 ```bash
-git clone https://github.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND.git
-cd Itasha.Corp_C0PL4ND
+git clone https://github.com/46b-ETYKiAL/C0PL4ND.git
+cd C0PL4ND
 cargo build --release
 ```
 

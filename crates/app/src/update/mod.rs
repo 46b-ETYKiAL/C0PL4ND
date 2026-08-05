@@ -34,9 +34,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-/// Canonical public release repository. (The prior value `itasha-corp/c0pl4nd`
-/// 404'd — there is no such repo — so every check silently failed.)
-const REPO: &str = "46b-ETYKiAL/Itasha.Corp_C0PL4ND";
+/// Canonical public release repository. (An early value `itasha-corp/c0pl4nd`
+/// 404'd — there is no such owner — so every check silently failed. It was then
+/// `46b-ETYKiAL/Itasha.Corp_C0PL4ND` until the repository was renamed to
+/// `C0PL4ND`; that former name resolves only via GitHub's rename redirect, which
+/// this constant must never depend on.)
+const REPO: &str = "46b-ETYKiAL/C0PL4ND";
 
 /// `User-Agent` for the one API call. App name + version ONLY — no PII. The
 /// GitHub API rejects requests without a User-Agent, so this is mandatory.
@@ -381,7 +384,7 @@ mod tests {
     fn release_page_url_points_at_the_real_repo() {
         let url = release_page_url();
         assert!(
-            url.contains("46b-ETYKiAL/Itasha.Corp_C0PL4ND"),
+            url.contains("46b-ETYKiAL/C0PL4ND"),
             "release URL must target the real repo, not the old 404 path: {url}"
         );
         assert!(

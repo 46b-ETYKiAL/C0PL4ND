@@ -166,13 +166,14 @@ It previously read `itasha-corp/c0pl4nd`, a GitHub **owner** that does not exist
 and served arbitrary code to every user who ran the advertised `curl … | sh`.
 Never point release URLs at a namespace this project does not control.
 
-Note that `46b-ETYKiAL/Itasha.Corp_C0PL4ND` — still used by `Cargo.toml`, the
-in-app updater and the issue-intake defaults — is the repository's FORMER name
-and resolves only through GitHub's rename redirect (the API reports
-`full_name = 46b-ETYKiAL/C0PL4ND`). That redirect is not squattable, because only
-this account can create a repository under its own owner namespace, so it is a
-fragility rather than a hijack risk: it breaks if a differently-named repo is
-ever created there. Prefer the canonical name in anything new.
+The repository's FORMER name was `46b-ETYKiAL/Itasha.Corp_C0PL4ND`. Every
+in-tree reference — `Cargo.toml`, the in-app updater constants and the
+issue-intake config default — now uses the canonical `46b-ETYKiAL/C0PL4ND`, so
+nothing ships that depends on GitHub's rename redirect. The old name still
+resolves through that redirect, which is not squattable (only this account can
+create a repository under its own owner namespace), so it was a fragility rather
+than a hijack risk: it would break if a differently-named repo were ever created
+there. Always use the canonical name; never rely on the redirect.
 
 Smoke tests:
 

@@ -5,7 +5,7 @@ All notable changes to C0PL4ND are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Full per-release artifacts (signed binaries, SBOMs, provenance) are on the
-[GitHub Releases](https://github.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND/releases)
+[GitHub Releases](https://github.com/46b-ETYKiAL/C0PL4ND/releases)
 page.
 
 ## [0.4.25]
@@ -586,7 +586,7 @@ the complete issue-finding tool sweep).
 Earlier releases (0.1.0 – 0.4.3) predate this changelog; see the GitHub Releases
 page for their notes and signed artifacts.
 
-[0.4.6]: https://github.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND/releases/tag/v0.4.6
-[0.4.5]: https://github.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND/releases/tag/v0.4.5
-[0.4.4]: https://github.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND/releases/tag/v0.4.4
-[0.4.3]: https://github.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND/releases/tag/v0.4.3
+[0.4.6]: https://github.com/46b-ETYKiAL/C0PL4ND/releases/tag/v0.4.6
+[0.4.5]: https://github.com/46b-ETYKiAL/C0PL4ND/releases/tag/v0.4.5
+[0.4.4]: https://github.com/46b-ETYKiAL/C0PL4ND/releases/tag/v0.4.4
+[0.4.3]: https://github.com/46b-ETYKiAL/C0PL4ND/releases/tag/v0.4.3

@@ -236,13 +236,16 @@ crash_reports = "off"   # off | ask_each_time | … (default: off)
 manual_issues = "off"   # off | ask_each_time | … (default: off)
 
 [reporting.issue_intake]
-repo = "46b-ETYKiAL/Itasha.Corp_C0PL4ND"      # the GitHub owner/repo the "Report an issue" deep link targets
+repo = "46b-ETYKiAL/C0PL4ND"                  # the GitHub owner/repo the "Report an issue" deep link targets
 mailto_alias = "you@example.com"              # the mailto: fallback address, used only if the deep link cannot open
 ```
 
 > `mailto_alias` is shown here with a placeholder. Set it to whatever address
-> you want "Report an issue" to fall back to; leaving it unset keeps the
-> project's own contact address, which is the shipped default.
+> you want "Report an issue" to fall back to. It is **empty by default and no
+> address ships** — a real mailbox compiled into a public binary would be
+> published to everyone who downloads the app. Leaving it unset simply means the
+> app offers the GitHub Issue form and the clipboard fallback, and does not
+> offer the email route at all.
 
 ## Keybindings
 

@@ -1077,7 +1077,7 @@ pub struct IssueIntakeConfig {
 impl Default for IssueIntakeConfig {
     fn default() -> Self {
         IssueIntakeConfig {
-            repo: "46b-ETYKiAL/Itasha.Corp_C0PL4ND".to_string(),
+            repo: "46b-ETYKiAL/C0PL4ND".to_string(),
             // No address ships. See the field doc.
             mailto_alias: String::new(),
         }
@@ -1127,6 +1127,21 @@ fn default_tint() -> String {
 /// migration; any other value (a user's custom tint) is preserved verbatim.
 const LEGACY_DEFAULT_TINT: &str = "#121212";
 
+/// The pre-v3 default issue-intake repo, carrying the GitHub repository's FORMER
+/// name (renamed `Itasha.Corp_C0PL4ND` → `C0PL4ND`). A stored config whose
+/// `reporting.issue_intake.repo` is PROVABLY this old default is re-pointed to
+/// the current default by the v2 → v3 migration; any other value (an operator's
+/// own fork coordinates) is preserved verbatim.
+///
+/// This migration is load-bearing rather than cosmetic: every field serializes
+/// (there is no `skip_serializing_if`), and [`Config::save_to`] runs on ordinary
+/// actions such as persisting window geometry — so essentially every existing
+/// user already has the old name written into `config.toml`. Because
+/// `#[serde(default)]` makes a STORED value win over the source default, bumping
+/// the [`IssueIntakeConfig::default`] string alone would never reach them, and
+/// their "Report an issue" link would keep depending on GitHub's rename redirect.
+const LEGACY_ISSUE_INTAKE_REPO: &str = "46b-ETYKiAL/Itasha.Corp_C0PL4ND";
+
 /// Current config schema version. Bumped whenever a one-time, version-gated
 /// migration is needed (see [`Config::migrate`]). A config written before schema
 /// versioning existed deserializes with `schema_version == 0` (the serde default
@@ -1139,7 +1154,11 @@ const LEGACY_DEFAULT_TINT: &str = "#121212";
 ///   `schema_version < 2`. (The earlier v1 legacy-transparency promotion was
 ///   retired when the multi-mode transparency model collapsed to the single
 ///   `opacity` model in v0.4.21; its former fields are now ignored on load.)
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+/// - v3 (repository rename): a stored config whose `reporting.issue_intake.repo`
+///   is PROVABLY the old [`LEGACY_ISSUE_INTAKE_REPO`] default is re-pointed to
+///   the renamed repository exactly once. An operator's custom value is left
+///   UNTOUCHED. Gated on `schema_version < 3`.
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Top-level configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1576,6 +1595,19 @@ impl Config {
                 self.tint = default_tint();
             }
             self.schema_version = 2;
+            changed = true;
+        }
+
+        // The GitHub repository was renamed (`Itasha.Corp_C0PL4ND` → `C0PL4ND`).
+        // A config whose issue-intake repo is PROVABLY the old shipped default is
+        // re-pointed once; ANY other value (an operator pointing at their own
+        // fork) is left untouched — no silent clobber. One-shot: after this,
+        // `schema_version == 3` and the block is skipped forever.
+        if self.schema_version < 3 {
+            if self.reporting.issue_intake.repo == LEGACY_ISSUE_INTAKE_REPO {
+                self.reporting.issue_intake.repo = IssueIntakeConfig::default().repo;
+            }
+            self.schema_version = 3;
             changed = true;
         }
 
@@ -2586,10 +2618,7 @@ mod tests {
         assert_eq!(c.reporting.streams.crash_reports, ReportingMode::Off);
         assert_eq!(c.reporting.streams.manual_issues, ReportingMode::Off);
         // Issue-intake coords backfill to the C0PL4ND defaults.
-        assert_eq!(
-            c.reporting.issue_intake.repo,
-            "46b-ETYKiAL/Itasha.Corp_C0PL4ND"
-        );
+        assert_eq!(c.reporting.issue_intake.repo, "46b-ETYKiAL/C0PL4ND");
     }
 
     #[test]
@@ -3153,7 +3182,7 @@ mod tests {
     #[test]
     fn issue_intake_defaults_are_the_c0pl4nd_coordinates() {
         let i = IssueIntakeConfig::default();
-        assert_eq!(i.repo, "46b-ETYKiAL/Itasha.Corp_C0PL4ND");
+        assert_eq!(i.repo, "46b-ETYKiAL/C0PL4ND");
         // The top-level ReportingConfig embeds those same defaults.
         let r = ReportingConfig::default();
         assert_eq!(r.issue_intake, i);
@@ -3333,6 +3362,44 @@ mod tests {
         let p = PathBuf::from("legacy-tint.toml");
         let c = Config::from_toml("tint = \"#121212\"\n", &p).unwrap();
         assert_eq!(c.tint, "#08060d", "old default tint remaps to VOID BLACK");
+        assert_eq!(c.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn pre_v3_default_issue_repo_migrates_to_the_renamed_repository() {
+        // An EXISTING config that persisted the OLD shipped default (the
+        // repository's former name) is re-pointed on load. Without this, the
+        // stored value would win over the source default forever — `save_to`
+        // serializes every field, so essentially every existing user has this
+        // string on disk — and the issue link would keep depending on GitHub's
+        // rename redirect.
+        let p = PathBuf::from("legacy-repo.toml");
+        let c = Config::from_toml(
+            "[reporting.issue_intake]\nrepo = \"46b-ETYKiAL/Itasha.Corp_C0PL4ND\"\n",
+            &p,
+        )
+        .unwrap();
+        assert_eq!(
+            c.reporting.issue_intake.repo, "46b-ETYKiAL/C0PL4ND",
+            "the old default repo name must migrate to the renamed repository"
+        );
+        assert_eq!(c.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn pre_v3_custom_issue_repo_is_preserved_verbatim() {
+        // An operator pointing the issue form at their OWN fork must survive the
+        // v2 → v3 migration untouched — no silent clobber.
+        let p = PathBuf::from("custom-repo.toml");
+        let c = Config::from_toml(
+            "[reporting.issue_intake]\nrepo = \"someone-else/their-fork\"\n",
+            &p,
+        )
+        .unwrap();
+        assert_eq!(
+            c.reporting.issue_intake.repo, "someone-else/their-fork",
+            "a custom issue-intake repo is never remapped"
+        );
         assert_eq!(c.schema_version, CURRENT_SCHEMA_VERSION);
     }
 

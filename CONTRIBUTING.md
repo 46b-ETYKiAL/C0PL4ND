@@ -35,8 +35,8 @@ C0PL4ND is written in Rust. You'll need:
 ### Clone and build
 
 ```bash
-git clone https://github.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND.git
-cd Itasha.Corp_C0PL4ND
+git clone https://github.com/46b-ETYKiAL/C0PL4ND.git
+cd C0PL4ND
 cargo build
 ```
 

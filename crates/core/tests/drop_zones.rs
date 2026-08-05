@@ -1,4 +1,4 @@
-//! Drop-zone tree-edit resolution tests (plan-575 Phase 5, T5.2).
+//! Drop-zone tree-edit resolution tests.
 //!
 //! The drop-zone *geometry* (cursor → zone) lives in the app crate's `drag`
 //! module (pure, tested there). These tests cover the *core* tree edit that an

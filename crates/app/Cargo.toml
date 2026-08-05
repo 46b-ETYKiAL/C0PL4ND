@@ -25,7 +25,6 @@ path = "src/lib.rs"
 
 # The modern eframe/egui chrome shell — the canonical C0PL4ND app. It draws each
 # pane's terminal grid with egui's native coloured-text painter.
-# See `.s4f3-data/recon-c0pl4nd-egui-modernization.md`.
 [[bin]]
 name = "c0pl4nd"
 path = "src/egui_main.rs"

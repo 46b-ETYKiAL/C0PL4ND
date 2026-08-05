@@ -47,7 +47,7 @@ The **privacy-critical invariants** are each pinned by a dedicated test:
 - **Counts/enums-only logging** — outcome + transport-class labels never embed
   PII (`outcome_log_details_are_stable_and_non_identifying`,
   `transport_choice_class_labels_are_stable_and_non_identifying`), and the
-  `S4F3_DISABLE_TELEMETRY=1` suppression + the emit branch are both covered.
+  `C0PL4ND_DISABLE_TELEMETRY=1` suppression + the emit branch are both covered.
 
 ## Genuinely uncoverable lines (documented, not faked)
 

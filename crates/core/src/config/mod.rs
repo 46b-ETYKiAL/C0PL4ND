@@ -1055,6 +1055,22 @@ pub struct IssueIntakeConfig {
     /// The GitHub `owner/repo` the prefilled Issue-Form deep link targets.
     pub repo: String,
     /// The support email alias the `mailto:` fallback addresses.
+    ///
+    /// **Empty by default, and that default is load-bearing.** This value is
+    /// compiled into every shipped binary of a PUBLIC repository, so a real
+    /// mailbox here is published to everyone who downloads the app (and to every
+    /// address harvester that reads the source). It previously defaulted to a
+    /// maintainer's personal address.
+    ///
+    /// Empty means the app offers the GitHub Issue form + the clipboard
+    /// fallback and simply does not offer the email route — see
+    /// `email_fallback_offered`. An operator who has a real support alias sets
+    /// it in `config.toml`:
+    ///
+    /// ```toml
+    /// [reporting.issue_intake]
+    /// mailto_alias = "support@example.org"
+    /// ```
     pub mailto_alias: String,
 }
 
@@ -1062,7 +1078,8 @@ impl Default for IssueIntakeConfig {
     fn default() -> Self {
         IssueIntakeConfig {
             repo: "46b-ETYKiAL/Itasha.Corp_C0PL4ND".to_string(),
-            mailto_alias: "46b.AbandonSomething@proton.me".to_string(),
+            // No address ships. See the field doc.
+            mailto_alias: String::new(),
         }
     }
 }
@@ -3137,10 +3154,37 @@ mod tests {
     fn issue_intake_defaults_are_the_c0pl4nd_coordinates() {
         let i = IssueIntakeConfig::default();
         assert_eq!(i.repo, "46b-ETYKiAL/Itasha.Corp_C0PL4ND");
-        assert_eq!(i.mailto_alias, "46b.AbandonSomething@proton.me");
         // The top-level ReportingConfig embeds those same defaults.
         let r = ReportingConfig::default();
         assert_eq!(r.issue_intake, i);
+    }
+
+    /// NO EMAIL ADDRESS MAY SHIP IN THE DEFAULT CONFIG.
+    ///
+    /// This default is compiled into every binary of a public repo. It used to
+    /// carry a maintainer's personal `proton.me` mailbox, published to every
+    /// downloader and every address harvester that reads the source.
+    ///
+    /// The assertion is on the SHAPE (`@`-free), not on one banned literal: a
+    /// test pinning the old string would have to be edited in lockstep with the
+    /// leak it was pinning — which is exactly how it survived — whereas an
+    /// `@`-free assertion rejects the next address too.
+    #[test]
+    fn no_email_address_ships_in_the_default_issue_intake_config() {
+        let i = IssueIntakeConfig::default();
+        assert!(
+            i.mailto_alias.is_empty(),
+            "the shipped default must carry NO mailbox; got {:?}",
+            i.mailto_alias
+        );
+        let toml = Config::default()
+            .to_toml()
+            .expect("the default config must serialize");
+        assert!(
+            !toml.contains('@'),
+            "the serialized default config must contain no email address; it is \
+             written to every user's disk and read from a public source tree"
+        );
     }
 
     // ---- PanelSide default + serde round-trip ----

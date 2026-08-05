@@ -3527,11 +3527,10 @@ impl ApplicationHandler for App {
         self.gpu = Some(gpu);
         if self.tabs.is_empty() {
             self.spawn_tab();
-            // Plan-575 P6 T6.4: restore the saved `default` workspace on
-            // launch when it carries a real multi-pane layout. Single-pane
-            // defaults are a no-op (same shape as the fresh tab above).
-            // Without this call the saved-on-exit default layout never
-            // re-materialises — the P0 wiring gap caught at QA review.
+            // Restore the saved `default` workspace on launch when it carries
+            // a real multi-pane layout. Single-pane defaults are a no-op (same
+            // shape as the fresh tab above). Without this call the
+            // saved-on-exit default layout never re-materialises.
             self.restore_default_workspace_on_startup();
         }
         if let Some(g) = &self.gpu {

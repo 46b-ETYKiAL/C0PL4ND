@@ -24,8 +24,18 @@ useDefault = true
 # anything, and are deliberately fixed so the assertion is deterministic.
 # The allowlist is scoped BOTH by a `c0pl4nd_`-prefixed regex AND by path, so
 # it cannot silently excuse a real credential elsewhere in the tree.
+#
+# `condition = "AND"` below is what MAKES that true, and its absence is not a
+# style detail. gitleaks v8 combines allowlist criteria with OR by default, so
+# without it the two criteria exempt INDEPENDENTLY: the two listed files became
+# wholly exempt from this rule, and any value matching `c0pl4nd_[a-z0-9_]+`
+# became exempt across the ENTIRE tree. Measured with gitleaks 8.30.1 against
+# four identical planted secrets — as previously shipped, `leaks found: 1`; with
+# this line, `leaks found: 4`. The comment above described the intent; this line
+# implements it.
 id = "generic-api-key"
 [rules.allowlist]
+condition = "AND"
 description = "Terminal round-trip test sentinels — fixed marker strings echoed back through the pty/grid to verify the read path; not credentials."
 regexes = [
   '''c0pl4nd_[a-z0-9_]+''',

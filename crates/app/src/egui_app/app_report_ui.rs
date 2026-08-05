@@ -244,7 +244,13 @@ impl super::C0pl4ndApp {
                     if ui.button("Open on GitHub").clicked() {
                         do_open = true;
                     }
-                    if ui.button("Email instead").clicked() {
+                    // Offered ONLY when an operator configured a real alias. The
+                    // shipped default is empty (no mailbox is compiled into a
+                    // public binary), and a `mailto:` with no recipient opens an
+                    // empty compose window that silently goes nowhere — worse
+                    // than not offering the route. "Open on GitHub" and the
+                    // clipboard fallback are always available.
+                    if email_fallback_offered(&alias) && ui.button("Email instead").clicked() {
                         do_mailto = true;
                     }
                     if ui.button("Close").clicked() {
@@ -276,9 +282,23 @@ impl super::C0pl4ndApp {
     }
 }
 
+/// Whether the "Email instead" fallback should be offered at all.
+///
+/// `false` for an absent or whitespace-only alias. The shipped default IS empty
+/// — no mailbox is compiled into a public binary (see
+/// `IssueIntakeConfig::mailto_alias`) — so on a stock install this route is
+/// simply not shown, and the GitHub Issue form + clipboard fallback carry the
+/// whole flow.
+///
+/// Pure, so the decision is testable without a live window.
+pub(crate) fn email_fallback_offered(alias: &str) -> bool {
+    !alias.trim().is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::C0pl4ndApp;
+    use super::email_fallback_offered;
     use crate::reporting::{RememberChoice, ReportingMode};
     use std::path::Path;
 
@@ -289,6 +309,29 @@ mod tests {
     // other. Instead the path DECISION (`remember_save_path`) and the path USE
     // (`apply_remember_choice_to`) are asserted separately, which needs no env
     // mutation at all and yields the same end-to-end guarantee.
+
+    /// The email route is offered only for a REAL alias — and the shipped
+    /// default is not one.
+    ///
+    /// The last assertion is the load-bearing half: it reads the live default
+    /// rather than a literal, so re-introducing an address into the shipped
+    /// config turns this test red instead of silently re-publishing a mailbox.
+    #[test]
+    fn the_email_fallback_is_offered_only_for_a_configured_alias() {
+        assert!(email_fallback_offered("support@example.org"));
+        assert!(!email_fallback_offered(""), "no alias -> no email route");
+        assert!(
+            !email_fallback_offered("   \t "),
+            "whitespace is not an address"
+        );
+        assert!(
+            !email_fallback_offered(
+                &c0pl4nd_core::config::IssueIntakeConfig::default().mailto_alias
+            ),
+            "the SHIPPED default must not offer an email route — it carries no \
+             mailbox, and a mailto: with no recipient goes nowhere"
+        );
+    }
 
     fn headless_app() -> C0pl4ndApp {
         C0pl4ndApp::bootstrap_with(c0pl4nd_core::Config::default())
@@ -529,14 +572,43 @@ mod tests {
         let h = issue_harness(&app);
 
         h.get_by_label("Open on GitHub");
-        h.get_by_label("Email instead");
         h.get_by_label("Close");
+        // "Email instead" is deliberately ABSENT here: the shipped default
+        // carries no mailbox (no personal address is compiled into a public
+        // binary), and a `mailto:` with no recipient opens an empty compose
+        // window that goes nowhere. See the configured case below.
+        assert!(
+            h.query_by_label("Email instead").is_none(),
+            "the stock config has no alias, so the email route must not be offered"
+        );
         // The preview must show the user's actual words — proof it previews the
         // real body rather than a placeholder.
         assert!(
             h.query_by_label_contains("the terminal ate my homework")
                 .is_some(),
             "the preview must render the user's description verbatim"
+        );
+    }
+
+    /// …and a CONFIGURED alias brings the email route back.
+    ///
+    /// This is the half that stops the assertion above passing vacuously: if the
+    /// button had simply been deleted, or if `email_fallback_offered` were wired
+    /// to a constant `false`, the absence check would still pass and the feature
+    /// would be silently gone. Driven through the REAL dialog on a real config,
+    /// so it asserts the live config value reaches the widget.
+    #[test]
+    fn report_issue_offers_the_email_route_when_an_alias_is_configured() {
+        let mut a = headless_app();
+        a.issue_intake.open = true;
+        a.config.reporting.issue_intake.mailto_alias = "support@example.org".to_string();
+        let app = RefCell::new(a);
+        let h = issue_harness(&app);
+
+        assert!(
+            h.query_by_label("Email instead").is_some(),
+            "a configured alias must offer the email route — otherwise the \
+             absence assertion in the sibling test proves nothing"
         );
     }
 

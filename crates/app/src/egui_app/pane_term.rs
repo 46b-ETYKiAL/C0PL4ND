@@ -1709,6 +1709,34 @@ mod tests {
         dir
     }
 
+    /// Does `grid` show `needle`, ignoring the terminal's HARD WRAP?
+    ///
+    /// The probe prints an absolute path into an 80-column grid, so a long temp
+    /// path is split across rows MID-TOKEN and a plain `contains` reports a
+    /// CORRECT spawn as a failure. Measured on macOS CI, where the runner's
+    /// temp dir resolves through the `/private` symlink:
+    ///
+    /// ```text
+    /// /private/var/folders/df/djsxfhc17x95674wsm_g8s980000gn/T/c0pl4nd-spawn-in-13600-
+    /// 1785939352831829000
+    /// ```
+    ///
+    /// The unique component is split at the row edge, so the child HAD run in
+    /// the requested directory and the assertion failed anyway. Windows never
+    /// showed it because its temp path is short enough to leave the token
+    /// intact — the defect was platform-hidden, not absent.
+    ///
+    /// Both sides drop every space and line break before comparing; the needle
+    /// is a single path component with neither, so this cannot match anything
+    /// else. It matters most for the NEGATIVE assertions: a wrapped token makes
+    /// a plain `!contains` falsely pass.
+    fn shows_unwrapped(grid: &str, needle: &str) -> bool {
+        fn squash(s: &str) -> String {
+            s.chars().filter(|c| !c.is_whitespace()).collect()
+        }
+        squash(grid).contains(&squash(needle))
+    }
+
     /// Poll the pane's visible grid for `needle` until `timeout`. The PTY reader
     /// is a background thread, so the output arrives asynchronously; returns the
     /// last grid seen so a failure message can show what DID land.
@@ -1717,7 +1745,7 @@ mod tests {
         let mut last = String::new();
         loop {
             last = pane.grid_text().unwrap_or(last);
-            if last.contains(needle) {
+            if shows_unwrapped(&last, needle) {
                 return last;
             }
             if std::time::Instant::now() >= deadline {
@@ -1766,7 +1794,7 @@ mod tests {
         let grid = wait_for_grid(&pane, &unique, std::time::Duration::from_secs(20));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
-            grid.contains(&unique),
+            shows_unwrapped(&grid, &unique),
             "the child must RUN in the requested cwd; wanted {unique:?} in the \
              grid, got:\n{grid}"
         );
@@ -1846,7 +1874,7 @@ mod tests {
             "a vanished cwd must fall back to home ({home:?}); got:\n{grid}"
         );
         assert!(
-            !grid.contains(&unique),
+            !shows_unwrapped(&grid, &unique),
             "the child cannot be running in a directory that does not exist; \
              got:\n{grid}"
         );

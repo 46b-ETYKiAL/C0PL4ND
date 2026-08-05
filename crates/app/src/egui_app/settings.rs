@@ -181,9 +181,6 @@ const KEYBINDING_SEARCH_LABELS: &[&str] = &[
     "reopen closed pane",
 ];
 
-/// The release channels the Updates section offers. Mirrors the channels the
-/// `c0pl4nd update` checker understands; a free choice list, not invented.
-
 /// The usable range of the chromatic-aberration INTENSITY slider.
 ///
 /// [`CHROMATIC_MIN`] doubles as the "not meaningfully set" floor, and that is

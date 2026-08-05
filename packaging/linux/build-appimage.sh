@@ -39,6 +39,11 @@ mkdir -p "${APPDIR}/usr/bin"
 mkdir -p "${APPDIR}/usr/share/applications"
 mkdir -p "${APPDIR}/usr/share/icons/hicolor/256x256/apps"
 
+# License texts (OFL-1.1 s2 — the embedded typefaces' licenses must travel
+# with every copy). Mandatory: the collector exits non-zero if any is missing.
+sh "${SCRIPT_DIR}/../collect-licenses.sh" "${SCRIPT_DIR}/../.." \
+	"${APPDIR}/usr/share/doc/${BIN}"
+
 cp "${BIN_PATH}" "${APPDIR}/usr/bin/${BIN}"
 chmod +x "${APPDIR}/usr/bin/${BIN}"
 cp "${DESKTOP}" "${APPDIR}/usr/share/applications/c0pl4nd.desktop"

@@ -1,24 +1,49 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  C0PL4ND Windows installer. WiX Toolset v6 (dotnet "wix" CLI).
-  The release.yml "msi" job builds this; see that workflow for the exact
-  invocation (it installs the wix global tool, adds the WixToolset.UI.wixext
-  extension, builds the release binary, then runs "wix build" from the repo
-  root). Source paths below are relative to the working directory (repo root).
+  C0PL4ND Windows installer (MSI). WiX Toolset v3.14.1 (candle / light / dark).
+
+  Built by the release.yml "msi" job, which mirrors the sibling SCR1B3 repo's
+  proven job verbatim: it downloads the pinned wix314-binaries.zip, verifies its
+  SHA-256 BEFORE extracting, compiles this file with `candle`, links with
+  `light` WITH ICE validation left ON, and then reads the built package back out
+  with `dark` to assert the shell/registry rows really made it into the MSI.
+
+  This file was authored against the WiX v4/v6 schema and NEVER compiled - there
+  was no WiX or cargo-wix anywhere in the repo, so the previous header comment
+  here (which claimed a release.yml "msi" job already built it via the dotnet
+  `wix` CLI) described a job that did not exist. It is now v3 schema, on the same
+  toolchain SCR1B3 ships, and is actually compiled by CI.
+
+  `candle` is invoked from the REPO ROOT, so the SourceFile/Value paths below are
+  relative to the repo root. The binary itself comes in via -dCargoTargetBinDir
+  so the packaged .exe is the SAME artifact the release publishes rather than a
+  second, separately-compiled one.
+
   The UpgradeCode GUID is STABLE: never regenerate it, or upgrades will break.
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
-  <Package
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product
+    Id="*"
     Name="C0PL4ND"
     Manufacturer="Itasha.Corp"
     Version="$(var.Version)"
     UpgradeCode="ADBB978D-ED4E-4EE3-A04F-22293BB12275"
     Language="1033"
-    Codepage="1252"
-    Scope="perMachine">
+    Codepage="1252">
 
-    <SummaryInformation
+    <!--
+      InstallerVersion 500 = Windows Installer 5.0, the floor for a 64-bit
+      package that resolves ProgramFiles64Folder. InstallScope="perMachine" is
+      the v3 spelling of the v4 `Scope="perMachine"` attribute; it is what makes
+      this an elevated, all-users install (C0PL4ND writes the machine PATH and
+      HKLM shell verbs, so it cannot be perUser - unlike SCR1B3, which is
+      strictly perUser and therefore carries the ICE38/ICE91 suppressions this
+      package does NOT need).
+    -->
+    <Package
+      InstallerVersion="500"
+      Compressed="yes"
+      InstallScope="perMachine"
       Keywords="terminal,emulator,gpu,rust"
       Description="C0PL4ND — the operator's shell into the wired" />
 
@@ -28,118 +53,140 @@
 
     <MediaTemplate EmbedCab="yes" />
 
-    <!-- Install under Program Files\C0PL4ND and add it to the machine PATH. -->
-    <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="C0PL4ND">
-        <Component Id="MainExecutable" Guid="*">
-          <File
-            Id="c0pl4ndExe"
-            Name="c0pl4nd.exe"
-            Source="target\release\c0pl4nd.exe"
-            KeyPath="yes" />
-          <Environment
-            Id="UpdatePath"
-            Name="PATH"
-            Value="[INSTALLFOLDER]"
-            Permanent="no"
-            Part="last"
-            Action="set"
-            System="yes" />
-        </Component>
-      </Directory>
-    </StandardDirectory>
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <!-- Install under Program Files\C0PL4ND and add it to the machine PATH. -->
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="C0PL4ND">
+          <Component Id="MainExecutable" Guid="*" Win64="yes">
+            <File
+              Id="c0pl4ndExe"
+              Name="c0pl4nd.exe"
+              Source="$(var.CargoTargetBinDir)\c0pl4nd.exe"
+              KeyPath="yes" />
+            <Environment
+              Id="UpdatePath"
+              Name="PATH"
+              Value="[INSTALLFOLDER]"
+              Permanent="no"
+              Part="last"
+              Action="set"
+              System="yes" />
+          </Component>
 
-    <!-- Start Menu shortcut. -->
-    <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="ApplicationProgramsFolder" Name="C0PL4ND">
-        <Component Id="ApplicationShortcut" Guid="*">
           <!--
-            The AUMID is REQUIRED, not decoration.
+            Explorer context-menu verb: "Open C0PL4ND here".
 
-            A non-packaged Win32 process may only raise a WinRT toast under an
-            Application User Model ID that resolves to an installed Start-Menu
-            shortcut carrying that same ID in its System.AppUserModel.ID
-            property. With no such property, ToastNotifier.Show() RETURNS
-            SUCCESS and nothing is ever displayed - the failure has no runtime
-            symptom at all. C0PL4ND's OSC 9 / OSC 777 desktop-notification
-            path raises such a toast, so without this line that whole
-            feature is silently inert on a machine installed from this MSI.
+            Two keys are required, and they are NOT interchangeable:
+              * Directory\shell          - right-click ON a folder icon.
+              * Directory\Background\shell - right-click on the EMPTY SPACE inside an
+                open folder (the far more common gesture).
 
-            The value MUST equal notify::AUMID in crates/app/src/notify.rs.
-            The pair is pinned in both directions by the notify_tests aumid
-            tests, which parse this file - a hand edit here that disagrees with
-            the constant fails the build rather than shipping a dead toast.
+            Both use the %V token. %V is correct for BOTH cases; %1 works only for the
+            first and expands to nothing for Background, which is the classic bug that
+            makes the verb silently open in the wrong directory. The value is passed to
+            the binary's cwd flag (see crates/app/src/cli_cwd.rs), which validates it
+            and refuses a non-existent or non-directory path rather than falling back
+            silently - a path arriving from the shell is untrusted input.
 
-            The shortcut is deliberately NON-advertised (a plain Target=), which
-            is what lets it carry shell properties.
+            ForceDeleteOnUninstall removes the whole key on uninstall so no orphan verb
+            is left pointing at a deleted binary.
           -->
-          <Shortcut
-            Id="ApplicationStartMenuShortcut"
-            Name="C0PL4ND"
-            Description="C0PL4ND terminal emulator"
-            Target="[INSTALLFOLDER]c0pl4nd.exe"
-            WorkingDirectory="INSTALLFOLDER">
-            <ShortcutProperty Key="System.AppUserModel.ID" Value="Itasha.Corp.C0PL4ND" />
-          </Shortcut>
-          <RemoveFolder Id="CleanUpShortCut" Directory="ApplicationProgramsFolder" On="uninstall" />
-          <RegistryValue
-            Root="HKCU"
-            Key="Software\Itasha.Corp\C0PL4ND"
-            Name="installed"
-            Type="integer"
-            Value="1"
-            KeyPath="yes" />
-        </Component>
+          <Component Id="ShellOpenHereVerb" Guid="*" Win64="yes">
+            <RegistryKey
+              Root="HKLM"
+              Key="Software\Classes\Directory\shell\C0pl4ndOpenHere"
+              ForceDeleteOnUninstall="yes">
+              <RegistryValue Type="string" Value="Open C0PL4ND here" KeyPath="yes" />
+              <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]c0pl4nd.exe" />
+            </RegistryKey>
+            <RegistryKey
+              Root="HKLM"
+              Key="Software\Classes\Directory\shell\C0pl4ndOpenHere\command"
+              ForceDeleteOnUninstall="yes">
+              <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]c0pl4nd.exe&quot; --cwd &quot;%V&quot;" />
+            </RegistryKey>
+
+            <RegistryKey
+              Root="HKLM"
+              Key="Software\Classes\Directory\Background\shell\C0pl4ndOpenHere"
+              ForceDeleteOnUninstall="yes">
+              <RegistryValue Type="string" Value="Open C0PL4ND here" />
+              <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]c0pl4nd.exe" />
+            </RegistryKey>
+            <RegistryKey
+              Root="HKLM"
+              Key="Software\Classes\Directory\Background\shell\C0pl4ndOpenHere\command"
+              ForceDeleteOnUninstall="yes">
+              <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]c0pl4nd.exe&quot; --cwd &quot;%V&quot;" />
+            </RegistryKey>
+          </Component>
+        </Directory>
       </Directory>
-    </StandardDirectory>
 
-    <!--
-      Explorer context-menu verb: "Open C0PL4ND here".
+      <!-- Start Menu shortcut. -->
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="C0PL4ND">
+          <Component Id="ApplicationShortcut" Guid="*">
+            <!--
+              The AUMID is REQUIRED, not decoration.
 
-      Two keys are required, and they are NOT interchangeable:
-        * Directory\shell          - right-click ON a folder icon.
-        * Directory\Background\shell - right-click on the EMPTY SPACE inside an
-          open folder (the far more common gesture).
+              A non-packaged Win32 process may only raise a WinRT toast under an
+              Application User Model ID that resolves to an installed Start-Menu
+              shortcut carrying that same ID in its System.AppUserModel.ID
+              property. With no such property, ToastNotifier.Show() RETURNS
+              SUCCESS and nothing is ever displayed - the failure has no runtime
+              symptom at all. C0PL4ND's OSC 9 / OSC 777 desktop-notification
+              path raises such a toast, so without this line that whole
+              feature is silently inert on a machine installed from this MSI.
 
-      Both use the %V token. %V is correct for BOTH cases; %1 works only for the
-      first and expands to nothing for Background, which is the classic bug that
-      makes the verb silently open in the wrong directory. The value is passed to
-      the binary's cwd flag (see crates/app/src/cli_cwd.rs), which validates it
-      and refuses a non-existent or non-directory path rather than falling back
-      silently - a path arriving from the shell is untrusted input.
+              The value MUST equal notify::AUMID in crates/app/src/notify.rs.
+              The pair is pinned in both directions by the notify_tests aumid
+              tests, which parse this file - a hand edit here that disagrees with
+              the constant fails the build rather than shipping a dead toast.
 
-      ForceDeleteOnUninstall removes the whole key on uninstall so no orphan verb
-      is left pointing at a deleted binary.
-    -->
-    <Component Id="ShellOpenHereVerb" Guid="*" Directory="INSTALLFOLDER">
-      <RegistryKey
-        Root="HKLM"
-        Key="Software\Classes\Directory\shell\C0pl4ndOpenHere"
-        ForceDeleteOnUninstall="yes">
-        <RegistryValue Type="string" Value="Open C0PL4ND here" KeyPath="yes" />
-        <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]c0pl4nd.exe" />
-      </RegistryKey>
-      <RegistryKey
-        Root="HKLM"
-        Key="Software\Classes\Directory\shell\C0pl4ndOpenHere\command"
-        ForceDeleteOnUninstall="yes">
-        <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]c0pl4nd.exe&quot; --cwd &quot;%V&quot;" />
-      </RegistryKey>
+              The shortcut is deliberately NON-advertised (a plain Target=), which
+              is what lets it carry shell properties.
+            -->
+            <Shortcut
+              Id="ApplicationStartMenuShortcut"
+              Name="C0PL4ND"
+              Description="C0PL4ND terminal emulator"
+              Target="[INSTALLFOLDER]c0pl4nd.exe"
+              WorkingDirectory="INSTALLFOLDER">
+              <ShortcutProperty Key="System.AppUserModel.ID" Value="Itasha.Corp.C0PL4ND" />
+            </Shortcut>
+            <RemoveFolder Id="CleanUpShortCut" Directory="ApplicationProgramsFolder" On="uninstall" />
+            <!--
+              HKCU is REQUIRED here, and it is not an oversight that a
+              perMachine package writes a per-user KeyPath in this one
+              component.
 
-      <RegistryKey
-        Root="HKLM"
-        Key="Software\Classes\Directory\Background\shell\C0pl4ndOpenHere"
-        ForceDeleteOnUninstall="yes">
-        <RegistryValue Type="string" Value="Open C0PL4ND here" />
-        <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]c0pl4nd.exe" />
-      </RegistryKey>
-      <RegistryKey
-        Root="HKLM"
-        Key="Software\Classes\Directory\Background\shell\C0pl4ndOpenHere\command"
-        ForceDeleteOnUninstall="yes">
-        <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]c0pl4nd.exe&quot; --cwd &quot;%V&quot;" />
-      </RegistryKey>
-    </Component>
+              A non-advertised shortcut (mandatory, so it can carry the AUMID
+              above) cannot itself be a KeyPath, so this component needs a
+              registry KeyPath. ICE57 classifies a ProgramMenuFolder shortcut as
+              PER-USER data, so the KeyPath must be per-user too or the
+              component mixes contexts. Both alternatives were tried against
+              `light` with full ICE validation:
+                * Root="HKMU" - FAILS, error LGHT0204 / ICE57 "Component
+                  'ApplicationShortcut' has both per-user data and a keypath
+                  that can be either per-user or per-machine".
+                * Root="HKCU" - links CLEAN, no ICE suppression needed.
+              So HKCU stays. This is also why ApplicationShortcut is a separate
+              component from MainExecutable and ShellOpenHereVerb (both of which
+              are genuinely per-machine, Win64, HKLM): splitting them is what
+              lets this package link with ZERO -sice: flags.
+            -->
+            <RegistryValue
+              Root="HKCU"
+              Key="Software\Itasha.Corp\C0PL4ND"
+              Name="installed"
+              Type="integer"
+              Value="1"
+              KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
 
     <Feature Id="Main" Title="C0PL4ND" Level="1">
       <ComponentRef Id="MainExecutable" />
@@ -150,12 +197,12 @@
     <!-- Add/Remove Programs metadata + branded icon. -->
     <Icon Id="ProductIcon" SourceFile="packaging\windows\c0pl4nd.ico" />
     <Property Id="ARPPRODUCTICON" Value="ProductIcon" />
-    <Property Id="ARPHELPLINK" Value="https://github.com/itasha-corp/c0pl4nd" />
-    <Property Id="ARPURLINFOABOUT" Value="https://github.com/itasha-corp/c0pl4nd" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/46b-ETYKiAL/C0PL4ND" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/46b-ETYKiAL/C0PL4ND" />
 
     <!-- Install-dir UI with the MIT OR Apache-2.0 license shown to the user. -->
     <WixVariable Id="WixUILicenseRtf" Value="packaging\windows\License.rtf" />
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
-    <ui:WixUI Id="WixUI_InstallDir" />
-  </Package>
+    <UIRef Id="WixUI_InstallDir" />
+  </Product>
 </Wix>

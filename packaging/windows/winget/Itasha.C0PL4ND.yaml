@@ -5,20 +5,31 @@
 # To submit to the Windows Package Manager Community Repository
 # (microsoft/winget-pkgs), split this into the three multi-file manifests
 # (version / installer / locale) or keep singleton form for initial review.
-# The release workflow (.github/workflows/release.yml) fills the per-tag
-# values below from the built MSI: PackageVersion (release tag), InstallerUrl
-# (release asset URL), InstallerSha256 (sha256 of the MSI), and ProductCode
-# (the MSI ProductCode GUID). The zeroed sha256/GUID are rewritten per release.
+# THIS FILE IS HAND-MAINTAINED. Nothing in .github/workflows/ references
+# winget, so no job rewrites the values below -- an earlier version of this
+# comment claimed the release workflow filled them in, which was never true.
+#
+# Before submitting a release, update BY HAND from the built MSI:
+#   PackageVersion   the release tag, without the leading v
+#   InstallerUrl     the release asset URL (the windows-msi job publishes
+#                    c0pl4nd-<tag>-x86_64-pc-windows-msvc.msi)
+#   InstallerSha256  contents of the published <asset>.msi.sha256
+#   ProductCode      the MSI ProductCode GUID (msiinfo / dark the package)
+#
+# The zeroed sha256/GUID below are PLACEHOLDERS and will be rejected by
+# winget validation until replaced -- that is deliberate, so an unedited
+# manifest fails loudly rather than installing something unverified.
+# x64 only: the release builds no aarch64 MSI.
 PackageIdentifier: Itasha.C0PL4ND
-PackageVersion: "0.1.0"
+PackageVersion: "0.4.25"
 PackageName: C0PL4ND
 Publisher: Itasha.Corp
-PublisherUrl: https://github.com/itasha-corp
-PublisherSupportUrl: https://github.com/itasha-corp/c0pl4nd/issues
+PublisherUrl: https://github.com/46b-ETYKiAL
+PublisherSupportUrl: https://github.com/46b-ETYKiAL/C0PL4ND/issues
 Author: Itasha.Corp
-PackageUrl: https://github.com/itasha-corp/c0pl4nd
+PackageUrl: https://github.com/46b-ETYKiAL/C0PL4ND
 License: MIT OR Apache-2.0
-LicenseUrl: https://github.com/itasha-corp/c0pl4nd/blob/main/LICENSE-MIT
+LicenseUrl: https://github.com/46b-ETYKiAL/C0PL4ND/blob/master/LICENSE-MIT
 Copyright: Copyright (c) Itasha.Corp
 ShortDescription: A fast, cross-platform terminal emulator.
 Description: |-
@@ -40,7 +51,7 @@ InstallModes:
 UpgradeBehavior: install
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/itasha-corp/c0pl4nd/releases/download/v0.1.0/c0pl4nd-v0.1.0-x86_64-pc-windows-msvc.msi
+    InstallerUrl: https://github.com/46b-ETYKiAL/C0PL4ND/releases/download/v0.4.25/c0pl4nd-v0.4.25-x86_64-pc-windows-msvc.msi
     InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
     ProductCode: "{00000000-0000-0000-0000-000000000000}"
     Scope: machine

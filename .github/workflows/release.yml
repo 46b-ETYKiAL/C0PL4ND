@@ -32,9 +32,46 @@ env:
 
 jobs:
   # --------------------------------------------------------------------------
+  # License-delivery gate. Runs BEFORE anything is built so a release can never
+  # publish an artifact that omits the license texts it is legally required to
+  # carry. The shipped binary embeds ~22 OFL-1.1 / Apache-2.0 typefaces via
+  # include_bytes!, and OFL-1.1 s2 requires the license to accompany every copy.
+  #
+  # This asserts over the packaging manifest (this workflow + the packaging
+  # scripts) and the repo tree -- it builds nothing, so it is seconds, not
+  # minutes. Every other job gates on it via `needs:`.
+  # --------------------------------------------------------------------------
+  license-delivery:
+    name: License delivery (fonts must ship their licenses)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        # actions/checkout@v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install PyYAML
+        run: python3 -m pip install --user --disable-pip-version-check pyyaml
+      - name: Verify every artifact path stages its license texts
+        run: python3 packaging/verify_license_delivery.py
+      - name: Verify the collector itself produces a complete license set
+        run: |
+          set -euo pipefail
+          sh packaging/collect-licenses.sh "${PWD}" /tmp/license-probe
+          echo "--- staged tree ---"
+          find /tmp/license-probe -type f | sort
+          # A tree with no font licenses means the collector silently no-op'd.
+          n=$(find /tmp/license-probe/licenses/fonts -type f | wc -l)
+          [ "$n" -gt 0 ] || { echo "::error::no font licenses staged"; exit 1; }
+          echo "font license files staged: $n"
+
+  # --------------------------------------------------------------------------
   # Build a release binary per OS/arch + per-binary SLSA provenance attestation.
   # --------------------------------------------------------------------------
   build:
+    needs: license-delivery
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     permissions:
@@ -175,7 +212,15 @@ jobs:
           stage="${BIN_NAME}-${tag}-${target}"
           mkdir -p "dist/${stage}"
           cp "target/${target}/release/${BIN_NAME}" "dist/${stage}/"
-          cp LICENSE-MIT LICENSE-APACHE README.md "dist/${stage}/" 2>/dev/null || true
+          cp README.md "dist/${stage}/"
+          # License delivery is MANDATORY, not best-effort. The binary embeds
+          # ~21 OFL-1.1 / Apache-2.0 typefaces via include_bytes!, and OFL-1.1
+          # s2 requires the license text to accompany every copy. This staging
+          # step fails the build if any bundled font's license is missing, so an
+          # artifact can never ship without it. (Previously this was
+          # `cp LICENSE-* README.md … 2>/dev/null || true` — best-effort, no
+          # font licenses at all, and silent on failure.)
+          sh packaging/collect-licenses.sh "${PWD}" "dist/${stage}"
           ( cd dist && tar -czf "${stage}.tar.gz" "${stage}" )
           ( cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256" )
           echo "artifact=dist/${stage}.tar.gz" >> "$GITHUB_ENV"
@@ -195,9 +240,14 @@ jobs:
           $stage = "$env:BIN_NAME-$tag-$target"
           New-Item -ItemType Directory -Force -Path "dist/$stage" | Out-Null
           Copy-Item "target/$target/release/$env:BIN_NAME.exe" "dist/$stage/"
-          foreach ($f in @("LICENSE-MIT","LICENSE-APACHE","README.md")) {
-            if (Test-Path $f) { Copy-Item $f "dist/$stage/" }
-          }
+          Copy-Item "README.md" "dist/$stage/"
+          # License delivery is MANDATORY (see the Unix packaging step). The
+          # collector is POSIX sh; the windows-latest runner ships Git Bash, so
+          # invoke it via `bash`. A non-zero exit MUST fail the job -- an
+          # artifact that ships embedded OFL-1.1 fonts without their license
+          # text is a license breach.
+          bash packaging/collect-licenses.sh "$(Get-Location)" "dist/$stage"
+          if ($LASTEXITCODE -ne 0) { throw "license collection failed" }
           Compress-Archive -Path "dist/$stage/*" -DestinationPath "dist/$stage.zip" -Force
           $hash = (Get-FileHash "dist/$stage.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $stage.zip" | Out-File -Encoding ascii "dist/$stage.zip.sha256"
@@ -401,9 +451,18 @@ jobs:
           [ -n "$exe" ] || { echo "c0pl4nd.exe not found"; exit 1; }
           mkdir -p payload
           cp "$exe" payload/
+          # NOTE: `app/assets` is the repo-ROOT assets dir — icons and media
+          # only. C0PL4ND's bundled typefaces live under
+          # `app/crates/app/assets/fonts/`, so this copy picks up ZERO font
+          # licenses. (The sibling SCR1B3 repo has the identical line and it
+          # *does* catch its fonts purely because its fonts sit at the repo
+          # root — the same line is load-bearing there and inert here.)
+          # The collector below is what actually satisfies OFL-1.1 s2.
           if [ -d app/assets ]; then cp -r app/assets payload/assets; fi
-          for f in LICENSE-MIT LICENSE-APACHE README.md; do [ -f "app/$f" ] && cp "app/$f" payload/ || true; done
+          [ -f app/README.md ] && cp app/README.md payload/
+          sh app/packaging/collect-licenses.sh "app" payload
           echo "payload contents:"; find payload -maxdepth 2 | head -40
+          echo "font licenses in payload: $(find payload/licenses/fonts -type f 2>/dev/null | wc -l)"
       - name: Build native installer
         shell: bash
         env:
@@ -456,9 +515,192 @@ jobs:
           path: dist-out/
           if-no-files-found: error
 
+  windows-msi:
+    # The MSI. Before this job there was NO WiX or cargo-wix anywhere in the
+    # repo: `packaging/windows/c0pl4nd.wxs` had never been compiled by CI or
+    # locally, and its own header comment claimed a release.yml "msi" job built
+    # it — a job that did not exist. So the file was never validated by anything
+    # except the notify_tests, which parse it as TEXT.
+    #
+    # That comment is now corrected and the file is WiX v3 schema (it was
+    # authored against the WiX v4/v6 schema, which candle/light cannot read at
+    # all). This is deliberately the SAME toolchain and the SAME job shape the
+    # sibling SCR1B3 repo already runs on a real runner — pinned + checksummed
+    # WiX 3.14.1, candle, light with ICE validation left ON, then a dark
+    # decompile that reads the built package back out — rather than a second,
+    # divergent installer toolchain in the fleet.
+    #
+    # Like SCR1B3's, it CONSUMES the `build` job's artifact instead of
+    # rebuilding, so the .exe inside the MSI is byte-identical to the one in the
+    # published .zip: same cargo-auditable SBOM, same hardening, one build.
+    name: Windows installer (.msi)
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      # WiX 3.x, pinned to a release asset + SHA-256 rather than relying on
+      # whatever the runner image preinstalls, so a runner image change cannot
+      # silently swap the compiler under the gate. Kept byte-identical to
+      # SCR1B3's job — if one moves, move both.
+      WIX_URL: "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip"
+      WIX_SHA256: "6ac824e1642d6f7277d0ed7ea09411a508f6116ba6fae0aa5f2c7daa2ff43d31"
+    steps:
+      - name: Harden the runner (egress audit)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920
+        with:
+          egress-policy: audit
+      - name: Checkout C0PL4ND (installer source + icon + license)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Download Windows binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: c0pl4nd-x86_64-pc-windows-msvc
+          path: winbin
+      - name: Stage the released binary as the MSI payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip="$(find winbin -name '*.zip' | head -1)"
+          [ -n "$zip" ] || { echo "::error::no windows binary zip under winbin/"; exit 1; }
+          python -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall('winbin/x')" "$zip"
+          exe="$(find winbin/x -name 'c0pl4nd.exe' | head -1)"
+          [ -n "$exe" ] || { echo "::error::c0pl4nd.exe not found in the release zip"; exit 1; }
+          mkdir -p payload
+          cp "$exe" payload/
+          ls -la payload/c0pl4nd.exe
+      - name: Install WiX 3.14 (pinned + checksum-verified)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSLf -o wix314-binaries.zip "$WIX_URL"
+          # Verify BEFORE extracting: an unverified archive is never unpacked.
+          echo "${WIX_SHA256}  wix314-binaries.zip" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/wix"
+          if command -v unzip >/dev/null 2>&1; then
+            unzip -q -o wix314-binaries.zip -d "$RUNNER_TEMP/wix"
+          elif command -v 7z >/dev/null 2>&1; then
+            7z x -y -o"$RUNNER_TEMP/wix" wix314-binaries.zip > /dev/null
+          else
+            echo "::error::no archive extractor available (tried unzip, 7z)"
+            exit 1
+          fi
+          for t in candle.exe light.exe dark.exe; do
+            [ -f "$RUNNER_TEMP/wix/$t" ] || { echo "::error::WiX archive did not contain $t"; exit 1; }
+          done
+      - name: Compile the installer source (candle)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # No Rust toolchain in this job (it builds nothing). The workspace root
+          # carries the real version; the c0pl4nd crate inherits it via
+          # `version.workspace = true`.
+          VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          # WiX requires x.x.x.x with each field <= 65534, so a non-numeric or
+          # empty version must stop here rather than reach candle as garbage.
+          echo "$VER" | grep -qE '^[0-9]+(\.[0-9]+){1,3}$' \
+            || { echo "::error::could not resolve a numeric version (got '$VER')"; exit 1; }
+          echo "installer version = $VER"
+          # candle runs from the repo root, which is what the .wxs's
+          # packaging\windows\... SourceFile/Value paths are relative to.
+          BIN_DIR="$(pwd -W)/payload"
+          "$RUNNER_TEMP/wix/candle.exe" -nologo -arch x64 \
+            -dVersion="$VER" -dCargoTargetBinDir="$BIN_DIR" \
+            -out c0pl4nd.wixobj packaging/windows/c0pl4nd.wxs
+          [ -s c0pl4nd.wixobj ] || { echo "::error::candle reported success but produced no .wixobj"; exit 1; }
+      - name: Link the installer (light, with ICE validation)
+        shell: bash
+        # ICE validation is ON and NOTHING is suppressed. Unlike SCR1B3 — which
+        # is a strictly perUser package and therefore needs -sice:ICE38 — this
+        # package is perMachine and links clean with zero -sice flags. Keep it
+        # that way: an ICE here is a real defect in the .wxs, not a flag to add.
+        #
+        # The one thing that had to be got right for that: ApplicationShortcut's
+        # KeyPath must be HKCU. ICE57 classifies a ProgramMenuFolder shortcut as
+        # per-user data, so an HKMU KeyPath fails with LGHT0204/ICE57 "has both
+        # per-user data and a keypath that can be either per-user or
+        # per-machine". The genuinely per-machine rows (the exe + PATH, and the
+        # HKLM shell verbs) live in their own Win64 components for the same
+        # reason.
+        #
+        # ICE61 is emitted as warning LGHT1076 (MajorUpgrade
+        # AllowSameVersionUpgrades="yes" makes Maximum == current). light exits
+        # 0, so it is not suppressed — same treatment SCR1B3 gives ICE91.
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/wix/light.exe" -nologo \
+            -ext WixUIExtension -ext WixUtilExtension \
+            -out c0pl4nd-installer.msi c0pl4nd.wixobj
+          [ -f c0pl4nd-installer.msi ] || { echo "::error::light reported success but produced no .msi"; exit 1; }
+          # light writes the .msi BEFORE ICE validation runs, so "the file
+          # exists" is not by itself proof the link succeeded -- `set -e` on
+          # light's exit status is what enforces that. This size floor is the
+          # separate check that the package is not a degenerate stub.
+          sz=$(wc -c < c0pl4nd-installer.msi)
+          echo "MSI size = $sz bytes"
+          [ "$sz" -gt 100000 ] || { echo "::error::MSI is implausibly small ($sz bytes)"; exit 1; }
+      - name: Assert the compiled MSI carries the AUMID and the shell verbs
+        shell: bash
+        # Reads the tables back out of the BUILT package (via WiX's own
+        # decompiler) instead of trusting the source text. This is what upgrades
+        # the notify_tests' premise from assumed to verified: those tests prove
+        # c0pl4nd.wxs's TEXT carries System.AppUserModel.ID == notify::AUMID;
+        # this proves the package that would actually ship carries it. Without
+        # the AUMID in the shipped MSI, every toast the app raises is accepted by
+        # the shell and silently never displayed.
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/wix/dark.exe" -nologo c0pl4nd-installer.msi -out decompiled.wxs
+          [ -s decompiled.wxs ] || { echo "::error::dark produced no output"; exit 1; }
+          src=$(grep -oE 'pub const AUMID: &str = "[^"]+"' crates/app/src/notify.rs \
+                | sed -E 's/.*"([^"]+)"/\1/')
+          built=$(grep -oE 'Key="System.AppUserModel.ID" Value="[^"]+"' decompiled.wxs \
+                | sed -E 's/.*Value="([^"]+)"/\1/')
+          echo "AUMID: source='$src' compiled='$built'"
+          # Both must be non-empty: two empty strings would compare equal and
+          # make this assertion vacuously true.
+          [ -n "$src" ] || { echo "::error::could not read notify::AUMID from notify.rs"; exit 1; }
+          [ -n "$built" ] || { echo "::error::the compiled MSI carries NO System.AppUserModel.ID -- every toast would be silently swallowed."; exit 1; }
+          [ "$src" = "$built" ] || { echo "::error::AUMID mismatch: notify.rs '$src' != compiled MSI '$built'"; exit 1; }
+          verbs=$(grep -c 'C0pl4ndOpenHere' decompiled.wxs || true)
+          echo "shell-verb registry rows in the compiled MSI: $verbs"
+          [ "$verbs" -ge 8 ] || { echo "::error::the 'Open C0PL4ND here' shell verb did not make it into the package (found $verbs rows)"; exit 1; }
+      - name: Name + checksum the release asset
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist-msi
+          T="${TAG//\//-}"
+          mv c0pl4nd-installer.msi "dist-msi/c0pl4nd-${T}-x86_64-pc-windows-msvc.msi"
+          cd dist-msi
+          # Unconditional, exactly like the native-CRT installer job above. This
+          # deliberately does NOT copy the `build` job's
+          # `if command -v sha256sum ... || true` form, which silently skips the
+          # checksum on any runner that lacks sha256sum. This job only runs on
+          # windows-latest, where Git-Bash always provides it, so a failure here
+          # is a real failure.
+          for m in *.msi; do sha256sum "$m" > "$m.sha256"; done
+          ls -la; cat *.sha256
+      - name: Attest MSI provenance (SLSA)
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
+        with:
+          subject-path: dist-msi/*.msi
+      - name: Upload MSI
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-msi
+          path: dist-msi/
+          if-no-files-found: error
+
   release:
     name: Publish Release
-    needs: [build, sbom, windows-installer]
+    needs: [build, sbom, windows-installer, windows-msi]
     runs-on: ubuntu-latest
     permissions:
       # The only job that needs write to create the release + upload assets.
@@ -467,7 +709,15 @@ jobs:
       # set (not just the per-job artifacts) needs OIDC + attestations write.
       id-token: write
       attestations: write
-    if: always() && needs.build.result == 'success' && startsWith(github.ref, 'refs/tags/v')
+    # NO `always()`. With it, this job ran whenever `build` succeeded and the
+    # other three entries in `needs:` were decorative — a failed `sbom`,
+    # `windows-installer` or `windows-msi` still published the release, silently
+    # missing the asset that job produces. Without it, GitHub's default applies:
+    # the job runs only when EVERY `needs:` entry succeeded, which is what
+    # listing them was for. (`needs.build.result == 'success'` is then implied,
+    # so it is gone too — a redundant condition invites re-adding `always()` to
+    # "make it work".)
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Harden the runner (egress audit)
         # step-security/harden-runner@v2.19.4
@@ -498,7 +748,7 @@ jobs:
           set -euo pipefail
           mkdir -p release
           find artifacts -type f \
-            \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.sha256' -o -name '*.cdx.json' -o -name 'BUILD-PROVENANCE.txt' \) \
+            \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.msi' -o -name '*.sha256' -o -name '*.cdx.json' -o -name 'BUILD-PROVENANCE.txt' \) \
             -exec cp {} release/ \;
           ( cd release && cat *.sha256 > SHA256SUMS 2>/dev/null || true )
           ls -la release
@@ -608,11 +858,11 @@ jobs:
         # `<asset>.minisig` sibling (the `.sha256` siblings already exist from the
         # build job) and `files: release/*` below uploads them.
         #
-        # ACTIVATION (one-time, repo owner): a passwordless rsign2 keypair was
-        # generated (`rsign generate -W`); the public half is embedded in
-        # `update_engine/verify.rs` and the secret half written to
-        # `.s4f3-data/c0pl4nd-minisign-secret.key` (OUTSIDE the repo). Add that
-        # secret-key file's CONTENTS as the `MINISIGN_SECRET_KEY` Actions secret.
+        # ACTIVATION (one-time, repo owner): generate an rsign2 keypair, embed
+        # the public half in `update_engine/verify.rs`, and add the secret half's
+        # CONTENTS as the `MINISIGN_SECRET_KEY` Actions secret. Where the secret
+        # half is kept offline is deliberately not recorded here — see
+        # `packaging/signing.md`.
         # Absent → this step is a NO-OP (artifacts ship checksummed but UNSIGNED;
         # the updater then rejects them — fail-closed). The in-script guard avoids
         # the secrets-in-`if` evaluation gotcha and fails safe.

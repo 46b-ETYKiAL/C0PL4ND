@@ -27,7 +27,7 @@ installable artifact — not just that a manifest file exists in the repo.
       update manifest `latest.json` (+ `latest.json.minisig`), `*.cdx.json`
       (SBOM), `BUILD-PROVENANCE.txt`, `*.sha256`, `SHA256SUMS`, and (when signing
       is provisioned) `*.minisig` siblings.
-- [ ] `gh attestation verify <asset> --repo 46b-ETYKiAL/Itasha.Corp_C0PL4ND`
+- [ ] `gh attestation verify <asset> --repo 46b-ETYKiAL/C0PL4ND`
       passes for at least one binary + the installer (SLSA build provenance).
 - [ ] `BUILD-PROVENANCE.txt` records the `rustc -vV` identity and the
       `rust-toolchain.toml` pin + its sha256.
@@ -85,10 +85,10 @@ flow.
 **Manifest in-repo:** `packaging/macos/c0pl4nd.rb` (cask skeleton).
 **Status: manifest not yet live.** The cask carries placeholder `sha256`
 values (`0000…` / `1111…`) and points at a `version "0.1.0"` with
-`itasha-corp/c0pl4nd` URLs. The bare README command `brew install --cask
+`46b-ETYKiAL/C0PL4ND` URLs. The bare README command `brew install --cask
 c0pl4nd` only resolves if the cask is published to **homebrew-cask** OR a tap
-(the cask's own header says distribute via `itasha-corp/homebrew-tap` →
-`brew install --cask itasha-corp/tap/c0pl4nd`). No tap repo is confirmed
+(the cask's own header says distribute via `46b-ETYKiAL/homebrew-tap` →
+`brew install --cask 46b-ETYKiAL/tap/c0pl4nd`). No tap repo is confirmed
 present. Note: the release matrix **does** build both macOS arches
 (`*-aarch64-apple-darwin.tar.gz` + `*-x86_64-apple-darwin.tar.gz` portable
 archives), so Mac users have a working download today. What is **not** built by
@@ -100,9 +100,9 @@ the Homebrew cask channel.
 
 Smoke tests once the cask + DMG are live:
 
-- [ ] `brew info --cask itasha-corp/tap/c0pl4nd` (or `c0pl4nd` if in
+- [ ] `brew info --cask 46b-ETYKiAL/tap/c0pl4nd` (or `c0pl4nd` if in
       homebrew-cask) — shows the new version.
-- [ ] `brew install --cask itasha-corp/tap/c0pl4nd` on a clean macOS — installs
+- [ ] `brew install --cask 46b-ETYKiAL/tap/c0pl4nd` on a clean macOS — installs
       `C0PL4ND.app` and the `c0pl4nd` CLI symlink.
 - [ ] `c0pl4nd --version` prints the new version.
 - [ ] `brew audit --cask --new c0pl4nd` (or `brew style packaging/macos/c0pl4nd.rb`)
@@ -139,30 +139,63 @@ Smoke tests once an AppImage asset is attached to the Release:
 ## 5. Linux/macOS — install script (`curl … | sh`)
 
 **In-repo:** `packaging/linux/install.sh` (detects OS/arch, downloads the
-latest release tarball, verifies sha256, installs to `~/.local/bin`).
+latest release tarball, verifies sha256 **and the minisign signature**, installs
+to `~/.local/bin`).
 **Status: script present and functional against the GitHub Releases tarballs**
-(which the release flow DOES produce). Caveat: the README advertises
-`https://get.c0pl4nd.dev/install.sh`, but the script's own usage header points
-at `https://raw.githubusercontent.com/itasha-corp/c0pl4nd/main/packaging/linux/install.sh`.
-The `get.c0pl4nd.dev` vanity domain is **unverified** — confirm it resolves and
-serves the current script, or update the README to the raw GitHub URL.
-The script's `REPO="itasha-corp/c0pl4nd"` must also match the actual release
-repo (`46b-ETYKiAL/Itasha.Corp_C0PL4ND`) for the download URLs to resolve —
-verify/realign before advertising.
+(which the release flow DOES produce). The only advertised install URL is the
+raw GitHub one, which is also the script's own usage header:
+
+```
+https://raw.githubusercontent.com/46b-ETYKiAL/C0PL4ND/master/packaging/linux/install.sh
+```
+
+**There is no vanity install domain.** `c0pl4nd.dev` and `get.c0pl4nd.dev` are
+**not registered** (both NXDOMAIN as of 2026-08-04) and are **not owned by this
+project**. Do NOT advertise either one anywhere — an unregistered install
+hostname is a supply-chain hijack waiting for whoever buys the domain first. If
+a vanity domain is ever wanted, register it *first*, then update this checklist
+and the README in the same change.
+
+Likewise, `REPO` in the script is the canonical `46b-ETYKiAL/C0PL4ND` — confirmed
+live, not assumed: `gh api repos/46b-ETYKiAL/C0PL4ND --jq .full_name` returns
+`46b-ETYKiAL/C0PL4ND`, and the advertised raw URL above returns HTTP 200
+(verified 2026-08-05).
+
+It previously read `itasha-corp/c0pl4nd`, a GitHub **owner** that does not exist
+(`gh api users/itasha-corp` → 404). Anyone could have registered `itasha-corp`
+and served arbitrary code to every user who ran the advertised `curl … | sh`.
+Never point release URLs at a namespace this project does not control.
+
+Note that `46b-ETYKiAL/Itasha.Corp_C0PL4ND` — still used by `Cargo.toml`, the
+in-app updater and the issue-intake defaults — is the repository's FORMER name
+and resolves only through GitHub's rename redirect (the API reports
+`full_name = 46b-ETYKiAL/C0PL4ND`). That redirect is not squattable, because only
+this account can create a repository under its own owner namespace, so it is a
+fragility rather than a hijack risk: it breaks if a differently-named repo is
+ever created there. Prefer the canonical name in anything new.
 
 Smoke tests:
 
 - [ ] **Dry-run / inspect first (never pipe-to-shell blind):**
-      `curl -fsSL <install-url> -o /tmp/install.sh && less /tmp/install.sh` —
-      review before running.
+      download `<install-url>` to `/tmp/install.sh` and read it before running.
 - [ ] `sh /tmp/install.sh` on a clean Linux container — confirm it downloads
-      the new tarball, the sha256 check passes, and the binary lands in
-      `~/.local/bin/c0pl4nd`.
+      the new tarball, the sha256 check passes, **the minisign signature
+      verifies**, and the binary lands in `~/.local/bin/c0pl4nd`.
 - [ ] `C0PL4ND_VERSION=<tag> sh /tmp/install.sh` — version pin honored.
 - [ ] `~/.local/bin/c0pl4nd --version` prints the new version.
-- [ ] Confirm the `<install-url>` advertised in the README actually serves this
-      script (resolve `get.c0pl4nd.dev` or switch the README to the raw URL).
-- [ ] Confirm `REPO` in the script equals the real release repo.
+- [ ] **Fail-closed check:** on a container with neither `minisign` nor `rsign`
+      installed, the script must ABORT with install instructions and must NOT
+      install anything. There is deliberately no skip-verification env var.
+- [ ] **Tamper check:** corrupt the downloaded `.tar.gz`, regenerate its
+      `.sha256` so the checksum gate passes, and confirm the signature gate
+      still rejects it. (A `.sha256` served from the same host as the artifact
+      is a corruption check, not a security control — the signature is the
+      control.)
+- [ ] Confirm every release publishes a `.minisig` sidecar next to each archive;
+      without it the installer fails closed and nobody can install.
+- [ ] Confirm `REPO` in the script equals the real release repo, and that the
+      raw URL's branch (`master`) is correct — the old header said `main`, which
+      does not exist in this repo and would have 404'd.
 
 ---
 

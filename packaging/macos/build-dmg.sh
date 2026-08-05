@@ -38,6 +38,12 @@ echo "Assembling ${APP_BUNDLE}"
 rm -rf "${APP_BUNDLE}"
 mkdir -p "${MACOS_DIR}" "${RES_DIR}"
 
+# License texts inside the bundle (OFL-1.1 s2 — the embedded typefaces'
+# licenses must travel with every copy). Mandatory: the collector exits
+# non-zero if any is missing, failing the build rather than shipping a breach.
+sh "${SCRIPT_DIR}/../collect-licenses.sh" "${SCRIPT_DIR}/../.." \
+	"${RES_DIR}/licenses"
+
 cp "${BIN_PATH}" "${MACOS_DIR}/${BIN}"
 chmod +x "${MACOS_DIR}/${BIN}"
 cp "${PLIST}" "${CONTENTS}/Info.plist"

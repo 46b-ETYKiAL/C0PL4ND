@@ -378,6 +378,82 @@ mod tests {
         assert!(darkened.0 < 230 && darkened.1 < 230 && darkened.2 < 220);
     }
 
+    /// THE LIFT MUST BE MINIMAL, not merely sufficient.
+    ///
+    /// Every other assertion about this function is satisfied by returning the
+    /// POLE — pure white on a dark background, pure black on a light one. Pure
+    /// white passes "contrast >= target", passes "every channel moved away from
+    /// the background", and is obviously not the untouched original. So a clamp
+    /// that slammed every low-contrast colour to a pole would have shipped
+    /// green, taking the theme's hue with it: `#405060` and `#602030` would both
+    /// come back `#ffffff`.
+    ///
+    /// That is not hypothetical. `step as f32 / CLAMP_STEPS as f32` mutated to
+    /// `*` (or `%`) makes step 1 yield `t >= 1`, `blend` clamps to the pole, and
+    /// the function returns it on the FIRST iteration — passing every test that
+    /// existed before this one.
+    ///
+    /// Minimality is asserted WITHOUT reimplementing the search: re-blend the
+    /// PREVIOUS step and require that it FAILS the target. If the returned
+    /// colour is the first blend that passes, the one before it must not — that
+    /// is the definition, and it pins the step size, the loop bounds and the
+    /// direction all at once.
+    #[test]
+    fn the_clamp_lifts_the_minimum_distance_not_all_the_way_to_the_pole() {
+        // Cases chosen so a genuine minimal lift lands well short of the pole.
+        for &(fg, bg, target) in &[
+            ((40, 40, 40), (0, 0, 0), 4.5_f32),
+            ((30, 30, 40), (0, 0, 0), 7.0),
+            ((60, 20, 20), (0, 0, 0), 4.5),
+            ((230, 230, 220), (255, 255, 255), 7.0),
+            ((200, 210, 200), (255, 255, 255), 4.5),
+        ] {
+            let out = enforce_min_contrast(fg, bg, target);
+            let pole = if relative_luminance(bg) < 0.1791 {
+                (255, 255, 255)
+            } else {
+                (0, 0, 0)
+            };
+
+            // Premise: the pole itself must clear the target, or "stopped short
+            // of the pole" would be vacuous (an unreachable target legitimately
+            // returns the pole — that path is covered by the sibling test).
+            assert!(
+                contrast_ratio(pole, bg) >= target,
+                "premise: {target} must be reachable for fg={fg:?} bg={bg:?}"
+            );
+            assert!(
+                contrast_ratio(out, bg) >= target,
+                "the lift must actually reach the target"
+            );
+            assert_ne!(
+                out, pole,
+                "the clamp went ALL THE WAY to the pole {pole:?} for fg={fg:?} \
+                 bg={bg:?} target={target} — that destroys the colour's hue and \
+                 is what a broken step size looks like"
+            );
+
+            // The load-bearing half: find which step produced `out`, and prove
+            // the step BEFORE it does not clear the target.
+            let step = (1..=CLAMP_STEPS)
+                .find(|&s| blend(fg, pole, s as f32 / CLAMP_STEPS as f32) == out)
+                .expect("the result must be one of the blend steps");
+            assert!(
+                step >= 1,
+                "a returned colour must come from a real lift step"
+            );
+            let previous = blend(fg, pole, (step - 1) as f32 / CLAMP_STEPS as f32);
+            assert!(
+                contrast_ratio(previous, bg) < target,
+                "NOT MINIMAL: step {step} was returned for fg={fg:?} bg={bg:?} \
+                 target={target}, but step {} ({previous:?}) already reaches \
+                 {:.3} — the clamp overshot",
+                step - 1,
+                contrast_ratio(previous, bg)
+            );
+        }
+    }
+
     #[test]
     fn clamp_returns_the_best_available_pole_when_the_target_is_unreachable() {
         // A mid-grey background caps out near 10.4:1 against either pole, so a

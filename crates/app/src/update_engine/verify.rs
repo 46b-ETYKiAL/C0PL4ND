@@ -25,6 +25,38 @@ use sha2::{Digest, Sha256};
 /// verified update available" — it NEVER installs an unsigned binary.
 pub const EMBEDDED_PUBLIC_KEY: &str = "untrusted comment: minisign public key: A8D869E2B4DD3FD9\nRWTZP9204mnYqKT/TK6OfYG70QwFoHF5WuuxODg8tgPU+WdLRJYt6iNN";
 
+/// EVERY key this build trusts to sign an update. The production verification
+/// path takes this SET, never a single key.
+///
+/// # Why this is a set, and why it had to be one before shipping
+///
+/// Verification happens inside the ALREADY-INSTALLED client, against keys
+/// compiled into that binary. A client built to trust exactly one key can only
+/// ever accept that one key — for the rest of its life, on the user's disk,
+/// beyond our reach.
+///
+/// So if the release key is ever lost, compromised, or simply rotated, releases
+/// signed with the new key are rejected by every installed client, and the
+/// in-app updater — the mechanism that would deliver the fix — is precisely the
+/// thing that stops working. The remaining recovery is "ask every user to
+/// re-download by hand", which for a compromise means asking them to do so
+/// through the same channel the attacker now controls.
+///
+/// The capability to rotate cannot be retrofitted into copies already on disk;
+/// it has to be in the binary BEFORE it ships. That is why this is a set today
+/// while it still holds exactly one key. Rotating later is then an ordinary
+/// change: append the new key here, ship a release signed by the OLD key so
+/// existing clients accept it, and once that build is widely deployed, drop the
+/// old key and switch signing to the new one.
+///
+/// This is not theoretical for this fleet: the sibling SCR1B3 editor has
+/// already used that escape hatch once (`rotate to maintainer-owned signing
+/// key`), and could only do so because its updater verified against a set.
+///
+/// Order is irrelevant — acceptance requires a FULL cryptographic verification
+/// against at least one entry, so a longer list weakens nothing.
+pub const EMBEDDED_PUBLIC_KEYS: &[&str] = &[EMBEDDED_PUBLIC_KEY];
+
 /// Hex-encoded SHA-256 of `bytes`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -49,6 +81,39 @@ pub fn verify_signature(bytes: &[u8], sig_str: &str, public_key_box: &str) -> Re
         .map_err(|e| format!("signature verification failed: {e}"))
 }
 
+/// Verify a minisign signature against a SET of candidate public keys, accepting
+/// if ANY of them verifies. The key-rotation-safe form of [`verify_signature`]
+/// (see [`EMBEDDED_PUBLIC_KEYS`]).
+///
+/// SECURITY: acceptance requires a FULL cryptographic verification against at
+/// least one key. minisign embeds an 8-byte key id in both the public key and
+/// the signature, but that id is only a routing HINT and is attacker-controlled,
+/// so it is never trusted on its own: `minisign_verify` rejects a key-id
+/// mismatch before the Ed25519 check, and a key-id MATCH still requires the
+/// signature itself to verify. Trying more keys therefore cannot turn a bad
+/// signature into an accepted one — it can only find the right key for a
+/// signature that was already valid.
+///
+/// Fails closed on an empty set: no trusted keys means nothing is trusted, not
+/// that everything is.
+pub fn verify_any_signature(
+    bytes: &[u8],
+    sig_str: &str,
+    public_key_boxes: &[&str],
+) -> Result<(), String> {
+    if public_key_boxes.is_empty() {
+        return Err("no trusted public keys configured".to_string());
+    }
+    let mut last_err = None;
+    for pk in public_key_boxes {
+        match verify_signature(bytes, sig_str, pk) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "signature did not verify against any trusted key".to_string()))
+}
+
 /// Defense-in-depth (audit P3-#1): assert the signature's *trusted comment* binds
 /// to the asset we believe we downloaded. The trusted comment is part of the
 /// cryptographically-signed blob (minisign signs `signature || trusted_comment`),
@@ -71,12 +136,13 @@ pub fn verify_signature(bytes: &[u8], sig_str: &str, public_key_box: &str) -> Re
 pub fn verify_signature_bound(
     bytes: &[u8],
     sig_str: &str,
-    public_key_box: &str,
+    public_keys: &[&str],
     expected_asset: &str,
 ) -> Result<(), String> {
     // Cryptographic check first — a bad signature is rejected before we even
-    // look at the (now-trusted) comment.
-    verify_signature(bytes, sig_str, public_key_box)?;
+    // look at the (now-trusted) comment. Multi-key, so a rotated signing key is
+    // still accepted by already-installed clients (see `EMBEDDED_PUBLIC_KEYS`).
+    verify_any_signature(bytes, sig_str, public_keys)?;
 
     let sig =
         minisign_verify::Signature::decode(sig_str).map_err(|e| format!("bad signature: {e}"))?;
@@ -134,14 +200,14 @@ pub fn verify_artifact_bound(
     bytes: &[u8],
     expected_sha256: &str,
     sig_str: &str,
-    public_key_box: &str,
+    public_keys: &[&str],
     expected_asset: &str,
 ) -> Result<(), String> {
     verify_artifact_bound_optional_sig(
         bytes,
         expected_sha256,
         Some(sig_str),
-        public_key_box,
+        public_keys,
         expected_asset,
     )
 }
@@ -168,7 +234,7 @@ pub fn verify_artifact_bound_optional_sig(
     bytes: &[u8],
     expected_sha256: &str,
     sig_str: Option<&str>,
-    public_key_box: &str,
+    public_keys: &[&str],
     expected_asset: &str,
 ) -> Result<(), String> {
     if !verify_checksum(bytes, expected_sha256) {
@@ -202,7 +268,7 @@ pub fn verify_artifact_bound_optional_sig(
         );
         return Ok(());
     };
-    if let Err(e) = verify_signature_bound(bytes, sig_str, public_key_box, expected_asset) {
+    if let Err(e) = verify_signature_bound(bytes, sig_str, public_keys, expected_asset) {
         // SECURITY: a minisign verification failure means the bytes were not
         // signed by the embedded release key (tampering, a forged sidecar, or a
         // same-key wrong-artifact substitution caught by the trusted-comment
@@ -345,17 +411,22 @@ mod tests {
         let sha = sha256_hex(data);
         let asset = "c0pl4nd-x86_64-pc-windows-msvc.tar.gz";
 
-        assert!(verify_artifact_bound(data, &sha, &sig_str, &pk_box, asset).is_ok());
+        assert!(verify_artifact_bound(data, &sha, &sig_str, &[pk_box.as_str()], asset).is_ok());
         // Wrong checksum fails closed even with a valid signature.
         assert_eq!(
-            verify_artifact_bound(data, "deadbeef", &sig_str, &pk_box, asset).unwrap_err(),
+            verify_artifact_bound(data, "deadbeef", &sig_str, &[pk_box.as_str()], asset)
+                .unwrap_err(),
             "checksum mismatch"
         );
         // Right checksum but a bogus signature also fails closed.
-        assert!(
-            verify_artifact_bound(data, &sha, "untrusted comment: x\nbogus", &pk_box, asset)
-                .is_err()
-        );
+        assert!(verify_artifact_bound(
+            data,
+            &sha,
+            "untrusted comment: x\nbogus",
+            &[pk_box.as_str()],
+            asset
+        )
+        .is_err());
     }
 
     #[test]
@@ -373,19 +444,21 @@ mod tests {
 
         // No sidecar + correct signed hash → accepted (verified via the pin).
         assert!(
-            verify_artifact_bound_optional_sig(data, &sha, None, &pk_box, asset).is_ok(),
+            verify_artifact_bound_optional_sig(data, &sha, None, &[pk_box.as_str()], asset).is_ok(),
             "an absent sidecar must verify against the signed-manifest SHA-256"
         );
         // No sidecar + WRONG hash → rejected (the integrity gate always runs).
         assert_eq!(
-            verify_artifact_bound_optional_sig(data, "deadbeef", None, &pk_box, asset).unwrap_err(),
+            verify_artifact_bound_optional_sig(data, "deadbeef", None, &[pk_box.as_str()], asset)
+                .unwrap_err(),
             "checksum mismatch"
         );
         // A tampered archive carrying the OLD pinned hash → rejected even without
         // a sidecar (preimage resistance of the signed pin catches substitution).
         let tampered = b"signed-manifest-only archive bytes (TAMPERED)";
         assert_eq!(
-            verify_artifact_bound_optional_sig(tampered, &sha, None, &pk_box, asset).unwrap_err(),
+            verify_artifact_bound_optional_sig(tampered, &sha, None, &[pk_box.as_str()], asset)
+                .unwrap_err(),
             "checksum mismatch"
         );
         // Sidecar PRESENT but bogus, correct hash → still fails closed (a present
@@ -395,7 +468,7 @@ mod tests {
                 data,
                 &sha,
                 Some("untrusted comment: x\nbogus"),
-                &pk_box,
+                &[pk_box.as_str()],
                 asset
             )
             .is_err(),
@@ -412,7 +485,14 @@ mod tests {
         )
         .unwrap()
         .to_string();
-        assert!(verify_artifact_bound_optional_sig(data, &sha, Some(&sig), &pk_box, asset).is_ok());
+        assert!(verify_artifact_bound_optional_sig(
+            data,
+            &sha,
+            Some(&sig),
+            &[pk_box.as_str()],
+            asset
+        )
+        .is_ok());
     }
 
     #[test]
@@ -442,7 +522,7 @@ mod tests {
         assert!(verify_signature_bound(
             data,
             &sig_linux,
-            &pk_box,
+            &[pk_box.as_str()],
             "c0pl4nd-v1.0.0-x86_64-unknown-linux-gnu.tar.gz",
         )
         .is_ok());
@@ -452,7 +532,7 @@ mod tests {
         let err = verify_signature_bound(
             data,
             &sig_linux,
-            &pk_box,
+            &[pk_box.as_str()],
             "c0pl4nd-v1.0.0-x86_64-pc-windows-msvc.zip",
         )
         .unwrap_err();
@@ -462,7 +542,7 @@ mod tests {
         assert!(verify_signature_bound(
             data,
             &sig_linux,
-            &pk_box,
+            &[pk_box.as_str()],
             "/tmp/staging/c0pl4nd-v1.0.0-x86_64-unknown-linux-gnu.tar.gz",
         )
         .is_ok());
@@ -486,9 +566,12 @@ mod tests {
         .unwrap()
         .to_string();
         // Binding skipped -> any expected asset name passes (crypto still gates).
-        assert!(verify_signature_bound(data, &sig, &pk_box, "anything.tar.gz").is_ok());
+        assert!(verify_signature_bound(data, &sig, &[pk_box.as_str()], "anything.tar.gz").is_ok());
         // But tampered bytes still fail closed.
-        assert!(verify_signature_bound(b"tampered", &sig, &pk_box, "anything.tar.gz").is_err());
+        assert!(
+            verify_signature_bound(b"tampered", &sig, &[pk_box.as_str()], "anything.tar.gz")
+                .is_err()
+        );
     }
 
     #[test]
@@ -509,14 +592,17 @@ mod tests {
         let asset = "c0pl4nd-v2.0.0-x86_64-pc-windows-msvc.zip";
 
         // Correct sha + valid sig + matching asset name -> accepted.
-        assert!(verify_artifact_bound(data, &sha, &sig, &pk_box, asset).is_ok());
+        assert!(verify_artifact_bound(data, &sha, &sig, &[pk_box.as_str()], asset).is_ok());
         // Wrong checksum fails closed BEFORE the signature is even checked.
         assert_eq!(
-            verify_artifact_bound(data, "deadbeef", &sig, &pk_box, asset).unwrap_err(),
+            verify_artifact_bound(data, "deadbeef", &sig, &[pk_box.as_str()], asset).unwrap_err(),
             "checksum mismatch"
         );
         // Right sha + valid sig but the WRONG expected asset -> rejected.
-        assert!(verify_artifact_bound(data, &sha, &sig, &pk_box, "wrong-asset.tar.gz").is_err());
+        assert!(
+            verify_artifact_bound(data, &sha, &sig, &[pk_box.as_str()], "wrong-asset.tar.gz")
+                .is_err()
+        );
     }
 
     #[test]
@@ -533,6 +619,118 @@ mod tests {
         // is the "fails closed until a signed release exists" guarantee.
         assert!(
             verify_signature(b"x", "untrusted comment: x\nbogus", EMBEDDED_PUBLIC_KEY).is_err()
+        );
+    }
+
+    /// The embedded SET must be non-empty and every entry a decodable key.
+    ///
+    /// An empty set would make `verify_any_signature` reject everything — the
+    /// updater would fail closed rather than open, but it would be permanently
+    /// broken, so this is a real (if benign-direction) failure worth pinning.
+    #[test]
+    fn embedded_key_set_is_non_empty_and_all_entries_decode() {
+        assert!(
+            !EMBEDDED_PUBLIC_KEYS.is_empty(),
+            "an empty trusted-key set rejects every update forever"
+        );
+        for pk in EMBEDDED_PUBLIC_KEYS {
+            assert!(
+                minisign_verify::PublicKey::decode(pk).is_ok(),
+                "every embedded key must be a well-formed minisign public key"
+            );
+        }
+        assert!(
+            EMBEDDED_PUBLIC_KEYS.contains(&EMBEDDED_PUBLIC_KEY),
+            "the current release key must be in the trusted set"
+        );
+    }
+
+    /// THE ROTATION PROPERTY — the reason the set exists.
+    ///
+    /// An artifact signed by a key that is in the set but is NOT the first entry
+    /// must still verify. This is exactly the state during a key rotation: the
+    /// installed client carries {old, new} and the release is signed by one of
+    /// them. Without it, rotating the signing key bricks in-app updates for
+    /// every client already on disk, and that cannot be fixed after the fact
+    /// because the fix would have to arrive through the updater it broke.
+    #[test]
+    fn a_signature_from_any_trusted_key_verifies() {
+        let kp = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+        let pk_box = kp.pk.to_box().unwrap().to_string();
+        let data = b"a release signed by the ROTATED key";
+        let sig = minisign::sign(
+            Some(&kp.pk),
+            &kp.sk,
+            std::io::Cursor::new(&data[..]),
+            Some("c0pl4nd v9.9.9"),
+            Some("comment"),
+        )
+        .unwrap()
+        .to_string();
+
+        // The rotated key is SECOND; the embedded release key is first and does
+        // not match this signature. A single-key verifier fails here.
+        let rotated_set = [EMBEDDED_PUBLIC_KEY, pk_box.as_str()];
+        assert!(
+            verify_any_signature(data, &sig, &rotated_set).is_ok(),
+            "a signature from ANY trusted key must verify — this is the whole \
+             point of the set"
+        );
+
+        // …and trying several keys must NOT launder a bad signature. A set that
+        // accepted anything once it held more than one key would be worse than
+        // the single-key form it replaced.
+        assert!(
+            verify_any_signature(b"different bytes", &sig, &rotated_set).is_err(),
+            "multi-key must not weaken verification: tampered bytes still fail \
+             against every key"
+        );
+    }
+
+    /// Fail-closed on an empty set: no trusted keys means nothing is trusted.
+    #[test]
+    fn an_empty_key_set_rejects_everything() {
+        let kp = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+        let data = b"payload";
+        let sig = minisign::sign(
+            Some(&kp.pk),
+            &kp.sk,
+            std::io::Cursor::new(&data[..]),
+            None,
+            None,
+        )
+        .unwrap()
+        .to_string();
+        assert!(
+            verify_any_signature(data, &sig, &[]).is_err(),
+            "an empty trusted set must reject a signature that is otherwise valid"
+        );
+    }
+
+    /// The full artifact gate must carry the rotation property too — a caller
+    /// going through `verify_artifact_bound` (the path the updater uses) must
+    /// accept a non-first trusted key.
+    #[test]
+    fn the_artifact_gate_accepts_a_non_first_trusted_key() {
+        let kp = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+        let pk_box = kp.pk.to_box().unwrap().to_string();
+        let data = b"artifact bytes signed by the rotated key";
+        let sha = sha256_hex(data);
+        let asset = "c0pl4nd-x86_64-pc-windows-msvc.zip";
+        let sig = minisign::sign(
+            Some(&kp.pk),
+            &kp.sk,
+            std::io::Cursor::new(&data[..]),
+            Some(&format!("timestamp:0\tfile:{asset}")),
+            Some("comment"),
+        )
+        .unwrap()
+        .to_string();
+
+        let rotated_set = [EMBEDDED_PUBLIC_KEY, pk_box.as_str()];
+        assert!(
+            verify_artifact_bound(data, &sha, &sig, &rotated_set, asset).is_ok(),
+            "the artifact gate must accept a signature from any trusted key"
         );
     }
 }

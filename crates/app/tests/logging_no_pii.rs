@@ -186,7 +186,7 @@ fn checksum_mismatch_emits_warn_with_checksum_gate() {
             b"the downloaded bytes",
             "deadbeef",
             "untrusted comment: x\nbogus",
-            update_engine::verify::EMBEDDED_PUBLIC_KEY,
+            update_engine::verify::EMBEDDED_PUBLIC_KEYS,
             "c0pl4nd-v9.9.9-x86_64-pc-windows-msvc.zip",
         )
         .unwrap_err();
@@ -219,7 +219,7 @@ fn signature_failure_emits_warn_with_signature_gate() {
             data,
             &sha,
             "untrusted comment: x\nbogus-signature-line",
-            update_engine::verify::EMBEDDED_PUBLIC_KEY,
+            update_engine::verify::EMBEDDED_PUBLIC_KEYS,
             "c0pl4nd.zip",
         )
         .unwrap_err();
@@ -317,7 +317,7 @@ fn valid_artifact_emits_no_refusal() {
     let sha = sha256_hex(data);
 
     let logs = capture(|| {
-        verify_artifact_bound(data, &sha, &sig, &pk_box, "c0pl4nd.zip")
+        verify_artifact_bound(data, &sha, &sig, &[pk_box.as_str()], "c0pl4nd.zip")
             .expect("a correctly-signed, correctly-hashed artifact verifies");
     });
 
@@ -371,7 +371,7 @@ fn no_captured_log_echoes_a_planted_payload_secret() {
             &data,
             "deadbeef", // wrong digest -> checksum refusal
             "untrusted comment: x\nbogus",
-            update_engine::verify::EMBEDDED_PUBLIC_KEY,
+            update_engine::verify::EMBEDDED_PUBLIC_KEYS,
             "c0pl4nd.zip",
         );
     });

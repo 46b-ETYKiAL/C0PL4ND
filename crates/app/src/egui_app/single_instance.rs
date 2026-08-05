@@ -238,15 +238,13 @@ mod imp {
     use windows::Win32::Foundation::{
         CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
     };
+    use windows::Win32::System::DataExchange::COPYDATASTRUCT;
     use windows::Win32::System::Threading::{AttachThreadInput, CreateMutexW, GetCurrentThreadId};
     use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
     use windows::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, EnumWindows, GetForegroundWindow, GetPropW, GetWindowThreadProcessId,
-        IsIconic, SendMessageW, SetForegroundWindow, SetPropW, ShowWindow, SW_RESTORE,
-        SW_SHOW, WM_COPYDATA, WM_NCDESTROY,
-    };
-    use windows::Win32::System::DataExchange::{
-        COPYDATASTRUCT,
+        IsIconic, SendMessageW, SetForegroundWindow, SetPropW, ShowWindow, SW_RESTORE, SW_SHOW,
+        WM_COPYDATA, WM_NCDESTROY,
     };
 
     use super::{
@@ -610,9 +608,17 @@ mod tests {
         for case in [
             vec![],
             vec!["c0pl4nd.exe".to_string()],
-            vec!["c0pl4nd.exe".to_string(), "--cwd".to_string(), "C:\\p".to_string()],
+            vec![
+                "c0pl4nd.exe".to_string(),
+                "--cwd".to_string(),
+                "C:\\p".to_string(),
+            ],
         ] {
-            assert_eq!(decode_argv(&encode_argv(&case)), case, "round trip {case:?}");
+            assert_eq!(
+                decode_argv(&encode_argv(&case)),
+                case,
+                "round trip {case:?}"
+            );
         }
     }
 

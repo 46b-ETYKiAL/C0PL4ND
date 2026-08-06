@@ -77,7 +77,9 @@ const CAL_BG: [u8; 3] = [173, 41, 209];
 
 mod common;
 
-use common::{isolate_config_dir, require_gpu};
+use common::{
+    isolate_config_dir, painted_px_in, pane_content_rect_px, require_gpu, MIN_PAINTED_PX_PER_PANE,
+};
 
 /// THE harness for this file: the real app at 1 physical pixel per point with
 /// every effect that would tint, fade or overlay the grid turned OFF.
@@ -86,6 +88,15 @@ use common::{isolate_config_dir, require_gpu};
 /// persisted opacity, tint, frost, scanlines, flicker, VHS banding, the ambient
 /// mesh or chromatic aberration each composite over the grid and would shift the
 /// bytes for a reason unrelated to the paint contract under test.
+///
+/// They are ASSERTED by [`the_px_harness_hands_every_scene_an_unmodulated_frame`],
+/// and that is not ceremony. Until it existed the sentence above was unfalsifiable
+/// in this file: the scenes below compare RGB only (`px_mask` /
+/// `px_runs_on_scanline` / `px_exact_run_on_scanline` all read channels `0..3`)
+/// over fully-opaque decoration rects, whose RGB no wash BEHIND them can move.
+/// Measured, by cutting exactly this wire — `opacity = 0.10`, `tint_enabled`,
+/// `tint = "#ff0040"`, `tint_strength = 1.0` — the harness rendered a red-washed
+/// 42%-alpha frame and both scenes still passed with byte-identical numbers.
 fn px_harness() -> Harness<'static, egui_app::C0pl4ndApp> {
     isolate_config_dir();
     require_gpu();
@@ -233,6 +244,91 @@ fn underline_row(sgr: &str) -> String {
         "{sgr}\x1b[58;2;{};{};{}m            \x1b[0m\r\n",
         DECO[0], DECO[1], DECO[2]
     )
+}
+
+// ---------------------------------------------------------------------------
+// The harness's OWN guard — the eight overrides in `px_harness` are asserted,
+// not merely written down
+// ---------------------------------------------------------------------------
+
+/// ANTI-VACUITY GUARD for [`px_harness`] itself: the frame it hands every scene
+/// must be the UNMODULATED one those scenes assume.
+///
+/// [`px_harness`] disables eight effects and its doc-comment calls them "what
+/// makes an EXACT colour comparison legitimate". Nothing checked that. Measured,
+/// by cutting exactly that wire: setting `opacity = 0.10`, `tint_enabled`,
+/// `tint = "#ff0040"` and `tint_strength = 1.0` in the harness — the precise
+/// contamination `common::isolate_config_dir` records as having produced wrong
+/// eyeballed PNGs — rendered a red-washed 42%-alpha frame (`[83, 2, 23, 107]`
+/// where the clean harness renders `[18, 18, 18, 255]`), and BOTH scenes below
+/// still passed with byte-identical numbers: `dotted=48 px in 16 runs |
+/// dashed=60 px in 13 runs | solid=94 px`, and the highlight run still equal to
+/// the calibration run.
+///
+/// The reason is structural, not incidental. Every measurement in this file is
+/// ALPHA-BLIND by construction — [`px_mask`], [`px_runs_on_scanline`] and
+/// [`px_exact_run_on_scanline`] all compare channels `0..3` only — and the
+/// decoration rects they count are drawn fully opaque, so their RGB is
+/// invariant under anything composited behind them. The eight overrides could
+/// be deleted wholesale and no assertion in this file would move. A protection
+/// nothing can falsify is a claim, not a guard.
+///
+/// So this asserts the two frame-observable properties those overrides exist to
+/// produce, on a CLEARED grid:
+///
+/// 1. **The pane backing is FULLY OPAQUE.** `paint_background_tint` /
+///    `paint_frost` wash the BACKGROUND layer, which is only visible THROUGH a
+///    non-opaque central fill (`pane_bg_alpha(config)` — the opacity slider). So
+///    one alpha check covers `opacity`, `tint_enabled` and `frost_enabled`
+///    together: with an opaque backing those washes cannot reach the frame, and
+///    with a faded one they can.
+/// 2. **A cleared pane stays BELOW the "this pane is empty" floor.** The overlay
+///    effects paint OVER the grid, so they turn an empty terminal into a painted
+///    one. Reusing `MIN_PAINTED_PX_PER_PANE` rather than inventing a threshold:
+///    that constant is already calibrated on these frames as the line between a
+///    blank pane and one showing content, and the pinned caret sits an order of
+///    magnitude under it (measured: 0–136 painted px on a cleared pane).
+///
+///    Measured falsification, so this is coverage rather than a hope: with all
+///    five overlays on it paints **11472** px, and with `wired_ambient` alone
+///    **8088** px — both far past the floor. It does NOT claim per-effect
+///    coverage: `crt_scanlines` ALONE measures **0** here, because its dark
+///    bands over a near-black `#121212` empty pane fall inside `common::BG_TOL`
+///    (8/255). Against a cleared pane this check sees the overlays that actually
+///    reach the frame at this contrast, not every member of the set.
+///
+/// Scoped to `pane_content_rect_px` for the reason that helper exists — the
+/// focused pane's 2px accent ring alone paints over a thousand pixels inside the
+/// raw body rect, which would swamp check 2.
+#[test]
+#[ignore = "needs a real GPU; run with --ignored (CI: the visual-qa job)"]
+fn the_px_harness_hands_every_scene_an_unmodulated_frame() {
+    let mut h = px_harness();
+    // Payload-free: `px_feed`'s own `ESC[2J ESC[H` prefix is the whole feed, so
+    // what renders is an empty terminal on the pane backing and nothing else.
+    let img = px_feed(&mut h, "");
+    let pane = h.state().focused_pane();
+    let region = pane_content_rect_px(&h, pane);
+    let (painted, total, bg) = painted_px_in(&img, region);
+    eprintln!("px_harness guard: region={region:?} bg={bg:?} painted={painted}/{total}");
+
+    assert_eq!(
+        bg[3], 255,
+        "px_harness rendered a pane backing at alpha {} instead of 255 (bg {bg:?}). \
+         The window is faded, so the background-layer tint/frost washes reach the \
+         frame — and every measurement in this file compares RGB only, so it \
+         cannot see that. Check the `opacity` / `tint_enabled` / `frost_enabled` \
+         overrides in px_harness.",
+        bg[3]
+    );
+    assert!(
+        painted < MIN_PAINTED_PX_PER_PANE,
+        "a CLEARED pane painted {painted} of {total} pixels — at or above the \
+         {MIN_PAINTED_PX_PER_PANE}-pixel floor that marks a pane as SHOWING \
+         content. Nothing but the pinned caret should be drawn here, so an \
+         overlay effect (scanlines / flicker / VHS / ambient mesh / chromatic \
+         aberration) is compositing over the grid every scene below measures."
+    );
 }
 
 // ---------------------------------------------------------------------------

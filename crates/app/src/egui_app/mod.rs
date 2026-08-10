@@ -4152,9 +4152,14 @@ impl eframe::App for C0pl4ndApp {
     /// keeps that typed-text undo history entirely in memory.
     ///
     /// Window geometry (position + size) is NOT lost by this: it is persisted
-    /// independently via [`c0pl4nd_core::Config::persist_geometry`] into the
-    /// config TOML AND by eframe's own `persist_window` native-window state, both
-    /// of which are unaffected by `persist_egui_memory`.
+    /// independently by eframe's own `persist_window` native-window state
+    /// (enabled at `egui_main.rs:263`), which is unaffected by
+    /// `persist_egui_memory`.
+    ///
+    /// Note: [`c0pl4nd_core::Config::persist_geometry`] writes the `[window]`
+    /// geometry keys into the config TOML, but its only caller is
+    /// `window.rs`, i.e. the default-off `legacy-winit` binary. This
+    /// shell never calls it, so those keys play no part in geometry here.
     fn persist_egui_memory(&self) -> bool {
         false
     }

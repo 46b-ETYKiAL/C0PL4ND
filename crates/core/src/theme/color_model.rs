@@ -308,6 +308,48 @@ mod tests {
         assert!((relative_luminance((0, 0, 255)) - 0.0722).abs() < 1e-4);
     }
 
+    /// The LINEAR branch of `linearize`, which only channels `0..=10` reach.
+    ///
+    /// The reference-point test above samples 0 and 255 only: 255 takes the
+    /// `powf` branch, and 0 is a FIXED POINT of this branch (`0 / 12.92 == 0`),
+    /// so neither can observe the `/ 12.92` divide at all. Three OTHER tests do
+    /// execute the line with a discriminating channel and still cannot fail —
+    /// the `(9,9,9)` doctest compares a colour with itself (ratio 1.0 for any
+    /// luminance), the symmetry doctest perturbs both orderings identically, and
+    /// `clamp_is_a_no_op_when_the_pair_already_passes` uses a 1.0 target that
+    /// both the true and the inflated ratio clear. Executing a line is not
+    /// asserting on it.
+    ///
+    /// WCAG defines the low branch as `c / 12.92`. Replacing `/` with `%`
+    /// returns `c` itself (`c <= 0.04045 < 12.92`, so the remainder IS `c`),
+    /// inflating near-black luminance ~13x — which silently changes whether the
+    /// contrast clamp fires on the near-black backgrounds terminal themes use.
+    #[test]
+    fn the_linear_branch_divides_by_the_wcag_slope() {
+        // Channel 10 is the LARGEST value on the linear branch
+        // (10/255 = 0.03922 <= 0.04045 < 11/255). Grey, so the three luminance
+        // weights sum to 1 and L is just the channel's linearised value:
+        // (10/255) / 12.92 = 0.00303528.
+        let l = relative_luminance((10, 10, 10));
+        assert!(
+            (l - 0.0030353).abs() < 1e-6,
+            "grey-10 luminance was {l}, expected the WCAG linear-branch value"
+        );
+        // Stated again as an inequality, so the assertion cannot be satisfied by
+        // an identity: the branch must SHRINK the channel by the 12.92 slope.
+        assert!(
+            l < 10.0 / 255.0 / 10.0,
+            "the linear branch must divide by 12.92, not pass the channel \
+             through unchanged (got {l})"
+        );
+        // And the branch boundary is where it claims to be: channel 11 crosses
+        // onto the (unmutated) powf branch and must still be brighter.
+        assert!(
+            relative_luminance((11, 11, 11)) > l,
+            "channel 11 sits above channel 10 on the luminance curve"
+        );
+    }
+
     #[test]
     fn contrast_ratio_is_bounded_symmetric_and_exact_at_the_poles() {
         assert!((contrast_ratio((0, 0, 0), (255, 255, 255)) - 21.0).abs() < 0.01);
@@ -500,6 +542,81 @@ mod tests {
         assert_eq!(d.contrast_scope, ContrastScope::IndexedOnly);
         assert_eq!(d.dim_blend, 0.5);
         assert!(!d.contrast_clamp_active(), "the clamp ships OFF");
+    }
+
+    /// The pole-selection pivot is a STRICT `<`.
+    ///
+    /// `relative_luminance(bg) < 0.1791` picks white BELOW the pivot and black
+    /// AT OR ABOVE it, so widening it to `<=` changes the chosen pole for
+    /// exactly one class of background: one whose luminance lands EXACTLY on the
+    /// pivot in f32. Every other test of this function uses `(0,0,0)` or
+    /// `(255,255,255)` backgrounds, nowhere near it.
+    ///
+    /// Over all 16 777 216 sRGB triples exactly ONE lands on the pivot —
+    /// `(64, 113, 217)`, confirmed by an exhaustive f32 sweep under two
+    /// independent `powf` implementations (native f32, and f64 rounded to f32),
+    /// with every other triple at least 1 ULP away. But that constant is a
+    /// product of `f32::powf`, which binds the PLATFORM libm, so it is used only
+    /// as a first guess: if it misses, the witness is SEARCHED FOR at run time.
+    /// A hard-coded constant that silently stopped being pivotal on some libm
+    /// would turn this test vacuous while leaving it green, which is the exact
+    /// failure the search exists to prevent.
+    #[test]
+    fn the_pole_pivot_is_strict_so_an_exactly_pivotal_background_darkens() {
+        const PIVOT: f32 = 0.1791;
+
+        // `linearize` is non-decreasing in its channel and f32 addition is
+        // monotonic, so for any (r, b) the green channel is binary-searchable
+        // for the first value whose luminance reaches the pivot. That bounds the
+        // fallback search at 256*256*8 evaluations instead of 2^24.
+        fn find_pivotal_background() -> Option<(u8, u8, u8)> {
+            let guess = (64u8, 113u8, 217u8);
+            if relative_luminance(guess) == PIVOT {
+                return Some(guess);
+            }
+            for r in 0..=255u8 {
+                for b in 0..=255u8 {
+                    let (mut lo, mut hi) = (0u16, 255u16);
+                    while lo < hi {
+                        let mid = (lo + hi) / 2;
+                        if relative_luminance((r, mid as u8, b)) < PIVOT {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    let candidate = (r, lo as u8, b);
+                    if relative_luminance(candidate) == PIVOT {
+                        return Some(candidate);
+                    }
+                }
+            }
+            None
+        }
+
+        // Premise, asserted loudly: without a witness the comparison has no
+        // observable strictness at all and the assertions below would be
+        // vacuous. A silently vacuous test is worse than no test.
+        let bg = find_pivotal_background().expect(
+            "premise: no sRGB colour lands exactly on the 0.1791 pole pivot \
+             under this platform's powf, so pole selection has no observable \
+             boundary to pin",
+        );
+
+        // At the pivot the two candidate poles contrast almost identically
+        // against `bg` (black 4.582:1, white 4.583:1) — that is what makes it
+        // the pivot — so BOTH clear a 4.5 target and the tie is broken by the
+        // comparison alone: `<` is false at equality, so the pole is BLACK.
+        let out = enforce_min_contrast(bg, bg, 4.5);
+        assert!(
+            contrast_ratio(out, bg) >= 4.5,
+            "the clamp must still reach the target for bg={bg:?}, got {out:?}"
+        );
+        assert!(
+            relative_luminance(out) < relative_luminance(bg),
+            "a background exactly ON the pivot must clamp toward BLACK; \
+             bg={bg:?} produced {out:?}"
+        );
     }
 
     #[test]

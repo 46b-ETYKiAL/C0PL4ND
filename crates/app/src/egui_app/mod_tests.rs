@@ -1165,6 +1165,7 @@ fn theme_candidate_paths_prioritizes_the_config_dir() {
 
 use crate::egui_app::grid as grid_mod;
 use crate::egui_app::layout_state::LayoutSnapshot;
+use crate::egui_app::pty_gate::expect_live_pty;
 
 /// Build a snapshot over a default horizontal grid of the given pane ids.
 fn snapshot_for(panes: &[PaneId], focused: PaneId, next_id: u64) -> LayoutSnapshot {
@@ -1586,9 +1587,7 @@ fn pump_drives_taskbar_progress_from_osc_9_4() {
 
     let mut app = C0pl4ndApp::bootstrap();
     let pane = PaneTerm::spawn(app.theme.clone(), 80, 24);
-    let term = pane
-        .terminal_for_test()
-        .expect("PTY spawn must succeed — a skipped wiring test proves nothing");
+    let term = expect_live_pty(&pane);
     {
         let mut t = term.lock().unwrap();
         // Two reports in ONE frame: only the LAST is visible on a single button.
@@ -1616,9 +1615,7 @@ fn pump_maps_warning_progress_to_paused() {
 
     let mut app = C0pl4ndApp::bootstrap();
     let pane = PaneTerm::spawn(app.theme.clone(), 80, 24);
-    let term = pane
-        .terminal_for_test()
-        .expect("PTY spawn must succeed — a skipped wiring test proves nothing");
+    let term = expect_live_pty(&pane);
     term.lock().unwrap().advance(b"\x1b]9;4;4;61\x07"); // state 4 = Warning
     app.terms.insert(PaneId(0), pane);
 
@@ -1641,9 +1638,7 @@ fn pump_leaves_taskbar_untouched_when_no_progress_drained() {
 
     let mut app = C0pl4ndApp::bootstrap();
     let pane = PaneTerm::spawn(app.theme.clone(), 80, 24);
-    let term = pane
-        .terminal_for_test()
-        .expect("PTY spawn must succeed — a skipped wiring test proves nothing");
+    let term = expect_live_pty(&pane);
     // Plain output + an unrelated OSC: no progress reports at all.
     term.lock().unwrap().advance(b"hello\r\n\x1b]0;title\x07");
     app.terms.insert(PaneId(0), pane);

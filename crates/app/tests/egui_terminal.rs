@@ -103,6 +103,9 @@ fn poll_focused_contains(
 #[test]
 fn opening_a_new_terminal_does_not_blank_the_first_pane() {
     let app = RefCell::new(C0pl4ndApp::bootstrap());
+    let mut h = harness(&app);
+    // Guard AFTER the harness: `bootstrap_with` defers every PTY spawn to the
+    // first frame, so before `harness(..)` has run one this is ALWAYS `None`.
     {
         let a = app.borrow();
         let focused = a.focused_pane();
@@ -111,7 +114,6 @@ fn opening_a_new_terminal_does_not_blank_the_first_pane() {
             return;
         }
     }
-    let mut h = harness(&app);
 
     let first = app.borrow().focused_pane();
 
@@ -151,8 +153,10 @@ fn opening_a_new_terminal_does_not_blank_the_first_pane() {
 #[test]
 fn typing_a_command_reaches_the_pty_and_updates_the_grid() {
     let app = RefCell::new(C0pl4ndApp::bootstrap());
+    let mut h = harness(&app);
     // Skip cleanly if the platform shell could not spawn (no PTY on this box) —
-    // never a false green: assert the pane is live before driving it.
+    // never a false green. Guard AFTER the harness: `bootstrap_with` defers every
+    // PTY spawn to the first frame, so before it this is ALWAYS `None`.
     {
         let a = app.borrow();
         let focused = a.focused_pane();
@@ -161,7 +165,6 @@ fn typing_a_command_reaches_the_pty_and_updates_the_grid() {
             return;
         }
     }
-    let mut h = harness(&app);
 
     // A token that cannot pre-exist on the prompt line. `echo` it so the shell
     // prints it back (works on cmd.exe and POSIX sh — the default shells).
@@ -183,6 +186,9 @@ fn typing_a_command_reaches_the_pty_and_updates_the_grid() {
 #[test]
 fn clicking_a_pane_routes_typed_input_to_that_pane_only() {
     let app = RefCell::new(C0pl4ndApp::bootstrap());
+    let mut h = harness(&app);
+    // Guard AFTER the harness: `bootstrap_with` defers every PTY spawn to the
+    // first frame, so before `harness(..)` has run one this is ALWAYS `None`.
     {
         let a = app.borrow();
         if a.pane_grid_text(PaneId(0)).is_none() || a.pane_grid_text(PaneId(1)).is_none() {
@@ -191,7 +197,6 @@ fn clicking_a_pane_routes_typed_input_to_that_pane_only() {
         }
         assert_eq!(a.focused_pane(), PaneId(0), "pane 0 focused at start");
     }
-    let mut h = harness(&app);
 
     // Focus pane 1 by clicking its tab (the real chrome path), retrying until
     // focus ACTUALLY lands on pane 1. The tab's accessible label tracks the
@@ -247,6 +252,9 @@ fn clicking_a_pane_routes_typed_input_to_that_pane_only() {
 #[test]
 fn shrinking_the_window_resizes_the_pane_pty() {
     let app = RefCell::new(C0pl4ndApp::bootstrap());
+    let mut h = harness(&app);
+    // Guard AFTER the harness: `bootstrap_with` defers every PTY spawn to the
+    // first frame, so before `harness(..)` has run one this is ALWAYS `None`.
     {
         let a = app.borrow();
         if a.pane_grid_text(a.focused_pane()).is_none() {
@@ -254,7 +262,6 @@ fn shrinking_the_window_resizes_the_pane_pty() {
             return;
         }
     }
-    let mut h = harness(&app);
     h.set_size(egui::vec2(1200.0, 800.0));
     h.run();
     h.run();
@@ -571,6 +578,9 @@ fn incognito_blocks_history_and_clear_empties_it() {
 #[test]
 fn grid_text_is_exposed_to_accesskit_screen_readers() {
     let app = RefCell::new(C0pl4ndApp::bootstrap());
+    let mut h = harness(&app);
+    // Guard AFTER the harness: `bootstrap_with` defers every PTY spawn to the
+    // first frame, so before `harness(..)` has run one this is ALWAYS `None`.
     {
         let a = app.borrow();
         let focused = a.focused_pane();
@@ -579,7 +589,6 @@ fn grid_text_is_exposed_to_accesskit_screen_readers() {
             return;
         }
     }
-    let mut h = harness(&app);
 
     let token = "c0pl4nd_a11y_marker";
     type_text(&mut h, &format!("echo {token}"));
@@ -612,6 +621,9 @@ fn grid_text_is_exposed_to_accesskit_screen_readers() {
 #[test]
 fn ime_commit_reaches_the_pty_and_updates_the_grid() {
     let app = RefCell::new(C0pl4ndApp::bootstrap());
+    let mut h = harness(&app);
+    // Guard AFTER the harness: `bootstrap_with` defers every PTY spawn to the
+    // first frame, so before `harness(..)` has run one this is ALWAYS `None`.
     {
         let a = app.borrow();
         let focused = a.focused_pane();
@@ -620,7 +632,6 @@ fn ime_commit_reaches_the_pty_and_updates_the_grid() {
             return;
         }
     }
-    let mut h = harness(&app);
 
     // A CJK composition the user finished composing: the IME delivers the final
     // result as a single `Commit`. (A real session would also see one or more

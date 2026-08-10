@@ -114,7 +114,7 @@ jobs:
         # `save-if`. We set `save-if: false` below so this step is RESTORE-ONLY
         # and can never persist a poisoned cache. The residual restore risk is
         # neutralised by `--locked` builds. Annotation documents the disposition.
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: ". -> target"
           key: ${{ matrix.target }}
@@ -380,7 +380,7 @@ jobs:
           toolchain: stable
       - name: Cache cargo + installer target
         # Swatinem/rust-cache@v2.9.1 — restore-only on tag builds (no poisoned save)
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: framework/installer -> target
           key: native-installer

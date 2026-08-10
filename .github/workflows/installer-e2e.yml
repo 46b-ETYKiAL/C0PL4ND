@@ -1,0 +1,137 @@
+name: Installer end-to-end (published release)
+
+# Runs the REAL `packaging/linux/install.sh` against the REAL latest published
+# release, on a clean runner, and then executes the binary it installed.
+#
+# Why this exists, stated precisely so the job is not mistaken for more than it
+# is: `post-release-verify.yml` proves the published ASSETS exist and verify
+# against the embedded key. It does not prove `install.sh` can CONSUME them.
+# That gap is not hypothetical — it is how two separate defects reached users
+# with every gate green:
+#
+#   1. The release workflow began pruning the per-artifact `.sha256`/`.minisig`
+#      sidecars. install.sh still fetched them, so every `curl | sh` install
+#      aborted. Assets existed and verified; the installer could not use them.
+#   2. The installer's hardcoded `REPO` pointed at a namespace that does not
+#      exist (404). Same shape: nothing that gates assets can see it.
+#
+# Both are ASSET-CONTRACT / IDENTITY drift, invisible to every check that only
+# inspects the release from the inside. The only thing that catches them is
+# running the installer the way a user runs it.
+#
+# SCOPE: Linux x86_64 only. That is the platform the one-line installer targets
+# most, and the runner GitHub gives us for free. macOS/arm64 are NOT covered
+# here and this job must not be read as covering them.
+
+on:
+  # After a release publishes. `workflow_run` rather than `release: published`
+  # for the reason post-release-verify.yml documents: a release created by
+  # release.yml's own GITHUB_TOKEN does not emit `release` events.
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  # A weekly beat, because this can rot without anyone releasing: GitHub could
+  # change asset URL behaviour, or a dependency of the script could vanish.
+  schedule:
+    - cron: "0 13 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: install.sh against the latest published release (linux x86_64)
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Harden the runner (egress audit)
+        # step-security/harden-runner@v2.19.4
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        # actions/checkout@v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install minisign
+        # install.sh FAILS CLOSED without a verifier. Supplying one is what makes
+        # the positive run below exercise the real verification path instead of
+        # the no-verifier refusal.
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y minisign
+          minisign -v
+
+      # ---------------------------------------------------------------------
+      # NEGATIVE CONTROL, FIRST. A gate that has never been observed failing is
+      # indistinguishable from a gate that always passes — so this job proves it
+      # can fail on EVERY run, rather than relying on someone having checked once
+      # by hand. If install.sh ever "succeeds" against a release that does not
+      # exist, the positive result below means nothing.
+      # ---------------------------------------------------------------------
+      - name: Negative control — the installer must REFUSE a version that does not exist
+        env:
+          C0PL4ND_VERSION: v0.0.0-this-release-does-not-exist
+        run: |
+          set -uo pipefail
+          out="$(sh packaging/linux/install.sh 2>&1)" && rc=0 || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::install.sh reported SUCCESS for a release that does not exist. Every positive result from this job is worthless until that is fixed."
+            exit 1
+          fi
+          # Not merely non-zero: it must say WHY. A bare `set -eu` death from an
+          # unguarded `curl -f` leaves the user staring at a progress line with no
+          # cause, which is exactly the failure shape this repo already shipped.
+          if ! printf '%s' "$out" | grep -q "could not download the release archive"; then
+            echo "::error::install.sh failed, but without the archive-download diagnosis — a silent death is not an acceptable failure mode. Output above."
+            exit 1
+          fi
+          echo "negative control OK: refused with an explicit, actionable message (exit $rc)."
+
+      # ---------------------------------------------------------------------
+      # POSITIVE: the real thing, exactly as a user runs it.
+      # ---------------------------------------------------------------------
+      - name: Resolve the latest published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh_err="$(mktemp)"
+          if ! tag="$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName -q .tagName 2>"$gh_err")"; then
+            echo "::error::could not resolve the latest release, so the installer cannot be tested and this job must NOT pass vacuously. gh said: $(tr '\n' ' ' <"$gh_err")"
+            exit 1
+          fi
+          [ -n "$tag" ] || { echo "::error::the latest release has an empty tag name."; exit 1; }
+          echo "EXPECTED_TAG=$tag" >>"$GITHUB_ENV"
+          echo "latest published release: $tag"
+
+      - name: Run the installer
+        run: |
+          set -euo pipefail
+          sh packaging/linux/install.sh
+
+      - name: Assert the installer actually installed a working binary
+        run: |
+          set -euo pipefail
+          bin="$HOME/.local/bin/c0pl4nd"
+          [ -x "$bin" ] || { echo "::error::install.sh exited 0 but produced no executable at $bin"; exit 1; }
+
+          # Exit 0 is not evidence: the binary must RUN and identify itself as the
+          # release we asked for. A stale binary left over from a previous step, or
+          # an archive whose payload does not match its tag, both fail here.
+          ver_out="$("$bin" --version 2>&1)"
+          echo "installed binary reports: $ver_out"
+          want="${EXPECTED_TAG#v}"
+          if ! printf '%s' "$ver_out" | grep -qF -- "$want"; then
+            echo "::error::the installed binary reports '$ver_out', which does not carry the published release version '$want'."
+            exit 1
+          fi
+          echo "installer end-to-end OK: $EXPECTED_TAG installed from the published release and runs."

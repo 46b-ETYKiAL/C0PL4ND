@@ -89,14 +89,20 @@ use common::{
 /// mesh or chromatic aberration each composite over the grid and would shift the
 /// bytes for a reason unrelated to the paint contract under test.
 ///
-/// They are ASSERTED by [`the_px_harness_hands_every_scene_an_unmodulated_frame`],
-/// and that is not ceremony. Until it existed the sentence above was unfalsifiable
-/// in this file: the scenes below compare RGB only (`px_mask` /
-/// `px_runs_on_scanline` / `px_exact_run_on_scanline` all read channels `0..3`)
-/// over fully-opaque decoration rects, whose RGB no wash BEHIND them can move.
-/// Measured, by cutting exactly this wire — `opacity = 0.10`, `tint_enabled`,
+/// All eight are ASSERTED by
+/// [`the_px_harness_hands_every_scene_an_unmodulated_frame`], and that is not
+/// ceremony. Until it existed the sentence above was unfalsifiable in this file:
+/// the scenes below compare RGB only (`px_mask` / `px_runs_on_scanline` /
+/// `px_exact_run_on_scanline` all read channels `0..3`) over fully-opaque
+/// decoration rects, whose RGB no wash BEHIND them can move. Measured, by
+/// cutting exactly this wire — `opacity = 0.10`, `tint_enabled`,
 /// `tint = "#ff0040"`, `tint_strength = 1.0` — the harness rendered a red-washed
 /// 42%-alpha frame and both scenes still passed with byte-identical numbers.
+///
+/// Read that guard's doc before trusting a number here: only THREE of the eight
+/// are individually visible in this frame, and the guard says which. The other
+/// five are held by a state assertion instead, because on a cleared near-black
+/// pane they provably move nothing a pixel measurement can see.
 fn px_harness() -> Harness<'static, egui_app::C0pl4ndApp> {
     isolate_config_dir();
     require_gpu();
@@ -291,11 +297,39 @@ fn underline_row(sgr: &str) -> String {
 ///
 ///    Measured falsification, so this is coverage rather than a hope: with all
 ///    five overlays on it paints **11472** px, and with `wired_ambient` alone
-///    **8088** px — both far past the floor. It does NOT claim per-effect
-///    coverage: `crt_scanlines` ALONE measures **0** here, because its dark
-///    bands over a near-black `#121212` empty pane fall inside `common::BG_TOL`
-///    (8/255). Against a cleared pane this check sees the overlays that actually
-///    reach the frame at this contrast, not every member of the set.
+///    **8088** px — both far past the floor.
+///
+/// 3. **The config the app was actually handed still carries all eight
+///    overrides.** This is the STATE-observable half, and it exists because
+///    checks 1–2 are narrower than the prose above them used to admit.
+///
+/// ## Measured per-override attribution (do not widen this claim)
+///
+/// Each override was flipped ALONE and the guard re-run against a real GPU. Only
+/// three individually move this frame:
+///
+/// | override | flipped alone | seen by |
+/// |---|---|---|
+/// | `opacity = 0.10` | backing alpha 26 (vs 255) | check 1 |
+/// | `wired_ambient` | 8088 painted px | check 2 |
+/// | `vhs_tracking` | 8712 painted px | check 2 |
+/// | `tint_enabled` | 136 px, `bg` unchanged | check 3 only |
+/// | `frost_enabled` | 136 px, `bg` unchanged | check 3 only |
+/// | `crt_scanlines` | 136 px | check 3 only |
+/// | `flicker` | 136 px | check 3 only |
+/// | `chromatic_aberration_enabled` | 136 px | check 3 only |
+///
+/// The five that move nothing are not oversights, and the reasons differ:
+/// `tint_enabled` / `frost_enabled` wash the BACKGROUND layer, which check 1
+/// pins out of the frame by holding the central fill opaque — so while check 1
+/// holds they *cannot* reach a pixel, which is a neutralisation, not a
+/// measurement. `crt_scanlines`' dark bands over a near-black `#121212` empty
+/// pane fall inside `common::BG_TOL` (8/255). `flicker` and
+/// `chromatic_aberration_enabled` modulate content that a CLEARED pane does not
+/// have. Check 3 is what makes those five falsifiable at all: it catches the
+/// concrete regression — an override line deleted from [`px_harness`] — that
+/// pixel measurement here provably cannot see. A frame check and a state check
+/// are not interchangeable, and the table is the honest boundary between them.
 ///
 /// Scoped to `pane_content_rect_px` for the reason that helper exists — the
 /// focused pane's 2px accent ring alone paints over a thousand pixels inside the
@@ -328,6 +362,52 @@ fn the_px_harness_hands_every_scene_an_unmodulated_frame() {
          content. Nothing but the pinned caret should be drawn here, so an \
          overlay effect (scanlines / flicker / VHS / ambient mesh / chromatic \
          aberration) is compositing over the grid every scene below measures."
+    );
+
+    // CHECK 3 — the state-observable half. The two checks above are honest but
+    // narrow: flipped ALONE, only `opacity`, `wired_ambient` and `vhs_tracking`
+    // move this frame (the table in this test's doc carries the measurements).
+    // The remaining five provably cannot be seen HERE, so assert them where they
+    // ARE observable — on the config the app was actually handed. This is what
+    // catches "an override line was dropped from px_harness" for all eight; a
+    // pixel check on a cleared near-black pane cannot.
+    let cfg = &h.state().config;
+    assert!(
+        (cfg.opacity - 1.0).abs() < f32::EPSILON,
+        "px_harness must hand the app a fully-opaque window, got opacity {}",
+        cfg.opacity
+    );
+    assert!(
+        !cfg.tint_enabled,
+        "px_harness must disable the background tint — it washes the layer \
+         behind the pane fill, and every measurement in this file is alpha-blind"
+    );
+    assert!(
+        !cfg.frost_enabled,
+        "px_harness must disable frost — same background layer as the tint"
+    );
+    assert!(
+        !cfg.effects.wired_ambient,
+        "px_harness must disable the ambient mesh — it composites over the grid"
+    );
+    assert!(
+        !cfg.effects.crt_scanlines,
+        "px_harness must disable CRT scanlines — invisible on a cleared \
+         near-black pane (inside BG_TOL), but NOT over painted decoration rects"
+    );
+    assert!(
+        !cfg.effects.flicker,
+        "px_harness must disable flicker — a per-frame modulation makes an exact \
+         colour count depend on when the frame was captured"
+    );
+    assert!(
+        !cfg.effects.vhs_tracking,
+        "px_harness must disable VHS tracking — it bands over the grid"
+    );
+    assert!(
+        !cfg.effects.chromatic_aberration_enabled,
+        "px_harness must disable chromatic aberration — it fringes painted \
+         content, which is exactly what the scenes below measure"
     );
 }
 

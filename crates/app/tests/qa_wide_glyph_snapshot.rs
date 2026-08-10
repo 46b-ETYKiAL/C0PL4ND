@@ -8,16 +8,17 @@
 //!   cargo test -p c0pl4nd --test qa_wide_glyph_snapshot -- --ignored --nocapture
 //!
 //! Each saved frame is announced twice: once as the human `QA-SNAPSHOT[…]` line,
-//! and once in the S4F3 platform driver's contract format
-//! `[visual-qa] wrote <path> (WxH)` (pinned by
-//! [`every_saved_frame_is_announced_to_the_platform_driver`]). To drive this file
-//! from the platform, pass the scene-name filter explicitly:
-//!   python .s4f3/scripts/tools/native_gui_render_qa.py \
-//!       --repo <c0pl4nd> --crate c0pl4nd --module qa_
-//! The driver's DEFAULT `--module visual_qa` matches nothing here — C0PL4ND's
-//! scenes are named `qa_*` in this integration-test target rather than living in
-//! an in-crate `mod visual_qa`, so the default filter selects zero tests and the
-//! driver reports "harness produced no rendered scenes". Pass `--module qa_`.
+//! and once in the machine-readable contract format consumed by an external
+//! native-GUI render-QA driver — `[visual-qa] wrote <path> (WxH)` (pinned by
+//! [`every_saved_frame_is_announced_to_the_platform_driver`]).
+//!
+//! Such a driver runs this target and scrapes that marker to build its scene
+//! list, so it needs the scene-name filter passed explicitly (`--module qa_`, or
+//! whatever the driver spells that as). A default filter of `visual_qa` matches
+//! nothing here: C0PL4ND's scenes are named `qa_*` in this integration-test
+//! target rather than living in an in-crate `mod visual_qa`, so such a default
+//! selects zero tests and the driver reports "harness produced no rendered
+//! scenes" — a red that looks like a broken harness while the harness is fine.
 //!
 //! Each test prints the absolute PNG path it wrote. The PNGs themselves are not
 //! gated — pixel output is non-deterministic across GPU drivers, so nothing here
@@ -365,14 +366,14 @@ fn snapshot(h: &mut Harness<'_, egui_app::C0pl4ndApp>, name: &str) -> image::Rgb
 
     let out = std::env::temp_dir().join(format!("c0pl4nd-qa-{name}.png"));
     img.save(&out).expect("save QA snapshot PNG");
-    // MACHINE-READABLE line, in the platform's contract format:
+    // MACHINE-READABLE line, in the render-QA driver's contract format:
     //   `[visual-qa] wrote <path> (WxH)`
-    // `.s4f3/scripts/tools/native_gui_render_qa.py` parses exactly this to build
+    // An external native-GUI render-QA driver parses exactly this shape to build
     // its scene list; a frame that is rendered and saved but never announced in
-    // this shape is INVISIBLE to the driver, which then reports "harness
-    // produced no rendered scenes" and exits 1 — a red that looks like a broken
-    // renderer while the renderer is fine. It is emitted ALONGSIDE (not instead
-    // of) the human QA-SNAPSHOT line below, which carries the extra per-scene
+    // it is INVISIBLE to the driver, which then reports "harness produced no
+    // rendered scenes" and exits 1 — a red that looks like a broken renderer
+    // while the renderer is fine. It is emitted ALONGSIDE (not instead of) the
+    // human QA-SNAPSHOT line below, which carries the extra per-scene
     // diagnostics the pane-content assertions print.
     eprintln!(
         "[visual-qa] wrote {} ({}x{})",
@@ -393,9 +394,8 @@ fn snapshot(h: &mut Harness<'_, egui_app::C0pl4ndApp>, name: &str) -> image::Rgb
 /// contract format. Needs no GPU, so it runs in the ordinary suite.
 ///
 /// The failure this pins is silent in both directions: the scenes rendered
-/// correctly, saved real PNGs and passed, while
-/// `native_gui_render_qa.py --repo . --crate c0pl4nd` exited 1 with "harness
-/// produced no rendered scenes" — because it looks for
+/// correctly, saved real PNGs and passed, while the external render-QA driver
+/// exited 1 with "harness produced no rendered scenes" — because it looks for
 /// `[visual-qa] wrote <path> (WxH)` and this file only ever printed
 /// `QA-SNAPSHOT[name]: WxH -> path`. Nothing in the Rust suite could observe
 /// that, so the guard has to be structural: exactly one save site, and that site
@@ -416,7 +416,7 @@ fn every_saved_frame_is_announced_to_the_platform_driver() {
     assert_eq!(
         marker_sites, 1,
         "that single save site must print the driver's contract line \
-         `[visual-qa] wrote <path> (WxH)` — native_gui_render_qa.py parses only \
+         `[visual-qa] wrote <path> (WxH)` — the render-QA driver parses only \
          this shape, and a saved-but-unannounced frame makes it exit 1 with \
          \"harness produced no rendered scenes\"; found {marker_sites} emitters"
     );

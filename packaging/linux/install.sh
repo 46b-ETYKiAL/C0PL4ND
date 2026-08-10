@@ -172,7 +172,16 @@ tmp="$(mktemp -d 2>/dev/null || mktemp -d -t c0pl4nd)"
 trap "rm -rf \"${tmp}\"" EXIT INT TERM
 
 info "Downloading ${archive_url}"
-download "${archive_url}" "${tmp}/${archive}"
+# The `|| err` is not decoration. Under `set -eu`, `curl -f` on a 404 exits 22
+# and the script dies HERE with no message whatsoever — the user sees the
+# "Downloading ..." line above and then nothing, which is precisely how a
+# release-asset naming change stayed invisible: it looks like the script hung or
+# the terminal ate the output, not like a failure with a cause. The two
+# downloads below always had this guard; this one did not.
+download "${archive_url}" "${tmp}/${archive}" \
+	|| err "could not download the release archive: ${archive_url} (the asset may not exist for this version/platform, or the network refused the request)"
+[ -s "${tmp}/${archive}" ] \
+	|| err "the downloaded release archive is empty: ${archive_url}"
 
 info "Downloading checksum manifest"
 download "${checksums_url}" "${tmp}/SHA256SUMS" \

@@ -59,7 +59,7 @@ pub(crate) fn load_config_from(
 /// [`c0pl4nd_core::forced_colors::auto_theme_override`] as a pure function with
 /// its own tests: **an explicit theme choice always wins**, and auto-selection
 /// only applies when the stored theme is still provably the shipped default.
-/// This wrapper does nothing but sample the OS and apply that verdict.
+/// This seam does nothing but apply that verdict.
 ///
 /// The assignment mutates the in-memory config exactly as `follow_os_theme_tick`
 /// does for the dark/light follow, which means it can later be persisted by an
@@ -67,13 +67,13 @@ pub(crate) fn load_config_from(
 /// auto-theming behaviour: once written, the value is no longer the default, so
 /// it reads as a deliberate choice and sticks — which is also what makes it
 /// straightforward for the user to override from the theme picker at any time.
-pub(crate) fn apply_forced_colors_auto_theme(config: &mut c0pl4nd_core::Config) -> bool {
-    apply_forced_colors_auto_theme_with(config, c0pl4nd_core::forced_colors::forced_colors())
-}
-
-/// Pure core of [`apply_forced_colors_auto_theme`], parameterised on the OS
-/// answer so the wiring is unit-testable without a machine in High Contrast
-/// mode (the real entry samples the OS).
+///
+/// `high_contrast` is passed in rather than sampled here. The real caller
+/// ([`super::C0pl4ndApp`]'s window constructor) needs the OS answer for its own
+/// `forced_colors` field as well, so a wrapper that re-sampled internally would
+/// be a second source for one process-cached fact; and taking it as a parameter
+/// is what makes the precedence testable without a machine in High Contrast
+/// mode.
 pub(crate) fn apply_forced_colors_auto_theme_with(
     config: &mut c0pl4nd_core::Config,
     high_contrast: bool,

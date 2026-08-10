@@ -89,9 +89,7 @@ pub fn section_for(markdown: &str, heading: &str) -> Option<String> {
     // Advance past the opening heading, or report absence.
     lines.by_ref().find(|line| heading_matches(line, heading))?;
     // The body runs to the next `## ` heading (or end of input).
-    let body: Vec<&str> = lines
-        .take_while(|line| !line.starts_with("## "))
-        .collect();
+    let body: Vec<&str> = lines.take_while(|line| !line.starts_with("## ")).collect();
     Some(body.join("\n").trim_matches('\n').to_string())
 }
 
@@ -260,8 +258,13 @@ Preamble text that is not part of any entry.
         let e = entry_for(SAMPLE, "0.4.99");
         assert!(e.body.contains("An unreleased change."));
         assert!(e.heading.contains(UNRELEASED));
-        let notice = e.notice.expect("the fallback MUST be announced, not silent");
-        assert!(notice.contains("0.4.99"), "the notice must name the version sought");
+        let notice = e
+            .notice
+            .expect("the fallback MUST be announced, not silent");
+        assert!(
+            notice.contains("0.4.99"),
+            "the notice must name the version sought"
+        );
     }
 
     /// Tier 3: nothing resolvable → empty body, but ALWAYS a notice. This is the

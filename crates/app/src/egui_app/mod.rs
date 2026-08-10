@@ -6871,3 +6871,129 @@ mod config_load_tests {
         assert!(err.is_none());
     }
 }
+
+#[cfg(test)]
+mod forced_colors_wiring_tests {
+    //! The OS high-contrast auto-select, at the seam that actually MUTATES the
+    //! loaded config. `c0pl4nd_core::forced_colors` tests the precedence rule as
+    //! a pure function; these test that this crate applies that rule to a real
+    //! `Config` and to `follow_os_theme_tick`, which is where getting it
+    //! backwards would silently discard a user's deliberate theme choice.
+    use super::{apply_forced_colors_auto_theme_with, C0pl4ndApp};
+
+    /// THE precedence contract at the wiring layer: a config carrying an
+    /// explicit theme choice must come back UNCHANGED even while the OS is
+    /// asking for high contrast.
+    #[test]
+    fn an_explicit_theme_choice_survives_the_os_high_contrast_request() {
+        for chosen in ["phosphor-amber", "ghost-paper", "itasha-void-high-contrast"] {
+            let mut cfg = c0pl4nd_core::Config {
+                theme: chosen.to_string(),
+                ..Default::default()
+            };
+            let applied = apply_forced_colors_auto_theme_with(&mut cfg, true);
+            assert!(
+                !applied,
+                "{chosen:?} is an explicit choice — auto-select must not report a change"
+            );
+            assert_eq!(
+                cfg.theme, chosen,
+                "{chosen:?} must survive an OS high-contrast request"
+            );
+        }
+    }
+
+    /// The other half: an untouched default DOES follow the OS request.
+    #[test]
+    fn an_untouched_default_theme_follows_the_os_high_contrast_request() {
+        let mut cfg = c0pl4nd_core::Config::default();
+        let applied = apply_forced_colors_auto_theme_with(&mut cfg, true);
+        assert!(applied, "an unchosen theme must follow the OS request");
+        assert_eq!(cfg.theme, c0pl4nd_core::forced_colors::HIGH_CONTRAST_THEME);
+    }
+
+    /// No OS request → nothing is touched, whatever the theme is.
+    #[test]
+    fn without_an_os_request_the_theme_is_never_touched() {
+        let mut cfg = c0pl4nd_core::Config::default();
+        let default_theme = cfg.theme.clone();
+        assert!(!apply_forced_colors_auto_theme_with(&mut cfg, false));
+        assert_eq!(cfg.theme, default_theme);
+    }
+
+    /// The headless bootstrap must NOT inherit the host machine's real
+    /// accessibility settings, or every other test in this suite would behave
+    /// differently on a developer running High Contrast.
+    #[test]
+    fn the_headless_bootstrap_reports_no_forced_colors() {
+        assert!(
+            !C0pl4ndApp::bootstrap().forced_colors,
+            "bootstrap must not sample the host OS — tests would vary by machine"
+        );
+    }
+
+    /// While forced colors are on, the dark/light follow must not run at all —
+    /// otherwise it would swap the high-contrast theme back for a brand theme
+    /// on the next observed frame and undo the accessibility selection.
+    /// `last_os_theme` must also survive, so turning high contrast OFF does not
+    /// re-apply a stale observation.
+    #[test]
+    fn forced_colors_suppresses_the_os_theme_follow_without_forgetting_it() {
+        let ctx = egui::Context::default();
+        let mut app = C0pl4ndApp::bootstrap();
+        app.config.follow_os_theme = true;
+        app.forced_colors = true;
+        app.config.theme = c0pl4nd_core::forced_colors::HIGH_CONTRAST_THEME.to_string();
+        app.last_os_theme = Some(egui::Theme::Dark);
+
+        app.follow_os_theme_tick(&ctx);
+
+        assert_eq!(
+            app.config.theme,
+            c0pl4nd_core::forced_colors::HIGH_CONTRAST_THEME,
+            "the follow must not override the high-contrast theme"
+        );
+        assert_eq!(
+            app.last_os_theme,
+            Some(egui::Theme::Dark),
+            "the tracked appearance must be kept, not forgotten"
+        );
+    }
+}
+
+#[cfg(test)]
+mod changelog_wiring_tests {
+    //! The in-app changelog panel reads `c0pl4nd_core::changelog::current()`.
+    //! These assert the binary-level contract the panel depends on: the entry it
+    //! renders is for THIS build, and it is never blank-with-no-explanation.
+
+    /// The panel must always have something to render — either a body, or a
+    /// notice explaining why there is none. A blank panel with no explanation is
+    /// the failure mode this feature exists to avoid.
+    #[test]
+    fn the_panel_always_has_something_to_render() {
+        let entry = c0pl4nd_core::changelog::current();
+        assert!(
+            !entry.is_empty() || entry.notice.is_some(),
+            "an empty changelog body MUST carry a notice explaining itself"
+        );
+        assert!(!entry.heading.is_empty(), "the panel needs a heading");
+    }
+
+    /// The embedded changelog is the one shipping in THIS binary, so the entry
+    /// resolves against this crate's own version, not some other tree's.
+    #[test]
+    fn the_entry_resolves_for_this_builds_version() {
+        let entry = c0pl4nd_core::changelog::current();
+        let version = env!("CARGO_PKG_VERSION");
+        // Either the running version's own section (heading names it) or an
+        // announced fallback that names the version it looked for.
+        let names_version = entry.heading.contains(version)
+            || entry.notice.as_deref().is_some_and(|n| n.contains(version));
+        assert!(
+            names_version,
+            "heading {:?} / notice {:?} must reference v{version}",
+            entry.heading, entry.notice
+        );
+    }
+}

@@ -3082,6 +3082,51 @@ fn render_sections(
                 )));
             }
         }
+
+        // ---- What's new: the running version's changelog entry, in-app ----
+        //
+        // The link above is a browser hand-off. This panel answers the same
+        // question WITHOUT leaving the app, from the changelog compiled into
+        // this binary (`c0pl4nd_core::changelog`) — so it always describes the
+        // build actually running, and works with no network and no install-dir
+        // layout assumptions.
+        if row_visible(q, "changelog release notes what is new version history") {
+            ui.add_space(4.0);
+            let entry = c0pl4nd_core::changelog::current();
+            egui::CollapsingHeader::new(format!("What's new in {}", entry.heading))
+                .id_salt("changelog_panel")
+                .default_open(false)
+                .show(ui, |ui| {
+                    // A changelog panel that silently shows nothing is worse
+                    // than one that says it could not load, so every fallback
+                    // and every miss is stated HERE, in the UI — not only in a
+                    // log the user never sees.
+                    if let Some(notice) = &entry.notice {
+                        ui.colored_label(egui::Color32::from_rgb(0xff, 0xb0, 0x00), notice);
+                        ui.add_space(6.0);
+                    }
+                    if entry.is_empty() {
+                        // The notice above is the whole content — by contract it
+                        // is always present on this path.
+                        return;
+                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("changelog_body")
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            // Monospace preserves the Keep a Changelog structure
+                            // (nested `###` groups, `-` bullets) without pulling
+                            // in a markdown renderer; selectable so a user can
+                            // copy a line into a bug report.
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(entry.body.as_str()).monospace(),
+                                )
+                                .selectable(true),
+                            );
+                        });
+                });
+        }
         group_gap(ui);
     }
 

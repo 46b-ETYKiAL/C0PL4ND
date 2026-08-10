@@ -253,8 +253,14 @@ mod tests {
     /// No OS request → never any change, whatever the configured theme is.
     #[test]
     fn without_a_high_contrast_request_nothing_is_overridden() {
-        assert_eq!(auto_theme_override("itasha-corp", "itasha-corp", false), None);
-        assert_eq!(auto_theme_override("phosphor-amber", "itasha-corp", false), None);
+        assert_eq!(
+            auto_theme_override("itasha-corp", "itasha-corp", false),
+            None
+        );
+        assert_eq!(
+            auto_theme_override("phosphor-amber", "itasha-corp", false),
+            None
+        );
     }
 
     /// If the shipped default ever BECOMES the high-contrast theme, the override
@@ -297,8 +303,7 @@ mod tests {
     fn the_key_path_line_is_not_mistaken_for_the_value() {
         // No value row at all → None (→ high contrast off), NOT a parse of the
         // path line.
-        let path_only =
-            "\r\nHKEY_CURRENT_USER\\Control Panel\\Accessibility\\HighContrast\r\n\r\n";
+        let path_only = "\r\nHKEY_CURRENT_USER\\Control Panel\\Accessibility\\HighContrast\r\n\r\n";
         assert_eq!(parse_high_contrast_flags(path_only), None);
     }
 
@@ -321,8 +326,14 @@ mod tests {
     #[test]
     fn unparseable_output_is_none_not_a_panic() {
         assert_eq!(parse_high_contrast_flags(""), None);
-        assert_eq!(parse_high_contrast_flags("ERROR: The system was unable to find"), None);
-        assert_eq!(parse_high_contrast_flags("    Flags    REG_SZ    not-a-number"), None);
+        assert_eq!(
+            parse_high_contrast_flags("ERROR: The system was unable to find"),
+            None
+        );
+        assert_eq!(
+            parse_high_contrast_flags("    Flags    REG_SZ    not-a-number"),
+            None
+        );
     }
 
     /// The env-override grammar, matching `reduced_motion`'s. We do not mutate
@@ -351,6 +362,9 @@ mod tests {
     fn forced_colors_is_stable_across_calls() {
         let a = forced_colors();
         let b = forced_colors();
-        assert_eq!(a, b, "forced_colors must be stable (OnceLock-cached OS read)");
+        assert_eq!(
+            a, b,
+            "forced_colors must be stable (OnceLock-cached OS read)"
+        );
     }
 }

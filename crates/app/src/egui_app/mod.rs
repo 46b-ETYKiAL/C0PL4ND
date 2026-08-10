@@ -482,6 +482,16 @@ pub struct C0pl4ndApp {
     /// event — but NOT in headless tests, where an unconditional repaint would
     /// make `Harness::run` loop until `max_steps`.
     pub(crate) live_window: bool,
+    /// A config file EXISTED at startup but could not be read/parsed, so
+    /// `self.config` is `Config::default()` and every field the user had set is
+    /// absent from memory. Any save would therefore overwrite their file with
+    /// defaults — and unlike the forward-version case, a document merge cannot
+    /// recover the lost values because they are not in this process at all. The
+    /// FIRST save of such a session therefore renames the original aside to
+    /// `config.toml.bak` before writing (and clears this), so the loss is always
+    /// recoverable and always announced. Cleared early if a hot reload later
+    /// parses the file successfully — the premise no longer holds then.
+    pub(crate) config_unreadable: bool,
     /// Frameless terminal-only fullscreen (#36), toggled by F11 (and exited by
     /// F11 or Esc). TRANSIENT — never persisted to `Config`: F11 is a per-session
     /// view toggle, not a saved preference, so a relaunch is always windowed.
@@ -729,7 +739,13 @@ impl C0pl4ndApp {
         // surfaces as a visible toast instead of the silent fallback-to-defaults
         // that previously only `eprintln`'d (invisible to a GUI-launched user).
         let (cfg, config_error) = load_config_with_status();
+        // A `Some` error means a config file EXISTED and failed to read/parse
+        // (an absent file is `None`), so `cfg` is defaults and every value the
+        // user had set is gone from memory. Remember that: the first save of
+        // this session must set their file aside instead of overwriting it.
+        let unreadable = config_error.is_some();
         let mut app = Self::bootstrap_with(cfg);
+        app.config_unreadable = unreadable;
         if let Some(err) = config_error {
             app.toast = Some(err);
         }
@@ -982,6 +998,7 @@ impl C0pl4ndApp {
             settings_place_pending: false,
             settings_was_open: false,
             live_window: false,
+            config_unreadable: false,
             fullscreen: false,
             was_focused: true,
             selection: None,
@@ -3315,12 +3332,7 @@ impl C0pl4ndApp {
                     // settings change — mirrors the legacy shell (window.rs). A
                     // GUI user never sees stderr, so a visible toast (the same
                     // channel the config-LOAD error uses) is the real surface.
-                    if let Err(e) = self.config.save_to(&path) {
-                        self.toast = Some(crate::user_error::config_save_failed(
-                            e,
-                            "Your settings change",
-                        ));
-                    }
+                    self.save_config_guarded(&path, "Your settings change");
                     // Re-stamp the watcher so OUR write is not read back as an
                     // external edit on the next poll (which would re-apply the
                     // theme + visuals on every slider nudge).
@@ -3403,6 +3415,12 @@ impl C0pl4ndApp {
         };
         match c0pl4nd_core::Config::from_toml(&src, &path) {
             Ok(new_config) => {
+                // The file on disk is readable again, so the "my in-memory
+                // config is defaults because the startup load failed" premise
+                // no longer holds. Clear it BEFORE the equivalence check, or a
+                // user who hand-repairs their config mid-session would still
+                // get it renamed aside on the next save.
+                self.config_unreadable = false;
                 if new_config == self.config {
                     // A touched-but-equivalent file (a comment edit, a
                     // reformat, our own save on a path `mark_self_written`
@@ -4152,9 +4170,11 @@ impl eframe::App for C0pl4ndApp {
     /// keeps that typed-text undo history entirely in memory.
     ///
     /// Window geometry (position + size) is NOT lost by this: it is persisted
-    /// independently via [`c0pl4nd_core::Config::persist_geometry`] into the
-    /// config TOML AND by eframe's own `persist_window` native-window state, both
-    /// of which are unaffected by `persist_egui_memory`.
+    /// independently by eframe's own `persist_window` native-window state, which
+    /// is unaffected by `persist_egui_memory`. (`Config::persist_geometry` is the
+    /// LEGACY winit shell's mechanism — `crates/app/src/window.rs`, behind the
+    /// default-off `legacy-winit` feature — and is not compiled into this
+    /// binary.)
     fn persist_egui_memory(&self) -> bool {
         false
     }
@@ -4278,14 +4298,78 @@ impl C0pl4ndApp {
     /// failure surfaces as a toast (the same channel the settings save uses) and
     /// never blocks the live in-memory apply. `what` names the change for the
     /// toast (e.g. "The font size").
+    ///
+    /// The SINGLE write seam for `config.toml`. Every shipping writer goes
+    /// through here so the "the startup load failed, so my in-memory config is
+    /// defaults" hazard is handled in exactly one place.
+    ///
+    /// When [`Self::config_unreadable`] is set, `self.config` carries none of
+    /// the user's values, so writing it would replace their file with defaults.
+    /// A document merge cannot help — the values are not in this process. The
+    /// only non-destructive move is to rename the original aside FIRST, then
+    /// write, and tell the user where their file went. One quarantine per
+    /// session: subsequent saves write normally, because after the first write
+    /// the file on disk is genuinely ours.
+    ///
+    /// If the original cannot even be set aside, the write is ABANDONED — an
+    /// unwritable-but-present config is left exactly as it is rather than
+    /// overwritten. The one exception is a file that has since vanished: there
+    /// is nothing to preserve, so the save proceeds.
+    ///
+    /// `what` names the change for the failure toast, matching
+    /// [`crate::user_error::config_save_failed`].
+    pub(crate) fn save_config_guarded(&mut self, path: &std::path::Path, what: &str) {
+        if self.config_unreadable {
+            // One quarantine per session, cleared BEFORE the attempt so a
+            // failure cannot wedge every later save in this session.
+            self.config_unreadable = false;
+            match c0pl4nd_core::config::quarantine_config_file(path) {
+                Ok(bak) => {
+                    // Logged as well as toasted: `prepare_shutdown` is a real
+                    // caller, and a toast raised while the window is closing is
+                    // never painted — the log is the only channel that survives
+                    // there.
+                    tracing::warn!(
+                        target: "c0pl4nd::config",
+                        backup = ?bak,
+                        "unreadable config set aside before writing new settings"
+                    );
+                    self.toast = Some(format!(
+                        "Your settings file couldn't be read, so it was saved as {} \
+                         before C0PL4ND wrote new settings.",
+                        bak.display()
+                    ));
+                }
+                Err(e) => {
+                    if path.exists() {
+                        // Present but un-renameable (permissions, a lock). Do
+                        // NOT overwrite it — leaving the user's bytes intact
+                        // beats persisting this one change.
+                        tracing::warn!(
+                            target: "c0pl4nd::config",
+                            path = ?path,
+                            "could not set the unreadable config aside; refusing to overwrite it"
+                        );
+                        self.toast = Some(crate::user_error::config_save_failed(e, what));
+                        return;
+                    }
+                    // Vanished since startup — nothing to preserve, so the
+                    // save below is not destructive.
+                }
+            }
+        }
+        if let Err(e) = self.config.save_to(path) {
+            tracing::warn!(target: "c0pl4nd::config", path = ?path, "could not save config: {e}");
+            self.toast = Some(crate::user_error::config_save_failed(e, what));
+        }
+    }
+
     fn persist_config_change(&mut self, what: &str) {
         if !self.live_window {
             return;
         }
         if let Some(path) = c0pl4nd_core::Config::default_path() {
-            if let Err(e) = self.config.save_to(&path) {
-                self.toast = Some(crate::user_error::config_save_failed(e, what));
-            }
+            self.save_config_guarded(&path, what);
             // Our own write — re-stamp so the hot-reload watcher does not read
             // it back as an external edit on its next poll.
             self.config_watch.mark_self_written();
@@ -4498,9 +4582,10 @@ impl C0pl4ndApp {
             if let Some(path) = c0pl4nd_core::Config::default_path() {
                 // Surface a persist failure instead of silently dropping the
                 // user's settings change — mirrors the legacy shell (window.rs).
-                if let Err(e) = self.config.save_to(&path) {
-                    tracing::warn!("could not save config: {e}");
-                }
+                // This is the one writer that fires with NO user action beyond
+                // launching and quitting, so it is also the one that most needs
+                // the unreadable-config quarantine the seam applies.
+                self.save_config_guarded(&path, "Your settings");
             }
         }
         // 2) Kill every pane's shell FIRST, in one pass, so all N children
@@ -6782,6 +6867,109 @@ mod close_path_tests;
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;
+#[cfg(test)]
+mod config_guard_tests {
+    //! The shipping data-loss path: when the startup load FAILED, `self.config`
+    //! is `Config::default()`, so any save replaces the user's file with
+    //! defaults — and `prepare_shutdown` performs one on EVERY window close, so
+    //! launching with a bad config and quitting was enough to destroy it. The
+    //! write seam must set the original aside first.
+    use super::C0pl4ndApp;
+
+    fn headless_app() -> C0pl4ndApp {
+        C0pl4ndApp::bootstrap_with(c0pl4nd_core::Config::default())
+    }
+
+    #[test]
+    fn the_first_save_of_an_unreadable_config_session_sets_the_original_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let bak = dir.path().join("config.toml.bak");
+        // What a user's file looks like when the load failed: real settings,
+        // one value out of range. `self.config` is defaults, so these values
+        // exist NOWHERE in the process — only in this file.
+        let original = "theme = \"ghost-paper\"\nopacity = 1.5\nscrollback_lines = 42\n";
+        std::fs::write(&path, original).unwrap();
+
+        let mut app = headless_app();
+        app.config_unreadable = true;
+        app.save_config_guarded(&path, "Your settings");
+
+        assert_eq!(
+            std::fs::read_to_string(&bak).expect("the original must be set aside"),
+            original,
+            "the user's bytes are preserved verbatim, not overwritten"
+        );
+        let toast = app.toast.clone().expect("the user must be told");
+        assert!(
+            toast.contains("config.toml.bak"),
+            "the toast must name the backup path, else the file is unfindable: {toast}"
+        );
+        assert!(
+            c0pl4nd_core::Config::load_from(&path).is_ok(),
+            "and the new settings are written and loadable"
+        );
+
+        // One quarantine per session: a SECOND save must not roll the backup
+        // forward and lose the original (the whole point of keeping it).
+        app.config.theme = "itasha-corp".to_string();
+        app.save_config_guarded(&path, "Your settings");
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            original,
+            "the second save must not overwrite the backup with our own output"
+        );
+    }
+
+    #[test]
+    fn a_readable_config_session_never_quarantines_and_merges_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let bak = dir.path().join("config.toml.bak");
+        std::fs::write(&path, "theme = \"ghost-paper\"\nfrom_a_newer_build = 7\n").unwrap();
+
+        let mut app = headless_app();
+        assert!(
+            !app.config_unreadable,
+            "a bootstrapped app has no failed load to recover from"
+        );
+        app.save_config_guarded(&path, "Your settings");
+
+        assert!(
+            !bak.exists(),
+            "a config that loaded fine must never be set aside"
+        );
+        // Asserted on the raw text rather than a parsed `toml::Table`: `toml`
+        // is a dependency of `c0pl4nd-core`, not of this crate, and the merge is
+        // already asserted structurally by the core suite. What matters here is
+        // that routing through the guarded seam did not lose it.
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("from_a_newer_build = 7"),
+            "the merging save must preserve a key this build has no field for; \
+             file is now:\n{written}"
+        );
+    }
+
+    #[test]
+    fn a_config_that_vanished_after_a_failed_load_is_still_saved() {
+        // Nothing to preserve, so refusing the write would strand the user's
+        // change for no benefit.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut app = headless_app();
+        app.config_unreadable = true;
+        app.save_config_guarded(&path, "Your settings");
+
+        assert!(
+            path.exists(),
+            "the save proceeds when there is nothing to lose"
+        );
+        assert!(!dir.path().join("config.toml.bak").exists());
+    }
+}
+
 #[cfg(test)]
 mod config_load_tests {
     //! F5-2: a present-but-broken config file must surface an error (so the host

@@ -425,12 +425,7 @@ impl super::C0pl4ndApp {
             // permission error) instead of silently dropping the user's settings
             // change. A GUI user never sees stderr, so a visible toast is the
             // real surface.
-            if let Err(e) = self.config.save_to(&path) {
-                self.toast = Some(crate::user_error::config_save_failed(
-                    e,
-                    "The layout change",
-                ));
-            }
+            self.save_config_guarded(&path, "The layout change");
         }
     }
 

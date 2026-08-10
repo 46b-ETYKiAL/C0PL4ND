@@ -39,6 +39,27 @@ pub enum ConfigError {
     Invalid(String),
 }
 
+/// What a [`Config::save_to_reporting`] write did to the file that was already
+/// on disk. Purely informational — the write itself already succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveOutcome {
+    /// No file existed; the config was written fresh.
+    Created,
+    /// An existing, parseable file was MERGED into: every key this build has no
+    /// field for (e.g. a key written by a NEWER build) survived verbatim.
+    Merged,
+    /// The existing file could not be parsed as TOML at all (or the merged
+    /// document could not be re-emitted losslessly), so it was renamed aside to
+    /// the returned path BEFORE the new body was written. Nothing was
+    /// destroyed; the caller SHOULD tell the user where the backup went.
+    Quarantined(PathBuf),
+}
+
+/// Suffix appended to a config file that had to be set aside before a write.
+/// Keep-one-prior, matching the update engine's backup discipline: a second
+/// quarantine in the same install replaces the first.
+pub const CONFIG_BACKUP_SUFFIX: &str = ".bak";
+
 /// Font configuration: the primary family, size, line height, and glyph
 /// fallback chain.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1700,60 +1721,243 @@ impl Config {
         toml::to_string_pretty(self).map_err(|e| ConfigError::Invalid(e.to_string()))
     }
 
-    /// Persist to a specific path, creating parent directories as needed.
-    /// Used by the settings panel and the window-geometry persistence so the
-    /// config file stays the single source of truth.
+    /// Persist to a specific path, creating parent directories as needed,
+    /// **preserving every key already in the file that this build has no field
+    /// for**. Thin wrapper over [`Config::save_to_reporting`] for callers that
+    /// do not need to know what happened to the prior file.
+    pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
+        self.save_to_reporting(path).map(|_| ())
+    }
+
+    /// Persist to a specific path, reporting what happened to the file that was
+    /// already there.
+    ///
+    /// **Preserving by construction.** The existing file is parsed as a raw TOML
+    /// document and this config is DEEP-MERGED over it, so a key the file
+    /// carries but this build has no field for — a key written by a NEWER build,
+    /// most importantly — is written back verbatim instead of being silently
+    /// dropped. Before this, `to_toml` emitted only the struct's own fields and
+    /// every unknown key was destroyed on the next save. (Comments and blank
+    /// lines are not preserved; they never were — `to_toml` has always re-emitted
+    /// the document from scratch.)
+    ///
+    /// **Never silently destructive.** If the existing file cannot be parsed as
+    /// TOML (a hand-edit mid-save, a truncated write, a binary blob), it is
+    /// RENAMED to `<name>.bak` before the new body is written and the caller
+    /// receives [`SaveOutcome::Quarantined`] carrying that path.
     ///
     /// The file is created **owner-only** from the start (roadmap P-V2): `0600`
     /// on Unix, an owner-only DACL on Windows. The config may reflect the user's
-    /// environment, so other local accounts should not be able to read it.
-    ///
-    /// The write goes through [`atomic_write_owner_only`], which writes the body
-    /// to a sibling temp file, tightens it (on Unix `0600` is applied to the temp
-    /// file **before** the rename), then atomically renames it over the
-    /// destination. This closes the previous race where `std::fs::write` then
-    /// `restrict_to_owner` left a brief window in which the file carried default
-    /// (umask/inherited) permissions (audit P3-#2). Permission tightening itself
-    /// remains BEST-EFFORT — a restrictive filesystem can never block a save —
-    /// but is no longer applied after the content already exists world-readable.
-    pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
-        let body = self.to_toml()?;
-        // `atomic_write_owner_only` creates parent dirs, writes to a sibling
-        // temp file, tightens perms (Unix: on the temp file pre-rename; Windows:
-        // on the final path post-rename), and renames atomically — so the
-        // destination never exists in a world-readable, default-perms state.
+    /// environment, so other local accounts should not be able to read it. The
+    /// write goes through [`crate::atomic_write::atomic_write_owner_only`],
+    /// which creates parent dirs, writes the body to a sibling temp file,
+    /// tightens it (on Unix `0600` is applied to the temp file **before** the
+    /// rename), then atomically renames it over the destination — so the
+    /// destination never exists in a world-readable, default-perms state.
+    pub fn save_to_reporting(&self, path: &Path) -> Result<SaveOutcome, ConfigError> {
+        let rendered = self.to_toml()?;
+        let (body, outcome) = match std::fs::read_to_string(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (rendered, SaveOutcome::Created),
+            // A file that exists but cannot be READ cannot be merged, and
+            // blindly overwriting it is exactly the destruction this method
+            // exists to prevent. Fail rather than clobber.
+            Err(e) => {
+                return Err(ConfigError::Io {
+                    path: path.to_path_buf(),
+                    source: e,
+                })
+            }
+            Ok(existing) => Self::merge_over_existing(&existing, &rendered, path)?,
+        };
         crate::atomic_write::atomic_write_owner_only(path, body.as_bytes()).map_err(|e| {
             ConfigError::Io {
                 path: path.to_path_buf(),
                 source: e,
             }
         })?;
-        Ok(())
+        Ok(outcome)
+    }
+
+    /// Build the body to write by merging `rendered` (this config) over
+    /// `existing` (the on-disk document). Falls back to
+    /// quarantine-then-plain-render when the existing text is not TOML, or when
+    /// the merged document cannot be re-emitted losslessly.
+    fn merge_over_existing(
+        existing: &str,
+        rendered: &str,
+        path: &Path,
+    ) -> Result<(String, SaveOutcome), ConfigError> {
+        let mine: toml::Table = rendered
+            .parse()
+            .map_err(|e: toml::de::Error| ConfigError::Invalid(e.to_string()))?;
+        let Ok(mut merged) = existing.parse::<toml::Table>() else {
+            let bak = quarantine_config_file(path)?;
+            return Ok((rendered.to_string(), SaveOutcome::Quarantined(bak)));
+        };
+        merge_toml_tables(&mut merged, mine);
+        let body =
+            toml::to_string_pretty(&merged).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        // Never write a body we cannot read back as the document we intended.
+        // TOML binds a bare `key = value` that follows a `[table]` header to that
+        // table, and a merge can introduce a key alongside existing tables.
+        // `toml::to_string_pretty` emits every scalar BEFORE every table at each
+        // nesting level (verified empirically against `toml 1.1.3`, which is also
+        // why no manual key reordering is needed here), so this holds today — but
+        // asserting it is what makes the guarantee load-bearing rather than
+        // assumed, and what makes a future serializer change a caught,
+        // recoverable condition instead of a mangled config.
+        if body
+            .parse::<toml::Table>()
+            .is_ok_and(|round| round == merged)
+        {
+            Ok((body, SaveOutcome::Merged))
+        } else {
+            let bak = quarantine_config_file(path)?;
+            Ok((rendered.to_string(), SaveOutcome::Quarantined(bak)))
+        }
+    }
+
+    /// Write ONLY the six persisted window-geometry keys into the file at
+    /// `path`, leaving every other byte of the user's config untouched.
+    ///
+    /// This never constructs a [`Config`] and never runs [`Config::validate`],
+    /// so a file that fails validation (e.g. a hand-edited `opacity = 1.5`)
+    /// still gets its geometry persisted instead of being overwritten with
+    /// defaults. A file that is not valid TOML at all cannot be patched, and is
+    /// left EXACTLY as it is — the error is returned, never papered over.
+    ///
+    /// A `None` geometry field REMOVES the key rather than writing a null, so
+    /// "no remembered position" round-trips as absence, matching the
+    /// `Option`-with-`serde(default)` shape of [`WindowConfig`].
+    pub fn patch_window_geometry(path: &Path, window: &WindowConfig) -> Result<(), ConfigError> {
+        let mut doc: toml::Table = match std::fs::read_to_string(path) {
+            Ok(src) => src
+                .parse()
+                .map_err(|e: toml::de::Error| ConfigError::Parse {
+                    path: path.to_path_buf(),
+                    message: e.to_string(),
+                })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+            Err(e) => {
+                return Err(ConfigError::Io {
+                    path: path.to_path_buf(),
+                    source: e,
+                })
+            }
+        };
+        if !doc.contains_key("window") {
+            doc.insert("window".to_string(), toml::Value::Table(toml::Table::new()));
+        }
+        let Some(toml::Value::Table(win)) = doc.get_mut("window") else {
+            // `window` exists but is not a table (a hand-edit such as
+            // `window = "x"`). Refuse rather than clobber the user's line.
+            return Err(ConfigError::Invalid(
+                "`window` is not a table; refusing to patch geometry".into(),
+            ));
+        };
+        set_or_remove(
+            win,
+            "pos_x",
+            window.pos_x.map(|v| toml::Value::Integer(v.into())),
+        );
+        set_or_remove(
+            win,
+            "pos_y",
+            window.pos_y.map(|v| toml::Value::Integer(v.into())),
+        );
+        set_or_remove(
+            win,
+            "size_w",
+            window.size_w.map(|v| toml::Value::Integer(v.into())),
+        );
+        set_or_remove(
+            win,
+            "size_h",
+            window.size_h.map(|v| toml::Value::Integer(v.into())),
+        );
+        set_or_remove(win, "maximized", window.maximized.map(toml::Value::Boolean));
+        set_or_remove(
+            win,
+            "monitor",
+            window.monitor.clone().map(toml::Value::String),
+        );
+        let body = toml::to_string_pretty(&doc).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        crate::atomic_write::atomic_write_owner_only(path, body.as_bytes()).map_err(|e| {
+            ConfigError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            }
+        })
     }
 
     /// Update only the persisted window-geometry fields on the file at
-    /// [`Config::default_path`], preserving every other field the user set.
-    /// Best-effort: a load/parse failure falls back to the in-memory config so
-    /// a corrupt file never blocks geometry capture. Returns the path written.
+    /// [`Config::default_path`], leaving every other byte the user set exactly
+    /// as it is. Returns the path written, or `None` when no config path
+    /// resolves or the file could not be patched (it is then left untouched).
+    ///
+    /// This deliberately does NOT load a [`Config`]. It previously did, via
+    /// `Config::load_from(&path).unwrap_or_default()` — and because this is an
+    /// associated function with no config in scope, `unwrap_or_default()`
+    /// synthesised a FRESH `Config::default()` and wrote it over the user's
+    /// file, destroying every setting, on any load failure (e.g. a hand-edited
+    /// out-of-range value that `validate` rejects).
     pub fn persist_geometry(window: WindowConfig) -> Option<PathBuf> {
         let path = Config::default_path()?;
-        let mut cfg = Config::load_from(&path).unwrap_or_default();
-        // Copy only geometry; leave cols/rows/padding (size-on-first-launch)
-        // untouched so an explicit user value is never clobbered.
-        cfg.window.pos_x = window.pos_x;
-        cfg.window.pos_y = window.pos_y;
-        cfg.window.size_w = window.size_w;
-        cfg.window.size_h = window.size_h;
-        cfg.window.maximized = window.maximized;
-        cfg.window.monitor = window.monitor;
         // Surface a save failure (audit LO-4): previously `.ok()?` swallowed it
         // silently, unlike the loader's `tracing::warn!` convention, so a
         // persistently-unwritable config dir lost window geometry with no trace.
-        if let Err(e) = cfg.save_to(&path) {
+        if let Err(e) = Config::patch_window_geometry(&path, &window) {
             tracing::warn!("failed to persist window geometry to {path:?}: {e}");
             return None;
         }
         Some(path)
+    }
+}
+
+/// Rename `path` aside to `<name>.bak` so an unreadable config is preserved
+/// rather than overwritten. Returns the backup path.
+pub fn quarantine_config_file(path: &Path) -> Result<PathBuf, ConfigError> {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_else(|| std::ffi::OsString::from("config.toml"));
+    name.push(CONFIG_BACKUP_SUFFIX);
+    let bak = path.with_file_name(name);
+    std::fs::rename(path, &bak).map_err(|e| ConfigError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    Ok(bak)
+}
+
+/// Insert `value`, or REMOVE `key` when it is `None`, so an absent `Option`
+/// field round-trips as an absent TOML key.
+fn set_or_remove(table: &mut toml::Table, key: &str, value: Option<toml::Value>) {
+    match value {
+        Some(v) => {
+            table.insert(key.to_string(), v);
+        }
+        None => {
+            table.remove(key);
+        }
+    }
+}
+
+/// Deep-merge `overlay` onto `base`. A key in `overlay` replaces the value in
+/// `base`, EXCEPT when both sides are tables, where the merge recurses. A key
+/// present ONLY in `base` survives untouched — that is the forward-compatibility
+/// guarantee: a key written by a newer build, for which this build's [`Config`]
+/// has no field, is not dropped on save.
+fn merge_toml_tables(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(base_table)), toml::Value::Table(overlay_table)) => {
+                merge_toml_tables(base_table, overlay_table);
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
     }
 }
 
@@ -2974,17 +3178,26 @@ mod tests {
 
     #[test]
     fn persist_geometry_copies_only_geometry_not_the_tray_toggles() {
-        // `persist_geometry` reloads the on-disk config and overwrites the
-        // geometry fields only. If it ever started copying the whole WindowConfig
-        // it would clobber a tray toggle the user changed in the settings window
-        // with whatever the geometry-capture snapshot happened to hold.
-        let on_disk = WindowConfig {
-            close_to_tray: true,
-            minimize_to_tray: true,
-            warn_on_close_running: false,
-            ..WindowConfig::default()
-        };
-        let mut merged = on_disk.clone();
+        // The geometry patch writes the geometry keys only. If it ever started
+        // writing the whole WindowConfig it would clobber a tray toggle the user
+        // changed in the settings window with whatever the geometry-capture
+        // snapshot happened to hold.
+        //
+        // This test previously asserted against its OWN hand-mirrored copy of
+        // `persist_geometry`'s field-by-field assignment and never called the
+        // real function, so it could not fail for any change to it — which is
+        // why the clobber defect (652c44b) survived. It now drives the real
+        // `patch_window_geometry` against a seeded file.
+        let path =
+            std::env::temp_dir().join(format!("c0pl4nd-cfg-{}-geom-tray.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "[window]\nclose_to_tray = true\nminimize_to_tray = true\n\
+             warn_on_close_running = false\n",
+        )
+        .expect("seed");
+
         let captured = WindowConfig {
             pos_x: Some(11),
             pos_y: Some(22),
@@ -2994,24 +3207,44 @@ mod tests {
             monitor: Some("DISPLAY1".to_string()),
             ..WindowConfig::default()
         };
-        // Mirrors persist_geometry's field-by-field copy exactly.
-        merged.pos_x = captured.pos_x;
-        merged.pos_y = captured.pos_y;
-        merged.size_w = captured.size_w;
-        merged.size_h = captured.size_h;
-        merged.maximized = captured.maximized;
-        merged.monitor = captured.monitor.clone();
+        Config::patch_window_geometry(&path, &captured).expect("patch");
 
-        assert_eq!(merged.pos_x, Some(11), "geometry must be copied");
-        assert!(merged.close_to_tray, "close_to_tray must survive");
-        assert!(merged.minimize_to_tray, "minimize_to_tray must survive");
-        assert!(
-            !merged.warn_on_close_running,
+        let doc: toml::Table = std::fs::read_to_string(&path)
+            .expect("read")
+            .parse()
+            .expect("valid TOML");
+        let win = doc
+            .get("window")
+            .and_then(|v| v.as_table())
+            .expect("[window]");
+        assert_eq!(
+            win.get("pos_x").and_then(|v| v.as_integer()),
+            Some(11),
+            "geometry must be written"
+        );
+        assert_eq!(
+            win.get("monitor").and_then(|v| v.as_str()),
+            Some("DISPLAY1")
+        );
+        assert_eq!(
+            win.get("close_to_tray").and_then(|v| v.as_bool()),
+            Some(true),
+            "close_to_tray must survive"
+        );
+        assert_eq!(
+            win.get("minimize_to_tray").and_then(|v| v.as_bool()),
+            Some(true),
+            "minimize_to_tray must survive"
+        );
+        assert_eq!(
+            win.get("warn_on_close_running").and_then(|v| v.as_bool()),
+            Some(false),
             "warn_on_close_running must survive"
         );
         // And the captured snapshot's own defaults are NOT what landed.
         assert_ne!(
-            merged.warn_on_close_running, captured.warn_on_close_running,
+            win.get("warn_on_close_running").and_then(|v| v.as_bool()),
+            Some(captured.warn_on_close_running),
             "the geometry snapshot's default must not have overwritten the user's value"
         );
     }
@@ -3466,6 +3699,338 @@ mod tests {
             "saved config must be owner-only 0600, got {:o}",
             mode & 0o777
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Serialises the tests that mutate the process-global env vars
+    /// [`Config::default_path`] reads. Mirrors the app crate's `WGPU_ENV_LOCK` /
+    /// `PATH_ENV_LOCK` pattern. Any future core test that sets `APPDATA` /
+    /// `XDG_CONFIG_HOME` / `HOME` MUST take this lock.
+    static CONFIG_PATH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Point [`Config::default_path`] at `dir` for the duration, restoring the
+    /// previous values on drop.
+    struct ConfigDirGuard {
+        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ConfigDirGuard {
+        fn new(dir: &Path) -> Self {
+            let keys: &[&'static str] = if cfg!(windows) {
+                &["APPDATA"]
+            } else {
+                &["XDG_CONFIG_HOME"]
+            };
+            let prev = keys
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect::<Vec<_>>();
+            for (k, _) in &prev {
+                std::env::set_var(k, dir);
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.prev {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn persist_geometry_never_overwrites_a_config_it_could_not_load() {
+        // REGRESSION (652c44b, 2026-05-30): `persist_geometry` did
+        // `Config::load_from(&path).unwrap_or_default()` — and because it is an
+        // associated fn with NO config in scope, a load failure synthesised a
+        // FRESH Config::default() and wrote it over the user's file. A single
+        // hand-edited out-of-range value (which `validate` rejects) therefore
+        // destroyed every setting the user ever made, on the next window move.
+        let _lock = CONFIG_PATH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("c0pl4nd-cfg-{}-geom-noclobber", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("c0pl4nd");
+        std::fs::create_dir_all(&dir).expect("seed config dir");
+        let path = dir.join("config.toml");
+        // A config that PARSES but fails validate(): opacity is out of range.
+        std::fs::write(
+            &path,
+            "theme = \"ghost-paper\"\nopacity = 1.5\nscrollback_lines = 42\n\
+             [font]\nfamily = \"Cascadia Code\"\n",
+        )
+        .expect("seed config");
+        assert!(
+            Config::load_from(&path).is_err(),
+            "precondition: the seeded config must fail to load"
+        );
+
+        let _guard = ConfigDirGuard::new(&root);
+        let written = Config::persist_geometry(WindowConfig {
+            pos_x: Some(11),
+            pos_y: Some(22),
+            size_w: Some(800),
+            size_h: Some(600),
+            maximized: Some(false),
+            ..WindowConfig::default()
+        });
+        assert_eq!(
+            written.as_deref(),
+            Some(path.as_path()),
+            "geometry must persist"
+        );
+
+        let after = std::fs::read_to_string(&path).expect("config must still exist");
+        let doc: toml::Table = after.parse().expect("still valid TOML");
+        assert_eq!(
+            doc.get("theme").and_then(|v| v.as_str()),
+            Some("ghost-paper"),
+            "the user's theme must survive a geometry persist over an invalid config"
+        );
+        assert_eq!(
+            doc.get("scrollback_lines").and_then(|v| v.as_integer()),
+            Some(42),
+            "every unrelated key must survive"
+        );
+        assert_eq!(
+            doc.get("font")
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get("family"))
+                .and_then(|v| v.as_str()),
+            Some("Cascadia Code"),
+            "nested tables must survive"
+        );
+        let win = doc
+            .get("window")
+            .and_then(|v| v.as_table())
+            .expect("[window]");
+        assert_eq!(win.get("pos_x").and_then(|v| v.as_integer()), Some(11));
+        assert_eq!(win.get("size_w").and_then(|v| v.as_integer()), Some(800));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_forward_version_config_keeps_its_unknown_keys_across_a_save() {
+        // A config written by a NEWER build carries keys this build has no field
+        // for. Because there is no `deny_unknown_fields`, they deserialize away —
+        // and `to_toml` emits only OUR fields, so a save silently dropped every
+        // v-next key while keeping the forward `schema_version`, leaving a file
+        // that claims v4 but holds v3 content. The save must MERGE over the
+        // existing document, not replace it.
+        let path =
+            std::env::temp_dir().join(format!("c0pl4nd-cfg-{}-forward.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let seeded = format!(
+            "schema_version = {}\n\
+             theme = \"ghost-paper\"\n\
+             remote_sync = \"wss://example.invalid\"\n\
+             [window]\ncols = 100\nsnap_to_edges = true\n\
+             [future]\nenabled = true\nweight = 3\n",
+            CURRENT_SCHEMA_VERSION + 1
+        );
+        std::fs::write(&path, &seeded).expect("seed");
+
+        let loaded = Config::load_from(&path).expect("a forward config still loads");
+        assert_eq!(loaded.schema_version, CURRENT_SCHEMA_VERSION + 1);
+        loaded.save_to(&path).expect("save");
+
+        let doc: toml::Table = std::fs::read_to_string(&path)
+            .expect("read")
+            .parse()
+            .expect("valid TOML");
+        assert_eq!(
+            doc.get("schema_version").and_then(|v| v.as_integer()),
+            Some(i64::from(CURRENT_SCHEMA_VERSION + 1)),
+            "the forward version is retained"
+        );
+        assert_eq!(
+            doc.get("remote_sync").and_then(|v| v.as_str()),
+            Some("wss://example.invalid"),
+            "a top-level key this build does not know must survive the save"
+        );
+        assert_eq!(
+            doc.get("window")
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get("snap_to_edges"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "an unknown key inside a KNOWN table must survive"
+        );
+        assert!(
+            doc.contains_key("future"),
+            "an entirely unknown table must survive"
+        );
+        assert_eq!(
+            doc.get("theme").and_then(|v| v.as_str()),
+            Some("ghost-paper"),
+            "known keys still round-trip"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn patch_window_geometry_touches_only_the_six_geometry_keys() {
+        // The geometry patch is a SURGICAL write: it edits six keys under
+        // `[window]` and leaves every other byte of the document — sibling keys
+        // in the same table, sibling tables, top-level scalars — exactly as the
+        // user left them. It never builds a `Config`, so it cannot substitute a
+        // default for a field it did not read.
+        let path = std::env::temp_dir().join(format!(
+            "c0pl4nd-cfg-{}-geom-patch.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "theme = \"ghost-paper\"\n\
+             [window]\ncols = 120\nrows = 40\nclose_to_tray = true\nmonitor = \"OLD\"\n\
+             [update]\nmode = \"off\"\n",
+        )
+        .expect("seed");
+
+        Config::patch_window_geometry(
+            &path,
+            &WindowConfig {
+                pos_x: Some(5),
+                size_w: Some(1280),
+                maximized: Some(true),
+                monitor: None, // an absent Option must REMOVE the key
+                ..WindowConfig::default()
+            },
+        )
+        .expect("patch");
+
+        let doc: toml::Table = std::fs::read_to_string(&path)
+            .expect("read")
+            .parse()
+            .expect("valid TOML");
+        let win = doc
+            .get("window")
+            .and_then(|v| v.as_table())
+            .expect("[window]");
+        assert_eq!(win.get("pos_x").and_then(|v| v.as_integer()), Some(5));
+        assert_eq!(win.get("size_w").and_then(|v| v.as_integer()), Some(1280));
+        assert_eq!(win.get("maximized").and_then(|v| v.as_bool()), Some(true));
+        assert!(
+            !win.contains_key("monitor"),
+            "a None geometry field removes the key rather than writing a default"
+        );
+        assert_eq!(
+            win.get("cols").and_then(|v| v.as_integer()),
+            Some(120),
+            "cols/rows/padding are NOT geometry and must not be touched"
+        );
+        assert_eq!(
+            win.get("close_to_tray").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            doc.get("theme").and_then(|v| v.as_str()),
+            Some("ghost-paper")
+        );
+        assert!(doc.contains_key("update"), "sibling tables survive");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_unparseable_config_is_set_aside_before_a_save_overwrites_it() {
+        // A file that cannot be parsed cannot be merged into, so the new body
+        // genuinely does replace it. That is only acceptable if the original
+        // bytes are preserved first and the caller is told where they went —
+        // otherwise a single truncated write destroys the user's settings with
+        // no way back.
+        let path = std::env::temp_dir().join(format!(
+            "c0pl4nd-cfg-{}-quarantine.toml",
+            std::process::id()
+        ));
+        let bak = path.with_extension("toml.bak");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&bak);
+        let garbage = "theme = \"ghost-paper\"\n[window\ncols = ";
+        std::fs::write(&path, garbage).expect("seed");
+        assert!(
+            garbage.parse::<toml::Table>().is_err(),
+            "precondition: the seeded file is not valid TOML"
+        );
+
+        let outcome = Config::default()
+            .save_to_reporting(&path)
+            .expect("the save itself still succeeds");
+        match outcome {
+            SaveOutcome::Quarantined(p) => assert_eq!(p, bak, "backup path is reported"),
+            other => panic!("expected Quarantined, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&bak).expect("backup exists"),
+            garbage,
+            "the user's original bytes are preserved verbatim"
+        );
+        assert!(
+            Config::load_from(&path).is_ok(),
+            "the new config is written and loadable"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&bak);
+    }
+
+    #[test]
+    fn a_merged_save_always_reparses_to_the_document_it_intended() {
+        // The one mechanical hazard of a document merge: TOML binds a bare
+        // `key = value` that follows a `[header]` to that table, so a body that
+        // emitted a scalar after a table would re-parse as a DIFFERENT document
+        // than the one intended — silently relocating the user's keys.
+        //
+        // Empirically (`toml 1.1.3`, no `preserve_order` feature anywhere in
+        // this workspace) `toml::Table` is BTreeMap-backed and
+        // `to_string_pretty` emits every scalar before every table at each
+        // nesting level, so this holds. This test is what keeps that a verified
+        // property rather than an assumption: a serializer change turns a
+        // mangled config into a caught, quarantined condition.
+        //
+        // The seed deliberately puts the unknown top-level scalar BEFORE the
+        // unknown table — the reverse is not expressible in TOML, since a bare
+        // key after `[zzz_unknown_table]` would belong to that table.
+        let path =
+            std::env::temp_dir().join(format!("c0pl4nd-cfg-{}-reparse.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "remote_sync = \"keep-me\"\n\n[zzz_unknown_table]\nk = 1\n",
+        )
+        .expect("seed");
+
+        let outcome = Config::default().save_to_reporting(&path).expect("save");
+        assert_eq!(
+            outcome,
+            SaveOutcome::Merged,
+            "a parseable existing file is merged, not quarantined"
+        );
+        let text = std::fs::read_to_string(&path).expect("read");
+        let doc: toml::Table = text
+            .parse()
+            .unwrap_or_else(|e| panic!("the written config must re-parse: {e}\n---\n{text}"));
+        assert_eq!(
+            doc.get("remote_sync").and_then(|v| v.as_str()),
+            Some("keep-me"),
+            "an unknown TOP-LEVEL scalar must survive the merge at top level"
+        );
+        assert_eq!(
+            doc.get("zzz_unknown_table")
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get("k"))
+                .and_then(|v| v.as_integer()),
+            Some(1),
+            "an unknown table and its contents must survive"
+        );
+        let reloaded = Config::load_from(&path).expect("and must load as a Config");
+        assert_eq!(reloaded.theme, Config::default().theme);
         let _ = std::fs::remove_file(&path);
     }
 }

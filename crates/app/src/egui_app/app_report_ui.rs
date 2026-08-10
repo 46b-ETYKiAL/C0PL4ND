@@ -136,12 +136,7 @@ impl super::C0pl4ndApp {
         let Some(path) = path else {
             return;
         };
-        if let Err(e) = self.config.save_to(path) {
-            self.toast = Some(crate::user_error::config_save_failed(
-                e,
-                "Your reporting choice",
-            ));
-        }
+        self.save_config_guarded(path, "Your reporting choice");
     }
 
     /// Render the W1TN3SS manual "Report an issue" dialog, opened from the
@@ -406,6 +401,41 @@ mod tests {
             ReportingMode::Always
         );
         assert_eq!(crash_mode_on_disk(&path), ReportingMode::Always);
+    }
+
+    /// A real shipping writer routes through the guarded write seam, so a
+    /// session whose config could not be read sets the user's file aside rather
+    /// than replacing it with defaults.
+    ///
+    /// This is the WIRING half of the fix: the seam existing is worth nothing if
+    /// the five writers still call `self.config.save_to` directly. Asserted here
+    /// because "remember my choice" is a writer that takes an explicit path and
+    /// needs no live window, so it can be driven headlessly end to end.
+    #[test]
+    fn a_writer_sets_an_unreadable_config_aside_instead_of_overwriting_it() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let path = tmp.path().join("config.toml");
+        let bak = tmp.path().join("config.toml.bak");
+        // Values that live ONLY in this file — after a failed load the app's
+        // in-memory config is defaults, so nothing here is recoverable from
+        // memory. `opacity = 1.5` is what made the load fail.
+        let original = "theme = \"ghost-paper\"\nopacity = 1.5\n";
+        std::fs::write(&path, original).expect("seed");
+        let mut app = headless_app();
+        app.config_unreadable = true;
+
+        app.apply_remember_choice_to(RememberChoice::Always, Some(&path));
+
+        assert_eq!(
+            std::fs::read_to_string(&bak).expect("the original must be set aside"),
+            original,
+            "the user's settings must survive the write that replaced them"
+        );
+        assert_eq!(
+            crash_mode_on_disk(&path),
+            ReportingMode::Always,
+            "and the choice still persists"
+        );
     }
 
     /// "Never" sets the crash stream to `Off` — the opt-OUT must persist just as

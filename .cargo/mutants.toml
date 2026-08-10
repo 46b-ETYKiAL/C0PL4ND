@@ -83,4 +83,25 @@ exclude_globs = [
 # the reliable filter for a single un-testable-on-Linux function.
 exclude_re = [
     "no_console_window",
+    # PROVABLY EQUIVALENT, not merely hard to kill. `push_decrqss_byte` caps the
+    # DECRQSS selector buffer at 64 bytes; widening `<` to `<=` caps it at 65.
+    # `put` writes nothing else on that branch, and the buffer's ONLY consumer
+    # (`unhook` -> `report_decrqss`) matches it against exactly `b"m"`, `b"r"`
+    # and `b" q"` — lengths 1, 1 and 2. Both a 64- and a 65-byte buffer are
+    # therefore unrecognised and produce the identical invalid reply, so no
+    # input can distinguish the two programs.
+    #
+    # !! Scoped to the EXTRACTED HELPER on purpose. The three payload caps in
+    # `<impl Perform for Screen>::put` (sixel 8 MiB, XTGETTCAP 4096, DECRQSS 64)
+    # generated the IDENTICAL mutant description while they shared that
+    # function, so the obvious
+    # `replace < with <= in <impl Perform for Screen>::put` would also have
+    # pardoned the XTGETTCAP cap — whose off-by-one IS observable, because it
+    # flips hex-string parity and so decides whether `hex_decode_bytes` succeeds
+    # or returns `None`. That would be exactly the silent gate hole the rest of
+    # this file exists to prevent. Hence the helper: the exclusion is surgical.
+    # The helper's other mutants stay live — `replace < with ==` and
+    # `replace push_decrqss_byte with ()` both empty the buffer and are caught
+    # by the DECRQSS reply tests.
+    "replace < with <= in push_decrqss_byte",
 ]

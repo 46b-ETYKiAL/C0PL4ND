@@ -7,9 +7,11 @@
 //! later without re-architecting the engine.
 
 pub mod atomic_write;
+pub mod changelog;
 pub mod command_history;
 pub mod config;
 pub mod fetch;
+pub mod forced_colors;
 pub mod fs_perms;
 pub mod fuzzy;
 pub mod grid;

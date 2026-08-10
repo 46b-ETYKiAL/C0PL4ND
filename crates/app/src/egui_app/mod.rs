@@ -468,6 +468,16 @@ pub struct C0pl4ndApp {
     /// MANUAL theme pick sticks between OS-appearance changes (SCR1B3 parity).
     /// `None` when follow-OS is off / never observed. Never persisted.
     pub(crate) last_os_theme: Option<egui::Theme>,
+    /// Whether the OS reports forced-colors / high-contrast mode, sampled ONCE
+    /// at real-window construction (`c0pl4nd_core::forced_colors::forced_colors`).
+    ///
+    /// Held as state rather than re-queried per frame for two reasons: the OS
+    /// answer is process-cached anyway, and — more importantly — it makes the
+    /// accessibility precedence in [`Self::follow_os_theme_tick`] deterministic
+    /// under test. The headless `bootstrap_with` path leaves it `false`, so no
+    /// existing test's behaviour depends on the host machine's real
+    /// accessibility settings. Never persisted.
+    pub(crate) forced_colors: bool,
     /// True on the first frame the Settings window opens (a closed→open edge),
     /// so `settings::show` FORCES the window to its saved-or-centered position
     /// that frame instead of trusting egui's `default_pos` (which read a
@@ -728,10 +738,23 @@ impl C0pl4ndApp {
         // F5-2: load config AND capture any parse error, so a broken config file
         // surfaces as a visible toast instead of the silent fallback-to-defaults
         // that previously only `eprintln`'d (invisible to a GUI-launched user).
-        let (cfg, config_error) = load_config_with_status();
+        let (mut cfg, config_error) = load_config_with_status();
+        // Accessibility: if the OS is in forced-colors / high-contrast mode and
+        // the user never picked a theme, start on the accessible one. An explicit
+        // theme choice always wins — see `apply_forced_colors_auto_theme`.
+        let forced_colors = c0pl4nd_core::forced_colors::forced_colors();
+        let auto_high_contrast = apply_forced_colors_auto_theme_with(&mut cfg, forced_colors);
         let mut app = Self::bootstrap_with(cfg);
+        app.forced_colors = forced_colors;
         if let Some(err) = config_error {
             app.toast = Some(err);
+        }
+        if auto_high_contrast && app.toast.is_none() {
+            app.toast = Some(
+                "High contrast is on in your OS settings — C0PL4ND started on the \
+                 accessible theme. Pick any theme in Settings to override it."
+                    .to_string(),
+            );
         }
         // Restore the persisted split-pane layout + per-pane cwd from a previous
         // run (eframe `persistence` storage). A missing, unreadable, or
@@ -979,6 +1002,9 @@ impl C0pl4ndApp {
             first_frame_time: None,
             foreground_done: false,
             last_os_theme: None,
+            // Headless/default: no OS accessibility request. The real-window
+            // constructor samples the OS and overwrites this.
+            forced_colors: false,
             settings_place_pending: false,
             settings_was_open: false,
             live_window: false,
@@ -3224,6 +3250,20 @@ impl C0pl4ndApp {
     /// observation still applies. Toggling the switch OFF forgets the tracked
     /// appearance so re-enabling re-applies on the next observed frame.
     fn follow_os_theme_tick(&mut self, ctx: &egui::Context) {
+        // Accessibility beats aesthetics: while the OS is in forced-colors /
+        // high-contrast mode, the dark/light follow must not swap the theme back
+        // to `itasha-corp`/`ghost-paper` and undo the high-contrast selection
+        // made at startup. Same precedence as SCR1B3's reduced-motion seam, where
+        // the accessibility preference wins over the user's own toggle.
+        //
+        // `last_os_theme` is deliberately left untouched here rather than
+        // cleared: if this returned via the `follow_os_theme == false` branch it
+        // would forget the tracked appearance, and turning high contrast off
+        // mid-session would then re-apply on the next observation. Returning
+        // early keeps the tracked value intact.
+        if self.forced_colors {
+            return;
+        }
         if !self.config.follow_os_theme {
             // Forget the tracked OS appearance so a later re-enable re-applies the
             // OS theme on its next observation instead of being suppressed by a

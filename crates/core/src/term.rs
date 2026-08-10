@@ -3982,7 +3982,6 @@ impl Terminal {
     }
 }
 
-
 /// One row of cells as text using the terminal COPY convention: the blank
 /// continuation spacer the core writes after a wide (width-2) glyph is SKIPPED,
 /// so the emitted text matches the drawn text and no stray space appears inside

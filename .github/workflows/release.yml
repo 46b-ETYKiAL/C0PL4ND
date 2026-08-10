@@ -205,7 +205,7 @@ jobs:
 
       - name: Attest build provenance (SLSA)
         # actions/attest-build-provenance@v4.1.0
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
           subject-path: ${{ env.artifact }}
 
@@ -317,7 +317,7 @@ jobs:
 
       - name: Attest SBOM provenance
         # actions/attest-build-provenance@v4.1.0
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
           subject-path: "sbom/*.cdx.json"
 
@@ -446,7 +446,7 @@ jobs:
           for e in *.exe; do sha256sum "$e" > "$e.sha256"; done
           cat *.sha256
       - name: Attest installer provenance (SLSA)
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
           subject-path: dist-out/*.exe
       - name: Upload installer
@@ -773,7 +773,7 @@ jobs:
         # `.sha256` (redundant with SHA256SUMS) sidecars are intentionally not
         # attested.
         # actions/attest-build-provenance@v4.1.0
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
           subject-path: |
             release/*.zip

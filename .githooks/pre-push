@@ -1,0 +1,82 @@
+#!/bin/sh
+# Block a push that would publish personal information.
+#
+# WHY THIS EXISTS ALONGSIDE THE CI JOB
+#   The CI content-safety job is detection AFTER publication. For file content
+#   that is recoverable - a bad commit can be amended and force-pushed before
+#   anyone fetches it. For commit METADATA it is not: author and committer
+#   addresses are published the instant the push lands on a public remote, and
+#   the only remedy afterwards is a history rewrite that every clone has to
+#   absorb. This hook is therefore the control that actually prevents the leak;
+#   the CI job is the backstop that catches a push made without it.
+#
+# WHAT IT CHECKS (in this order, deliberately)
+#   1. Both falsification harnesses - so a guard that has silently stopped
+#      detecting anything cannot let steps 2 and 3 report a clean pass.
+#   2. The content-safety audit over tracked files.
+#   3. The commit-identity guard over the exact range being pushed.
+#
+# INSTALL
+#   sh scripts/install-git-hooks.sh
+#
+# EMERGENCY BYPASS
+#   git push --no-verify
+#   Use it only when you have confirmed by other means that the push carries
+#   no personal information. It is not a way to silence a finding you have not
+#   read: the audit prints the file and line for every one of them.
+
+set -eu
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT"
+
+PY=""
+for cand in python3 python py; do
+    if command -v "$cand" >/dev/null 2>&1; then PY="$cand"; break; fi
+done
+if [ -z "$PY" ]; then
+    # Fail CLOSED. A missing interpreter must not silently become a green
+    # push -- that is precisely the "gate you never run" failure mode.
+    echo "pre-push: no python interpreter found; cannot run the content-safety guards." >&2
+    echo "pre-push: install python, or use --no-verify only if you are certain." >&2
+    exit 1
+fi
+
+echo "pre-push: falsifying the guards before trusting them..."
+"$PY" tests/test_content_safety_audit.py >/dev/null || {
+    echo "pre-push: the content-safety audit FAILED ITS OWN FALSIFICATION SUITE." >&2
+    echo "pre-push: it can no longer detect every known leak class -- fix it before pushing." >&2
+    "$PY" tests/test_content_safety_audit.py >&2 || true
+    exit 1
+}
+"$PY" tests/test_author_identity_guard.py >/dev/null || {
+    echo "pre-push: the identity guard FAILED ITS OWN FALSIFICATION SUITE." >&2
+    "$PY" tests/test_author_identity_guard.py >&2 || true
+    exit 1
+}
+
+echo "pre-push: auditing tracked files..."
+"$PY" tests/content_safety_audit.py || exit 1
+
+# Git feeds one line per ref being pushed:
+#   <local ref> <local sha> <remote ref> <remote sha>
+# A remote sha of all zeros means the branch is new on the remote, so there is
+# no base to diff against; the guard falls back to a bounded ancestry walk.
+ZERO=$(git hash-object --stdin </dev/null | tr '0-9a-f' '0')
+status=0
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [ -z "${local_sha:-}" ] && continue
+    # A delete-push has an all-zero LOCAL sha; nothing is being published.
+    case "$local_sha" in "$ZERO") continue ;; esac
+
+    base=""
+    case "$remote_sha" in
+        "$ZERO"|"") base="" ;;
+        *) base="$remote_sha" ;;
+    esac
+
+    echo "pre-push: checking commit identities being published..."
+    "$PY" tests/author_identity_guard.py --base "$base" --head "$local_sha" || status=1
+done
+
+exit "$status"

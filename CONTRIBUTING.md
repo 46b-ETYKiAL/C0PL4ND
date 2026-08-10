@@ -59,6 +59,61 @@ documented in **[docs/KEYBINDINGS.md](docs/KEYBINDINGS.md)**.
 
 ---
 
+## Before your first push: install the git hooks
+
+```bash
+sh scripts/install-git-hooks.sh
+```
+
+This repository is public, so anything you push is published immediately.
+Commit **metadata** is the part that cannot be taken back: the author and
+committer addresses on a pushed commit are visible the moment the push lands,
+and clearing them afterwards requires rewriting history for everyone. The
+pre-push hook is what prevents that; the CI job is the backstop for a push made
+without it.
+
+The hook refuses a push when:
+
+- either guard fails its own falsification suite (checked **first**, so a guard
+  that has silently stopped detecting anything cannot let the rest report a
+  clean pass);
+- a tracked file carries an absolute home path, a personal mailbox, an internal
+  tooling reference, or a secret-shaped string;
+- any commit in the range being pushed carries an identity that is not on the
+  allowlist.
+
+Set a publishing identity before you commit — **both** fields:
+
+```bash
+git config user.email '<id>+<handle>@users.noreply.github.com'
+git config user.name  'Your Name'
+```
+
+GitHub issues that address under **Settings → Emails → Keep my email address
+private**. Contributions from a bot or forge noreply address are equally fine.
+
+Your **name** is welcome in commits and in the contributor list — real names,
+handles, and pseudonyms all pass, and nothing about a name is checked except
+one thing: it must not be your **workstation account name**, a home path, or
+an internal tooling reference. Git defaults `user.name` to the OS account, so
+setting it explicitly is the whole fix; the guard refuses in a name field
+exactly what it refuses anywhere else, and accepts every other name untouched.
+
+Run the checks yourself at any time:
+
+```bash
+python3 tests/test_content_safety_audit.py    # falsify the audit
+python3 tests/test_author_identity_guard.py   # falsify the identity guard
+python3 tests/content_safety_audit.py         # audit tracked files
+python3 tests/content_safety_audit.py --history   # + commit metadata (reporting)
+```
+
+`--no-verify` bypasses the hook. Use it only when you have confirmed by other
+means that the push carries nothing personal — not to skip a finding you have
+not read, since the audit prints the file and line for every one.
+
+---
+
 ## Build, test, lint, and format
 
 Before opening a pull request, run the full local check suite. CI runs the same checks.

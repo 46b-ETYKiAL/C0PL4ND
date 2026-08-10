@@ -1555,12 +1555,20 @@ impl PaneTerm {
     }
 
     /// The visible grid as plain text (used by tests to assert PTY output landed
-    /// on screen, and as a headless render fallback). `None` for a dead session.
+    /// on screen, by the AccessKit screen-reader node, by the in-terminal search
+    /// corpus and the history echo gate, and as a headless render fallback).
+    /// `None` for a dead session.
+    ///
+    /// Uses [`Terminal::screen_text`], NOT the raw `Grid::to_text` dump: the
+    /// latter emits the blank continuation cell after a width-2 glyph, so a CJK
+    /// line came back as `"日 本 語"` — which broke substring search, hid CJK
+    /// commands from history, and made a screen reader announce a phantom space
+    /// between every wide glyph.
     pub fn grid_text(&self) -> Option<String> {
         let session = self.session.as_ref()?;
         let term = session.terminal();
         let guard = term.lock().ok()?;
-        Some(guard.grid().to_text())
+        Some(guard.screen_text())
     }
 
     /// The active theme's default background as an `(r,g,b)` triple — the colour

@@ -2767,6 +2767,45 @@ fn xtgettcap_advertises_setulc_underline_colour() {
     assert_eq!(t.take_pty_response(), expected.as_bytes());
 }
 
+/// The terminal NAME capability, under both spellings that share its arm.
+///
+/// The block above queries `Co`, an unknown name, a non-UTF-8 name, a malformed
+/// hex name, `Smulx` and `Setulc` — but never `TN`, `name` or `RGB`, so those
+/// two arms could be deleted with the whole suite green. That failure is
+/// invisible from INSIDE the terminal: a terminfo-probing app simply reads the
+/// unknown form and downgrades, and nothing anywhere reports an error.
+///
+/// Both spellings are asserted because they SHARE one arm — asserting only
+/// `TN` would leave `name` unpinned if the arm were ever split.
+#[test]
+fn xtgettcap_reports_the_terminal_name_under_both_spellings() {
+    // "TN" hex = 544E.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP+q544E\x1b\\");
+    let expected = format!("\x1bP1+r544E={}\x1b\\", hex_encode(b"xterm-256color"));
+    assert_eq!(t.take_pty_response(), expected.as_bytes());
+
+    // "name" hex = 6E616D65 — the long spelling of the same capability.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP+q6E616D65\x1b\\");
+    let expected = format!("\x1bP1+r6E616D65={}\x1b\\", hex_encode(b"xterm-256color"));
+    assert_eq!(t.take_pty_response(), expected.as_bytes());
+}
+
+/// `RGB` is how an application decides truecolor is available.
+///
+/// It is a BOOLEAN capability, so the reply is the VALID form with NO
+/// `=<value>` — `DCS 1 + r <name> ST`. Dropping the arm yields the UNKNOWN form
+/// (`0+r`), a single-byte difference that silently makes every probing app fall
+/// back to 256 colours, so the reply is asserted byte-for-byte.
+#[test]
+fn xtgettcap_advertises_rgb_truecolor_as_a_boolean_capability() {
+    // "RGB" hex = 524742.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP+q524742\x1b\\");
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1+r524742\x1b\\");
+}
+
 #[test]
 fn smulx_advertisement_is_backed_by_real_support() {
     // TRUTHFULNESS: advertising `Smulx` promises that the sequence its template
@@ -2901,6 +2940,50 @@ fn decrqss_reports_extended_sgr_colors_and_underline_style() {
     assert_eq!(
         t.take_pty_response().as_slice(),
         b"\x1bP1$r0;4:3;38;2;10;20;30;101m\x1b\\"
+    );
+}
+
+/// The 8 / 16 colour-index BOUNDARIES of the DECRQSS SGR report.
+///
+/// `push_sgr_color` has three arms — `0..=7` (base 30/40), `8..=15` (aixterm
+/// bright 90/100, offset by 8) and `16..` (extended `38;5;n`). The extended-SGR
+/// test above is the only test in the workspace that drives an INDEXED colour
+/// through it, and it picks index 9 — the MIDDLE of the bright arm. Index 9 is
+/// invariant under every boundary mutation: `n < 8` widened to `n <= 8` still
+/// misses it, `n < 16` widened to `n <= 16` still catches it, and replacing the
+/// `n < 16` guard with `true` changes nothing because it already matched. So
+/// both guards went unasserted while looking covered.
+///
+/// The reply is documented as a self-contained sequence a client can replay
+/// verbatim, which is why index 8 matters most: `30 + 8` is `38`, the
+/// EXTENDED-COLOUR INTRODUCER, so a client replaying a mis-reported index 8
+/// mis-parses every parameter after it rather than merely painting one cell in
+/// the wrong colour.
+#[test]
+fn decrqss_sgr_report_pins_the_8_and_16_colour_index_boundaries() {
+    // Index 8 is the FIRST bright colour: aixterm `90`, never `30 + 8 == 38`.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[38;5;8m");
+    t.advance(b"\x1bP$qm\x1b\\");
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1$r0;90m\x1b\\");
+
+    // Index 16 is the FIRST extended colour: `38;5;16`, never `90 + 16 - 8`.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[38;5;16m");
+    t.advance(b"\x1bP$qm\x1b\\");
+    assert_eq!(
+        t.take_pty_response().as_slice(),
+        b"\x1bP1$r0;38;5;16m\x1b\\"
+    );
+
+    // And a high index proves the bright arm is not swallowing the whole range:
+    // with the `n < 16` guard replaced by `true`, 255 reports as `;347`.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[48;5;255m");
+    t.advance(b"\x1bP$qm\x1b\\");
+    assert_eq!(
+        t.take_pty_response().as_slice(),
+        b"\x1bP1$r0;48;5;255m\x1b\\"
     );
 }
 

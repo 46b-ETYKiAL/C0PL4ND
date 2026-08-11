@@ -42,6 +42,22 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
+    env:
+      # Arms the live-PTY guard in `egui_app::pty_gate`. Eighteen `pane_term`
+      # tests — two of them the OSC 52 clipboard-read security gates — are
+      # guarded on `terminal_for_test()`, which returns `None` for exactly one
+      # reason: the PTY spawn failed. That keys the guard on the very subsystem
+      # the tests protect, so a regression in shell resolution, ConPTY/openpty
+      # setup, or the job-object assignment would turn all eighteen green having
+      # asserted nothing.
+      #
+      # The platform default shell exists on all three runners, so there is no
+      # legitimate skip here and this is set for every OS leg. With it, an
+      # absent PTY is a hard, actionable failure instead of a quiet pass. Only
+      # the literal `1` arms it (see `pty_gate::env_arms_requirement`), so a
+      # typo cannot silently disarm the lane the way the dead `C0PL4ND_HEADLESS`
+      # did.
+      C0PL4ND_REQUIRE_PTY: "1"
     steps:
       - name: Harden the runner (egress audit)
         # step-security/harden-runner@v2.19.4
@@ -273,10 +289,28 @@ jobs:
         run: vulkaninfo --summary || true
 
       - name: Run the visual-QA render suite
-        # --run-ignored only: every test in this file is #[ignore]d, so this runs
-        # exactly the visual-QA suite and nothing else. Single-threaded because
-        # each test stands up its own wgpu device against one software rasteriser.
-        run: cargo nextest run -p c0pl4nd --test qa_wide_glyph_snapshot --locked --run-ignored only --test-threads 1
+        # --run-ignored only: every render test in these files is #[ignore]d, so
+        # this runs exactly the real-frame suites and nothing else. Single-threaded
+        # because each test stands up its own wgpu device against one software
+        # rasteriser.
+        #
+        # egui_term_render is here because it is a real-frame test and this is the
+        # only job with an adapter. It used to be un-ignored and therefore ran in
+        # the `test` job above, where its GPU probe returned early and libtest
+        # reported `ok` — a skip that read as a pass. It now FAILS without an
+        # adapter, so it has to run where one exists.
+        #
+        # qol_pixel_regressions is here for the same reason: it asserts on the
+        # RASTERISED frame, so a job without an adapter cannot run it at all, and
+        # a test category nothing runs is a test category with zero protection.
+        #
+        # It also carries the `ESC[4:4m` dotted-underline guard that used to have
+        # its own underline_dotted_4_4_defect target. That file was a
+        # failing-by-design reproduction of a defect this repo has since fixed;
+        # once fixed it passed while still titled "KNOWN DEFECT ... FAILS by
+        # design", and every assertion in it was a strict subset of the ones
+        # here. It was folded in rather than left to mislead in both directions.
+        run: cargo nextest run -p c0pl4nd --test qa_wide_glyph_snapshot --test egui_term_render --test qol_pixel_regressions --locked --run-ignored only --test-threads 1
 
       - name: Upload the rendered QA frames (eyeball aid)
         if: always()
@@ -340,6 +374,26 @@ jobs:
   msrv:
     name: MSRV (rust-version floor)
     runs-on: ubuntu-latest
+    # RUSTUP_TOOLCHAIN is the ONLY thing that makes this job authoritative.
+    #
+    # Installing a toolchain and making it rustup's *default* is NOT enough: the
+    # repo-root rust-toolchain.toml is a DIRECTORY OVERRIDE, and rustup's
+    # precedence is
+    #   `cargo +toolchain` > RUSTUP_TOOLCHAIN > `rustup override` > rust-toolchain.toml > default
+    # so the default always loses to the file. Before this env existed, the job
+    # installed the MSRV, set it as default, and then `cargo check` silently ran
+    # on the pinned channel from rust-toolchain.toml instead — rustup even said
+    # so on every run ("note that the toolchain 'stable-…' is currently in use
+    # (overridden by '…/rust-toolchain.toml')"). The gate could not fail; it
+    # re-tested the same channel every other job already tested.
+    #
+    # Chosen over per-command `cargo +1.95.0 …` because the env covers EVERY
+    # toolchain-proxy invocation in the job — including future steps, build
+    # scripts, and any tool that shells out to `cargo` without a `+` prefix.
+    # A `+`-prefix has to be remembered on each command; forgetting it once
+    # silently restores the vacuous gate this fixes.
+    env:
+      RUSTUP_TOOLCHAIN: "1.95.0"
     steps:
       - name: Harden the runner (egress audit)
         # step-security/harden-runner@v2.19.4
@@ -353,13 +407,14 @@ jobs:
         with:
           persist-credentials: false
 
-      # Pin the MSRV channel to the rust-version declared in Cargo.toml (1.80).
-      # Bump this in lockstep with the manifest; CI fails if the floor regresses.
-      - name: Install MSRV toolchain (1.80)
+      # Must equal both Cargo.toml `rust-version` and RUSTUP_TOOLCHAIN above.
+      # Bump all three in lockstep when a dependency or a language feature
+      # raises the floor; CI fails loudly if the floor regresses.
+      - name: Install MSRV toolchain (1.95.0)
         # dtolnay/rust-toolchain @master commit
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: "1.80"
+          toolchain: "1.95.0"
 
       - name: Cache cargo registry and target
         # Swatinem/rust-cache@v2.9.1
@@ -375,6 +430,18 @@ jobs:
           sudo apt-get install -y \
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libwayland-dev libfontconfig1-dev
+
+      # Anti-vacuity assertion. If a future edit ever lets the directory
+      # override win again, this fails HERE with a clear message instead of the
+      # job quietly re-testing the pinned channel and reporting green.
+      - name: Assert the MSRV toolchain is the one actually in use
+        run: |
+          set -euo pipefail
+          rustc --version
+          rustc --version | grep -qF 'rustc 1.95.0' || {
+            echo "::error::MSRV job is not running on 1.95.0 — a toolchain override won. See the RUSTUP_TOOLCHAIN comment on this job."
+            exit 1
+          }
 
       - name: cargo check on MSRV
         run: cargo check --workspace --locked
@@ -416,13 +483,167 @@ jobs:
         # independently-maintained advisory source (defense in depth).
         run: cargo audit
 
+  # Public-repo content safety. Catches internal-tooling references, absolute
+  # developer paths, personal mailboxes and internal work-tracking tokens
+  # before they land on a public branch. Complements `gitleaks` below, which
+  # covers credential SHAPES but not identity or path leakage.
+  content-safety:
+    name: public-repo content-safety audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner (egress audit)
+        # step-security/harden-runner@v2.19.4
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        # actions/checkout@v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          # The identity guard walks a commit RANGE, so the shallow default
+          # clone is not enough: `git rev-list base..head` cannot resolve a
+          # base that was never fetched, and the guard would silently drop to
+          # its fallback on every run.
+          fetch-depth: 0
+
+      - name: Set up Python
+        # actions/setup-python@v7.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+
+      - name: Falsify the audit (it must catch every known leak class)
+        # Runs first on purpose: a guard that has silently stopped detecting
+        # something would otherwise report a clean tree and look like success.
+        run: python3 tests/test_content_safety_audit.py
+
+      - name: Falsify the author-identity guard
+        # Same reason: an allowlist with no rejection cases is
+        # indistinguishable from one that accepts everything.
+        run: python3 tests/test_author_identity_guard.py
+
+      - name: Audit tracked files for internal references / identity / secrets
+        run: python3 tests/content_safety_audit.py
+
+      - name: Reject non-allowlisted commit identities in the push range
+        # Scoped to the push/PR range: historical commits carry mailboxes that
+        # only a history rewrite can clear, and a gate that is permanently red
+        # for something no PR can fix trains people to ignore it.
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tests/author_identity_guard.py --base "$BASE" --head "$HEAD"
+
+  # The release workflow's signing / licence / checksum gates, proved able to
+  # FAIL. Runs on every push and PR, not only at tag time: each of these was
+  # once a gate that could not fail, and a release-only check would not surface
+  # a regression until the release it was meant to protect.
+  release-gates:
+    name: release gates can fail
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner (egress audit)
+        # step-security/harden-runner@v2.19.4
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        # actions/checkout@v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # `fetch-depth: 0` is NOT needed, but the index MUST exist: the
+          # line-ending check reads the committed blob (`git cat-file blob :path`)
+          # rather than the working copy, because a Windows checkout is
+          # legitimately CRLF while the committed bytes are LF.
+          persist-credentials: false
+
+      - name: Set up Python
+        # actions/setup-python@v7.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        # Same form the release workflow's license-delivery job uses.
+        run: python3 -m pip install --user --disable-pip-version-check pyyaml
+
+      - name: Falsify the release gates (each must be shown RED and GREEN)
+        # Executes the gate scripts directly AND extracts the `run:` blocks of
+        # the named release.yml steps via a real YAML parse and runs THAT TEXT
+        # against fixtures — so the shipped shell is falsified as-shipped, not
+        # as-quoted.
+        run: python3 packaging/falsify_release_gates.py
+
+      - name: Control — re-introduce each defect and require the falsifier to catch it
+        # The step above reporting green means the gates failed on the bad
+        # inputs it chose. It does NOT establish that it would notice if a gate
+        # stopped working — a falsifier that passes with or without the fix is
+        # the same "cannot fail" defect one level up. This puts each original
+        # defect back, one at a time, and fails unless the falsifier goes red
+        # for the SPECIFIC checks that defect should break.
+        #
+        # It mutates the working tree and restores it (asserting the bytes
+        # changed and were restored). Safe here because the checkout is
+        # ephemeral, and it runs AFTER the plain falsification so a genuine gate
+        # regression is reported as itself rather than as a failed baseline.
+        run: python3 packaging/mutate_release_gates.py
+
+  # Credential-shape scan over the full history. Complements content-safety.
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner (egress block)
+        # step-security/harden-runner@v2.19.4
+        # Block mode: this job runs on untrusted PR triggers. gitleaks-action
+        # downloads its binary from GitHub releases, which 302s to
+        # release-assets.githubusercontent.com — that host is REQUIRED and is
+        # not interchangeable with objects.githubusercontent.com. Do not "fix"
+        # a download failure here by dropping to audit mode; that disables the
+        # firewall on an untrusted-PR job to work around a missing hostname.
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920
+        with:
+          egress-policy: block
+          disable-sudo: true
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            codeload.github.com:443
+            raw.githubusercontent.com:443
+
+      - name: Checkout
+        # actions/checkout@v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # Full history so gitleaks scans every commit, not just HEAD.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run gitleaks
+        # gitleaks/gitleaks-action@v3.0.0, SHA-pinned like every other action
+        # here. Reads .gitleaks.toml from the repo root.
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e
+        env:
+          # Required for the action to read the pull-request diff; the
+          # automatically-created PR token is sufficient (no PAT needed).
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: true
+          GITLEAKS_ENABLE_SUMMARY: true
+
   # Aggregating gate. ALWAYS runs and explicitly inspects every prior job so a
   # SKIPPED / CANCELLED job cannot be silently reported as a passing required
   # check on the merge queue (merge-queue-check-gating discipline).
   ci-gate:
     name: CI Gate
     runs-on: ubuntu-latest
-    needs: [test, lint, msrv, security, flaky-gate-live, visual-qa]
+    needs:
+      [test, lint, msrv, security, flaky-gate-live, visual-qa, content-safety, gitleaks,
+       release-gates]
     if: always()
     steps:
       - name: Verify all required jobs succeeded
@@ -435,6 +656,9 @@ jobs:
             [security]="${{ needs.security.result }}"
             [flaky-gate-live]="${{ needs.flaky-gate-live.result }}"
             [visual-qa]="${{ needs.visual-qa.result }}"
+            [content-safety]="${{ needs.content-safety.result }}"
+            [gitleaks]="${{ needs.gitleaks.result }}"
+            [release-gates]="${{ needs.release-gates.result }}"
           )
           failed=0
           for job in "${!results[@]}"; do

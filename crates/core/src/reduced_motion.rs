@@ -102,6 +102,11 @@ fn os_reduced_motion() -> bool {
 
 /// Run a query command and return its stdout on success; `None` on any failure
 /// (binary absent, non-zero exit, non-UTF8). Never panics; never writes.
+///
+/// Shared with [`crate::forced_colors`], which asks the same class of question
+/// (an OS accessibility preference) of the same platform tools, so the two
+/// probes cannot drift apart in how they spawn, gate on exit status, or
+/// suppress the Windows console flash.
 #[cfg_attr(
     not(any(
         target_os = "windows",
@@ -110,7 +115,7 @@ fn os_reduced_motion() -> bool {
     )),
     allow(dead_code)
 )]
-fn query_cmd(prog: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn query_cmd(prog: &str, args: &[&str]) -> Option<String> {
     use crate::win_process::NoConsoleWindow;
     // `no_console_window()` suppresses the console flash on Windows (the OS
     // reduce-motion probe spawns `reg query`, a console program); no-op on the

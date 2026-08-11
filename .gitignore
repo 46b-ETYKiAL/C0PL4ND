@@ -6,8 +6,10 @@ Thumbs.db
 *.pem
 *.key
 
-# agent-system runtime artifacts (never publish)
-.s4f3-data/
+# Tooling runtime artifacts (never publish). Matched by shape rather than
+# by name, so this file does not itself publish the internal directory
+# names the content-safety audit exists to suppress.
+.*-data/
 relfinal.log
 *.log
 egui-app.png

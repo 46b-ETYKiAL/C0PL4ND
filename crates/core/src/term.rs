@@ -14,7 +14,7 @@ use zeroize::{Zeroize, Zeroizing};
 mod charset;
 pub mod keys;
 pub mod osc;
-mod palette;
+pub(crate) mod palette;
 
 use charset::{dec_line_draw, is_variation_selector, Charset};
 pub use keys::{encode_key, encode_key_kitty, KeyEventKind, KeyModifiers, LogicalKey};
@@ -32,6 +32,35 @@ pub const DEFAULT_SCROLLBACK: usize = 10_000;
 /// program issuing an unbalanced stream of pushes; when the cap is reached the
 /// oldest entry is dropped rather than growing without limit.
 const KITTY_KBD_STACK_MAX: usize = 16;
+
+/// Terminal name reported by XTVERSION (`CSI > 0 q`). The VERSION is never
+/// written here — it is read from `CARGO_PKG_VERSION` at the reply site so it
+/// cannot rot out of step with the crate.
+const XTVERSION_NAME: &str = "c0pl4nd";
+
+/// Terminfo `Smulx` — styled underline. `%p1` is the style selector, emitted as
+/// an SGR 4 colon sub-parameter (`4:0` … `4:5`).
+///
+/// Advertised because that mapping is REAL: `Screen::sgr`'s `4` arm reads
+/// `groups[i].get(1)` and maps 0/1/2/3/4/5 to
+/// none/single/double/curly/dotted/dashed. The advertisement is bound to that
+/// behaviour by `smulx_advertisement_is_backed_by_real_support`.
+const SMULX_CAPABILITY: &str = "\x1b[4:%p1%dm";
+
+/// Terminfo `Setulc` — underline colour. Splits `%p1` (a packed 24-bit RGB
+/// value) into r/g/b and emits the colon form `58:2::r:g:b`, empty colorspace
+/// slot included.
+///
+/// Advertised because `parse_extended_color` genuinely handles that exact
+/// shape: for `kind == 2` it takes the LAST three sub-parameters after the
+/// kind, so the empty slot is tolerated. Bound to that behaviour by
+/// `setulc_advertisement_is_backed_by_real_support`.
+const SETULC_CAPABILITY: &str = "\x1b[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%dm";
+
+/// Byte cap on an accumulated DECRQSS (`DCS $ q … ST`) setting selector. Real
+/// selectors are 1-2 bytes (`m`, `r`, `SP q`, `" q`); the cap bounds memory
+/// against a hostile stream that never terminates the DCS.
+const DECRQSS_PAYLOAD_MAX: usize = 64;
 
 /// A decoded inline image anchored to a grid position (absolute line + column).
 #[derive(Debug, Clone)]
@@ -201,9 +230,13 @@ fn clamp_u8(v: u16) -> u8 {
     v.min(255) as u8
 }
 
-/// Decode an ASCII-hex byte string (XTGETTCAP capability name) into a UTF-8
-/// string. Returns `None` on odd length, non-hex bytes, or invalid UTF-8.
-fn hex_decode(hex: &[u8]) -> Option<String> {
+/// Decode an ASCII-hex byte string (an XTGETTCAP capability name) into raw
+/// bytes. Returns `None` only on malformed hex — odd length or a non-hex digit.
+///
+/// Decoding stops at bytes deliberately: a well-formed hex name that is not
+/// valid UTF-8 is still a name the terminal must ANSWER (with the "unknown
+/// capability" form), so the UTF-8 check belongs at the call site, not here.
+fn hex_decode_bytes(hex: &[u8]) -> Option<Vec<u8>> {
     if !hex.len().is_multiple_of(2) {
         return None;
     }
@@ -213,7 +246,46 @@ fn hex_decode(hex: &[u8]) -> Option<String> {
         let lo = (pair[1] as char).to_digit(16)?;
         out.push((hi * 16 + lo) as u8);
     }
-    String::from_utf8(out).ok()
+    Some(out)
+}
+
+/// Append one SGR colour selection to a DECRQSS SGR report. `base` is the
+/// 8-colour code (30 fg / 40 bg), `bright` the aixterm bright base (90 / 100),
+/// and `ext` the extended-colour selector (38 / 48). A [`Color::Default`] pen
+/// contributes nothing — the leading `0` in the report already reset it.
+fn push_sgr_color(out: &mut String, color: Color, base: u16, bright: u16, ext: u16) {
+    match color {
+        Color::Default => {}
+        Color::Indexed(n) if n < 8 => out.push_str(&format!(";{}", base + u16::from(n))),
+        Color::Indexed(n) if n < 16 => out.push_str(&format!(";{}", bright + u16::from(n) - 8)),
+        Color::Indexed(n) => out.push_str(&format!(";{ext};5;{n}")),
+        Color::Rgb(r, g, b) => out.push_str(&format!(";{ext};2;{r};{g};{b}")),
+    }
+}
+
+/// Append one DECRQSS selector byte, bounded against a hostile stream.
+///
+/// DECRQSS setting selectors are 1-2 bytes; anything longer is not a setting we
+/// know. Truncating past the cap can only ever turn the request into an
+/// unrecognised one, which is answered with the DEC "invalid request" form —
+/// never with silence.
+///
+/// Named separately from the sixel and XTGETTCAP caps in [`Perform::put`]
+/// specifically so the off-by-one on THIS bound can be excluded from mutation
+/// testing on its own. It is provably unobservable: `put` writes nothing but
+/// `decrqss_accum`, whose sole consumer (`unhook` -> `report_decrqss`) matches
+/// the payload against exactly `b"m"`, `b"r"` and `b" q"` — lengths 1, 1 and 2.
+/// A 64-byte and a 65-byte buffer are therefore BOTH unrecognised and both
+/// produce the identical invalid reply, so no test can distinguish `<` from
+/// `<=` here. The XTGETTCAP cap next door is NOT equivalent — its off-by-one
+/// flips hex-string parity, so `hex_decode_bytes` succeeds in one case and
+/// returns `None` in the other — and the three caps generate the SAME mutant
+/// description while they share a function, so a name-based exclusion could not
+/// pardon one without silently pardoning all three.
+fn push_decrqss_byte(buf: &mut Vec<u8>, byte: u8) {
+    if buf.len() < DECRQSS_PAYLOAD_MAX {
+        buf.push(byte);
+    }
 }
 
 /// Encode bytes as uppercase ASCII-hex (for XTGETTCAP replies).
@@ -308,6 +380,11 @@ struct Screen {
     /// between hook and unhook when the DCS is an XTGETTCAP request, exclusive
     /// with `sixel_accum`.
     xtgettcap_accum: Option<Vec<u8>>,
+    /// In-progress DECRQSS DCS payload accumulator (`DCS $ q … ST` — "report
+    /// the current value of this setting"). Some between hook and unhook when
+    /// the DCS is a DECRQSS request, exclusive with `sixel_accum` and
+    /// `xtgettcap_accum`.
+    decrqss_accum: Option<Vec<u8>>,
     /// In-progress Kitty transmissions keyed by image id, accumulated across
     /// `m=1` … `m=0` chunk boundaries (decoded once at the `m=0` boundary).
     /// Format/width/height are captured from the FIRST chunk — the Kitty spec
@@ -382,6 +459,10 @@ struct Screen {
     /// DEFAULT-OFF (see `clipboard_read_enabled`) to avoid the canonical
     /// host-clipboard-exfiltration vulnerability.
     pending_clipboard_writes: Vec<ClipboardWrite>,
+    /// OSC 52 clipboard READ requests awaiting a host answer. Populated ONLY
+    /// while `clipboard_read_enabled` is true; a denied read is answered inline
+    /// with an empty payload and never lands here.
+    pending_clipboard_reads: Vec<osc::ClipboardReadRequest>,
     clipboard_read_enabled: bool,
     /// OSC 4 / 10 / 11 / 12 / 104 / 11x color-set requests, drained by the app
     /// so it can apply them to its live theme.
@@ -423,6 +504,7 @@ impl Screen {
             images: Vec::new(),
             sixel_accum: None,
             xtgettcap_accum: None,
+            decrqss_accum: None,
             kitty_chunks: std::collections::HashMap::new(),
             kitty_store: std::collections::HashMap::new(),
             dec_modes: DecModes::default(),
@@ -445,6 +527,7 @@ impl Screen {
             command_marks: Vec::new(),
             pty_response: Vec::new(),
             pending_clipboard_writes: Vec::new(),
+            pending_clipboard_reads: Vec::new(),
             clipboard_read_enabled: false,
             pending_color_sets: Vec::new(),
             pending_notifications: Vec::new(),
@@ -575,11 +658,22 @@ impl Screen {
 
     /// Handles `OSC 52 ; <selection> ; <base64|?>` (clipboard set/query).
     ///
-    /// WRITE-only by default. A `?` payload is a clipboard READ request and is
-    /// ignored unless [`Terminal::set_clipboard_read_enabled`] is opted into —
-    /// and even then the core does not read the host clipboard itself; the app
-    /// must call [`Terminal::respond_clipboard_read`]. This avoids the canonical
-    /// OSC 52 host-clipboard-exfiltration vulnerability.
+    /// WRITE-only by default. A `?` payload is a clipboard READ request, gated
+    /// on [`Terminal::set_clipboard_read_enabled`] (DEFAULT-OFF — an
+    /// on-by-default clipboard read is the canonical OSC 52 exfiltration hole:
+    /// anything with a handle on the tty could siphon whatever the user last
+    /// copied, passwords and tokens included).
+    ///
+    /// - **Denied (the default)** — the terminal answers the query ITSELF with
+    ///   an empty-payload OSC 52 reply and queues nothing. It never consults the
+    ///   host clipboard, so zero bytes leak; and because it still ANSWERS, a
+    ///   program blocking on the reply is released instead of hanging until its
+    ///   own timeout (see [`osc::format_clipboard_reply`]).
+    /// - **Allowed** — the request is queued as a
+    ///   [`osc::ClipboardReadRequest`] for the app to drain
+    ///   ([`Terminal::take_clipboard_reads`]). Even then the core never reads the
+    ///   host clipboard itself; the app supplies the text via
+    ///   [`Terminal::respond_clipboard_read`].
     fn handle_osc_52(&mut self, params: &[&[u8]]) {
         let sel_bytes = params.get(1).copied().unwrap_or(b"c");
         let payload = params.get(2).copied().unwrap_or(b"");
@@ -595,9 +689,24 @@ impl Screen {
             .unwrap_or(ClipboardSelection::Clipboard);
 
         if payload == b"?" {
-            // Clipboard READ request: DEFAULT-OFF; never auto-respond with host
-            // clipboard contents. Dropped; the app may later call
-            // respond_clipboard_read after opting in.
+            if self.clipboard_read_enabled {
+                // Opted in: surface the request so the host can answer it with
+                // real clipboard text. Bounded — a program spamming `?` must not
+                // grow this queue without limit (oldest dropped, matching every
+                // other PTY-driven buffer).
+                self.pending_clipboard_reads
+                    .push(osc::ClipboardReadRequest { selection });
+                while self.pending_clipboard_reads.len() > Self::CLIPBOARD_READS_MAX {
+                    self.pending_clipboard_reads.remove(0);
+                }
+            } else {
+                // DENIED (the default). Answer with an EMPTY payload: the host
+                // clipboard is never consulted, so nothing leaks — but the
+                // requesting program still gets a well-formed reply and resumes
+                // instead of blocking on a response that never comes.
+                let reply = osc::format_clipboard_reply(selection, "");
+                self.push_pty_response(reply.as_bytes());
+            }
             return;
         }
 
@@ -1229,6 +1338,25 @@ impl Screen {
             // so explicitly clearing the queue here scrubs sensitive plaintext
             // that the app had not yet drained.
             self.clear_pending_clipboard_writes();
+            // An un-drained OSC 52 read request is a program still blocking on a
+            // reply. A hard reset must not strand it, so refuse each with the
+            // empty-payload answer rather than silently forgetting it.
+            self.deny_pending_clipboard_reads();
+        }
+    }
+
+    /// Answer every un-drained OSC 52 read request with the empty-payload deny
+    /// reply, then clear the queue.
+    ///
+    /// Used wherever pending reads must be abandoned — a hard reset, or the user
+    /// switching `clipboard_read_allow` back off while a request is in flight.
+    /// Answering rather than dropping preserves the no-hang guarantee: the
+    /// requesting program gets a well-formed reply carrying zero clipboard bytes
+    /// instead of blocking forever on one that never arrives.
+    fn deny_pending_clipboard_reads(&mut self) {
+        for req in std::mem::take(&mut self.pending_clipboard_reads) {
+            let reply = osc::format_clipboard_reply(req.selection, "");
+            self.push_pty_response(reply.as_bytes());
         }
     }
 
@@ -1271,6 +1399,7 @@ impl Screen {
             match codes[i] {
                 0 => self.pen = Pen::default(),
                 1 => self.pen.flags.bold = true,
+                2 => self.pen.flags.dim = true,
                 3 => self.pen.flags.italic = true,
                 4 => {
                     // C20 — styled underline. `4` alone = single. The colon
@@ -1287,13 +1416,27 @@ impl Screen {
                     };
                     self.pen.flags.underline_style = style;
                 }
+                5 => self.pen.flags.blink = true,
+                6 => self.pen.flags.rapid_blink = true,
                 7 => self.pen.flags.inverse = true,
+                8 => self.pen.flags.conceal = true,
                 9 => self.pen.flags.strikeout = true,
                 21 => self.pen.flags.underline_style = UnderlineStyle::Double,
-                22 => self.pen.flags.bold = false,
+                22 => {
+                    // ECMA-48: "normal intensity" cancels BOTH bold (1) and
+                    // faint (2) — there is no separate dim-off code.
+                    self.pen.flags.bold = false;
+                    self.pen.flags.dim = false;
+                }
                 23 => self.pen.flags.italic = false,
                 24 => self.pen.flags.underline_style = UnderlineStyle::None,
+                25 => {
+                    // "Blink off" cancels both the slow (5) and rapid (6) rates.
+                    self.pen.flags.blink = false;
+                    self.pen.flags.rapid_blink = false;
+                }
                 27 => self.pen.flags.inverse = false,
+                28 => self.pen.flags.conceal = false,
                 29 => self.pen.flags.strikeout = false,
                 30..=37 => self.pen.fg = Color::Indexed((codes[i] - 30) as u8),
                 40..=47 => self.pen.bg = Color::Indexed((codes[i] - 40) as u8),
@@ -1310,6 +1453,8 @@ impl Screen {
                         self.pen.underline_color = Some(color);
                     }
                 }
+                53 => self.pen.flags.overline = true,
+                55 => self.pen.flags.overline = false,
                 59 => self.pen.underline_color = None,
                 38 | 48 => {
                     let target_is_fg = codes[i] == 38;
@@ -1429,33 +1574,159 @@ impl Screen {
             if token.is_empty() {
                 continue;
             }
-            let Some(name) = hex_decode(token) else {
+            // Malformed hex names the terminal to nothing at all, so there is
+            // no name to quote back — answer the bare "unknown" form. Every
+            // non-empty token gets an answer; silence hangs the caller.
+            let Some(raw) = hex_decode_bytes(token) else {
+                self.push_pty_response(b"\x1bP0+r\x1b\\");
                 continue;
             };
             // Recognised capabilities. `Co`/`colors` = 256, `TN` (terminal name)
-            // = "xterm-256color", `RGB` = present (truecolor).
-            let value: Option<&str> = match name.as_str() {
-                "Co" | "colors" => Some("256"),
-                "TN" | "name" => Some("xterm-256color"),
-                "RGB" => Some(""), // boolean capability — present, empty value.
+            // = "xterm-256color", `RGB` = present (truecolor). A well-formed hex
+            // name that is not valid UTF-8 cannot match any of them, and falls
+            // through to the "unknown capability" answer below.
+            let value: Option<&str> = match std::str::from_utf8(&raw) {
+                Ok("Co") | Ok("colors") => Some("256"),
+                Ok("TN") | Ok("name") => Some("xterm-256color"),
+                Ok("RGB") => Some(""), // boolean capability — present, empty value.
+                // Styled underline (SGR `4:n`) + underline colour (SGR 58) are
+                // genuinely implemented, so advertise them: an app that probes
+                // terminfo and gets the invalid form downgrades to a plain
+                // underline even though `4:3` / `58:2::r:g:b` work here.
+                Ok("Smulx") => Some(SMULX_CAPABILITY),
+                Ok("Setulc") => Some(SETULC_CAPABILITY),
                 _ => None,
             };
+            // Re-encoded from the DECODED bytes, so the quoted name is
+            // normalised hex the terminal produced — never a byte-for-byte
+            // reflection of the request.
+            let name_hex = hex_encode(&raw);
             let resp = match value {
+                Some("") => format!("\x1bP1+r{name_hex}\x1b\\"),
                 Some(v) => {
-                    let name_hex = hex_encode(name.as_bytes());
-                    if v.is_empty() {
-                        format!("\x1bP1+r{name_hex}\x1b\\")
-                    } else {
-                        let val_hex = hex_encode(v.as_bytes());
-                        format!("\x1bP1+r{name_hex}={val_hex}\x1b\\")
-                    }
+                    let val_hex = hex_encode(v.as_bytes());
+                    format!("\x1bP1+r{name_hex}={val_hex}\x1b\\")
                 }
-                None => {
-                    let name_hex = hex_encode(name.as_bytes());
-                    format!("\x1bP0+r{name_hex}\x1b\\")
-                }
+                None => format!("\x1bP0+r{name_hex}\x1b\\"),
             };
             self.push_pty_response(resp.as_bytes());
+        }
+    }
+
+    /// XTVERSION reply (`CSI > 0 q`): `DCS > | <name>(<version>) ST` — the shape
+    /// xterm (`XTerm(370)`) and kitty (`kitty(0.21.2)`) use, which is what
+    /// version-sniffing apps parse.
+    ///
+    /// The version comes from `CARGO_PKG_VERSION` at COMPILE time rather than a
+    /// hand-written literal, so it tracks the crate version instead of silently
+    /// rotting one release after someone forgets to bump it.
+    fn report_xtversion(&mut self) {
+        let resp = format!(
+            "\x1bP>|{}({})\x1b\\",
+            XTVERSION_NAME,
+            env!("CARGO_PKG_VERSION")
+        );
+        self.push_pty_response(resp.as_bytes());
+    }
+
+    /// DECRQSS reply: `DCS $ q <selector> ST` asks the terminal to report the
+    /// CURRENT value of one setting. The answer is
+    /// `DCS 1 $ r <value><selector> ST` when the setting is supported, and the
+    /// DEC "invalid request" form `DCS 0 $ r ST` when it is not.
+    ///
+    /// An unrecognised selector is answered with the invalid form, NEVER with
+    /// silence: an app that issues DECRQSS and blocks on the reply (this is how
+    /// editors probe for styled-underline / cursor-shape support) hangs
+    /// otherwise.
+    ///
+    /// SECURITY (device-reply echo-to-stdin, CVE-2022-45872 et al.): the reply
+    /// is built ONLY from validated internal state. The request payload selects
+    /// a match arm and is never copied into the answer, so a hostile
+    /// `DCS $ q <control bytes> ST` cannot smuggle bytes onto the shell's stdin.
+    fn report_decrqss(&mut self, payload: &[u8]) {
+        let setting: Option<String> = match payload {
+            // SGR — the current pen rendition.
+            b"m" => Some(format!("{}m", self.sgr_setting())),
+            // DECSTBM — the scroll region, reported 1-based inclusive.
+            b"r" => Some(format!(
+                "{};{}r",
+                self.scroll_top + 1,
+                self.scroll_bottom + 1
+            )),
+            // DECSCUSR — cursor shape + blink (`CSI Ps SP q`).
+            b" q" => Some(format!("{} q", self.cursor_style_param())),
+            _ => None,
+        };
+        let resp = match setting {
+            Some(v) => format!("\x1bP1$r{v}\x1b\\"),
+            None => "\x1bP0$r\x1b\\".to_string(),
+        };
+        self.push_pty_response(resp.as_bytes());
+    }
+
+    /// Serialise the current pen as an SGR parameter string (without the
+    /// trailing `m`). Always led by `0` so the DECRQSS answer is a
+    /// self-contained "reset, then apply" sequence a client can replay
+    /// verbatim — the shape xterm reports.
+    fn sgr_setting(&self) -> String {
+        let mut s = String::from("0");
+        let f = self.pen.flags;
+        if f.bold {
+            s.push_str(";1");
+        }
+        if f.dim {
+            s.push_str(";2");
+        }
+        if f.italic {
+            s.push_str(";3");
+        }
+        match f.underline_style {
+            UnderlineStyle::None => {}
+            UnderlineStyle::Single => s.push_str(";4"),
+            UnderlineStyle::Double => s.push_str(";4:2"),
+            UnderlineStyle::Curly => s.push_str(";4:3"),
+            UnderlineStyle::Dotted => s.push_str(";4:4"),
+            UnderlineStyle::Dashed => s.push_str(";4:5"),
+        }
+        if f.blink {
+            s.push_str(";5");
+        }
+        if f.rapid_blink {
+            s.push_str(";6");
+        }
+        if f.inverse {
+            s.push_str(";7");
+        }
+        if f.conceal {
+            s.push_str(";8");
+        }
+        if f.strikeout {
+            s.push_str(";9");
+        }
+        if f.overline {
+            s.push_str(";53");
+        }
+        push_sgr_color(&mut s, self.pen.fg, 30, 90, 38);
+        push_sgr_color(&mut s, self.pen.bg, 40, 100, 48);
+        // SGR 58 (underline colour, C20) has no 8/16-colour short form.
+        match self.pen.underline_color {
+            Some(Color::Indexed(n)) => s.push_str(&format!(";58;5;{n}")),
+            Some(Color::Rgb(r, g, b)) => s.push_str(&format!(";58;2;{r};{g};{b}")),
+            Some(Color::Default) | None => {}
+        }
+        s
+    }
+
+    /// The DECSCUSR `Ps` that reproduces the current cursor shape + blink.
+    /// Inverse of [`Screen::set_cursor_shape`].
+    fn cursor_style_param(&self) -> u8 {
+        match (self.cursor_shape, self.cursor_shape_blink) {
+            (CursorShape::Block, true) => 1,
+            (CursorShape::Block, false) => 2,
+            (CursorShape::Underline, true) => 3,
+            (CursorShape::Underline, false) => 4,
+            (CursorShape::Bar, true) => 5,
+            (CursorShape::Bar, false) => 6,
         }
     }
 
@@ -1733,6 +2004,26 @@ impl Perform for Screen {
                 .and_then(|p| p.first().copied())
                 .unwrap_or(0);
             self.set_cursor_shape(ps);
+            return;
+        }
+        // XTVERSION: `CSI > Ps q` — the `>` private marker distinguishes it from
+        // DECSCUSR (`CSI Ps SP q`, handled just above) and from a bare
+        // `CSI Ps q`. Only Ps 0 (or omitted) requests the version.
+        //
+        // A non-zero Ps is IGNORED rather than answered: xterm assigns it no
+        // meaning and the protocol defines no negative/invalid reply form for
+        // XTVERSION, so there is nothing truthful to send. This is a deliberate
+        // narrow exception to the "always answer a query" rule that DECRQSS and
+        // XTGETTCAP follow — those protocols DO define an invalid form.
+        if action == 'q' && intermediates.contains(&b'>') {
+            let ps = params
+                .iter()
+                .next()
+                .and_then(|p| p.first().copied())
+                .unwrap_or(0);
+            if ps == 0 {
+                self.report_xtversion();
+            }
             return;
         }
         // DECSTR soft reset: `CSI ! p` — the `!` is the intermediate.
@@ -2186,13 +2477,24 @@ impl Perform for Screen {
     }
 
     fn hook(&mut self, _params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
-        // `DCS + q … ST` is an XTGETTCAP capability request (C30) — the `+`
-        // arrives as an intermediate. `DCS q …` (no intermediate) is a Sixel
-        // image. The two are disambiguated by the intermediate.
-        if action == 'q' && intermediates.contains(&b'+') {
-            self.xtgettcap_accum = Some(Vec::new());
-        } else if action == 'q' {
-            self.sixel_accum = Some(Vec::new());
+        // THREE distinct DCS sequences share the final byte `q` and are
+        // disambiguated ONLY by the intermediate:
+        //
+        //   `DCS + q … ST`  XTGETTCAP terminfo-capability request (C30)
+        //   `DCS $ q … ST`  DECRQSS "report the current setting" request
+        //   `DCS   q … ST`  Sixel image data (no intermediate)
+        //
+        // Missing the `$` case routes DECRQSS into the Sixel decoder, where it
+        // fails to decode and the request is answered with SILENCE — which
+        // hangs any app that waits on the reply.
+        if action == 'q' {
+            if intermediates.contains(&b'+') {
+                self.xtgettcap_accum = Some(Vec::new());
+            } else if intermediates.contains(&b'$') {
+                self.decrqss_accum = Some(Vec::new());
+            } else {
+                self.sixel_accum = Some(Vec::new());
+            }
         }
     }
 
@@ -2207,6 +2509,8 @@ impl Perform for Screen {
             if buf.len() < 4096 {
                 buf.push(byte);
             }
+        } else if let Some(buf) = &mut self.decrqss_accum {
+            push_decrqss_byte(buf, byte);
         }
     }
 
@@ -2222,6 +2526,8 @@ impl Perform for Screen {
             }
         } else if let Some(buf) = self.xtgettcap_accum.take() {
             self.report_xtgettcap(&buf);
+        } else if let Some(buf) = self.decrqss_accum.take() {
+            self.report_decrqss(&buf);
         }
     }
 }
@@ -2429,6 +2735,11 @@ impl Screen {
     /// occasional and the last write wins, so a small cap suffices; oldest
     /// dropped on overflow. (Each payload is already byte-capped on entry.)
     const CLIPBOARD_WRITES_MAX: usize = 64;
+    /// Max queued OSC 52 clipboard-READ requests between drains. Only ever
+    /// non-empty when reads are opted into; a program spamming `OSC 52 ; c ; ?`
+    /// must not grow this without bound, so the oldest is dropped on overflow.
+    /// Small — the app drains every frame and each request carries no payload.
+    const CLIPBOARD_READS_MAX: usize = 16;
     /// Max queued OSC 9;4 progress updates between drains. Only the latest state
     /// is meaningful, so a small cap bounds a flood; oldest dropped on overflow.
     const PROGRESS_MAX: usize = 256;
@@ -3133,13 +3444,40 @@ impl Terminal {
 
     /// Enables (or disables) responding to OSC 52 clipboard READ requests.
     ///
-    /// DEFAULT-OFF. When disabled (the default), an `OSC 52 ; c ; ?` query is
-    /// silently dropped — the terminal never leaks host clipboard contents back
-    /// to a program, which is the canonical OSC 52 read vulnerability. Even when
-    /// enabled, the core never reads the host clipboard itself; the host
-    /// supplies the text via [`Terminal::respond_clipboard_read`].
+    /// DEFAULT-OFF. While disabled (the default), an `OSC 52 ; c ; ?` query is
+    /// answered by the terminal itself with an EMPTY payload — the host
+    /// clipboard is never consulted, so nothing leaks (the canonical OSC 52 read
+    /// vulnerability), while the requesting program still receives a reply and
+    /// does not hang. Even when enabled, the core never reads the host clipboard
+    /// itself: it queues the request for
+    /// [`Terminal::take_clipboard_reads`] and the host supplies the text via
+    /// [`Terminal::respond_clipboard_read`].
+    ///
+    /// Switching this OFF also refuses any request still queued from while it
+    /// was on, so flipping the setting can never strand a blocked program.
     pub fn set_clipboard_read_enabled(&mut self, enabled: bool) {
         self.screen.clipboard_read_enabled = enabled;
+        if !enabled {
+            self.screen.deny_pending_clipboard_reads();
+        }
+    }
+
+    /// Drains all pending OSC 52 clipboard READ requests at once.
+    ///
+    /// The ONLY read-drain. There is deliberately no singular
+    /// `take_clipboard_read` companion to the write side's
+    /// [`Terminal::take_clipboard_write`]: reads are consumed by the host's
+    /// per-frame `for req in term.take_clipboard_reads()` loop, so a one-at-a-time
+    /// drain has no caller and offers nothing the batch drain does not
+    /// (`take_clipboard_reads().into_iter().next()`). One shipped as dormant `pub`
+    /// API — `pub` on a `pub` type, so `dead_code` never fired — and was removed
+    /// rather than left to look supported.
+    ///
+    /// Always empty unless clipboard reads were opted into: a denied read is
+    /// answered inline by the terminal and never queued. The host answers a
+    /// drained request with [`Terminal::respond_clipboard_read`].
+    pub fn take_clipboard_reads(&mut self) -> Vec<osc::ClipboardReadRequest> {
+        std::mem::take(&mut self.screen.pending_clipboard_reads)
     }
 
     /// Returns whether OSC 52 clipboard READ responses are enabled.
@@ -3157,12 +3495,8 @@ impl Terminal {
         if !self.screen.clipboard_read_enabled {
             return;
         }
-        let sel = match selection {
-            ClipboardSelection::Clipboard => 'c',
-            ClipboardSelection::Primary => 'p',
-        };
         let encoded = base64_encode(text.as_bytes());
-        let resp = format!("\x1b]52;{};{}\x07", sel, encoded);
+        let resp = osc::format_clipboard_reply(selection, &encoded);
         // Route through the capped sink so PTY_RESPONSE_MAX is honoured
         // uniformly (the cap's doc claims it is the single sink for every
         // reply). This path is host-gated (clipboard_read_enabled, default-off).
@@ -3569,24 +3903,8 @@ impl Terminal {
     /// empty bottom of the live grid) are dropped. Rows are joined with `\n` with
     /// no trailing newline.
     pub fn buffer_text(&self) -> Option<String> {
-        use unicode_width::UnicodeWidthChar;
-        let row_text = |cells: &[Cell]| -> String {
-            let mut s = String::new();
-            for (i, cell) in cells.iter().enumerate() {
-                // Skip the wide-glyph continuation spacer: a cell whose PREVIOUS
-                // cell is a width-2 glyph (the core writes the glyph then one
-                // blank cell), so no stray space is emitted around a CJK / emoji.
-                if i > 0 {
-                    if let Some(prev) = cells.get(i - 1) {
-                        if UnicodeWidthChar::width(prev.c).unwrap_or(1) >= 2 {
-                            continue;
-                        }
-                    }
-                }
-                s.push(cell.c);
-            }
-            s.trim_end().to_string()
-        };
+        let row_text =
+            |cells: &[Cell]| -> String { row_text_skipping_spacers(cells).trim_end().to_string() };
         let rows = self.screen.grid.rows();
         let mut lines: Vec<String> = Vec::with_capacity(self.screen.history.len() + rows);
         for row in self.screen.history.iter() {
@@ -3606,6 +3924,27 @@ impl Terminal {
         } else {
             Some(lines.join("\n"))
         }
+    }
+
+    /// The VISIBLE screen as plain text — one line per grid row, each terminated
+    /// by `\n` (so a 24-row grid yields 24 newlines), using the SAME wide-glyph
+    /// convention as [`Self::buffer_text`]: the blank continuation spacer written
+    /// after a width-2 glyph is skipped, so the text matches what is DRAWN.
+    ///
+    /// This is the accessor every "what is on screen right now" consumer wants —
+    /// the AccessKit screen-reader node, the in-terminal search corpus, the
+    /// command-history echo gate, and the headless render fallback. The raw
+    /// [`Grid::to_text`] dump is column-faithful instead of glyph-faithful, so it
+    /// emits a stray space inside every CJK / emoji run; use this instead.
+    pub fn screen_text(&self) -> String {
+        let grid = &self.screen.grid;
+        let rows = grid.rows();
+        let mut out = String::with_capacity(rows * (grid.cols() + 1));
+        for r in 0..rows {
+            out.push_str(&row_text_skipping_spacers(grid.row(r)));
+            out.push('\n');
+        }
+        out
     }
 
     /// Resize the terminal to `rows` × `cols` (each clamped to a minimum of 1),
@@ -3660,6 +3999,30 @@ impl Terminal {
             self.screen.clamp_scroll_region();
         }
     }
+}
+
+/// One row of cells as text using the terminal COPY convention: the blank
+/// continuation spacer the core writes after a wide (width-2) glyph is SKIPPED,
+/// so the emitted text matches the drawn text and no stray space appears inside
+/// a CJK / emoji run.
+///
+/// Single implementation shared by [`Terminal::buffer_text`] (copy-all) and
+/// [`Terminal::screen_text`] (the visible screen) so the convention can never
+/// drift between the two surfaces.
+fn row_text_skipping_spacers(cells: &[Cell]) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut s = String::with_capacity(cells.len());
+    for (i, cell) in cells.iter().enumerate() {
+        if i > 0 {
+            if let Some(prev) = cells.get(i - 1) {
+                if UnicodeWidthChar::width(prev.c).unwrap_or(1) >= 2 {
+                    continue;
+                }
+            }
+        }
+        s.push(cell.c);
+    }
+    s
 }
 
 #[cfg(test)]

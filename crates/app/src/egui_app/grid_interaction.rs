@@ -147,6 +147,239 @@ pub(crate) fn cell_at_pos(
     Some((row, col))
 }
 
+/// The most scrollback lines ONE frame of drag-select autoscroll may move.
+/// Matches the wheel handler's per-frame tick cap so a pointer flung far off the
+/// pane cannot teleport the view across the whole history in a single frame.
+pub(crate) const AUTOSCROLL_MAX_LINES: i32 = 8;
+
+/// How many scrollback lines a drag-select autoscroll should move THIS frame,
+/// given the pointer's `y` (POINTS, screen space) and the grid's vertical span
+/// `[grid_top, grid_bottom)` (`grid_bottom == origin.y + rows * ch`).
+///
+/// Sign matches [`super::pane_term::PaneTerm::scroll_view`]: **positive goes BACK
+/// into history** (the pointer is dragged ABOVE the top edge, so the selection
+/// must reach older lines) and **negative goes FORWARD toward the live bottom**
+/// (dragged BELOW the bottom edge). A pointer inside the grid returns `0`.
+///
+/// The rate SCALES with how far past the edge the pointer is: one grid row of
+/// overshoot moves one line, five rows move five, capped at
+/// [`AUTOSCROLL_MAX_LINES`]. Any overshoot at all moves at least one line, so a
+/// pointer parked one pixel outside still scrolls.
+///
+/// Pure (no egui frame, no terminal) so the rate curve is unit-testable. Degenerate
+/// inputs (non-positive `ch`, an inverted/empty grid span, a non-finite pointer)
+/// return `0` rather than dividing by zero or saturating a cast.
+pub(crate) fn autoscroll_lines(pointer_y: f32, grid_top: f32, grid_bottom: f32, ch: f32) -> i32 {
+    if ch <= 0.0 || !pointer_y.is_finite() || !grid_top.is_finite() || !grid_bottom.is_finite() {
+        return 0;
+    }
+    if grid_bottom <= grid_top {
+        return 0;
+    }
+    // Overshoot past the nearer edge, in points. Positive = above the top.
+    let overshoot = if pointer_y < grid_top {
+        grid_top - pointer_y
+    } else if pointer_y > grid_bottom {
+        -(pointer_y - grid_bottom)
+    } else {
+        return 0;
+    };
+    let cells = (overshoot.abs() / ch).ceil();
+    // `as i32` saturates, so an absurd pointer coordinate clamps rather than
+    // wrapping negative; the explicit `min` keeps the documented cap.
+    let lines = (cells as i32).clamp(1, AUTOSCROLL_MAX_LINES);
+    if overshoot > 0.0 {
+        lines
+    } else {
+        -lines
+    }
+}
+
+/// Wheel lines-per-notch used when the OS setting cannot be read (and on every
+/// non-Windows target, which has no `SPI_GETWHEELSCROLLLINES` analogue). Three
+/// is the Windows factory default and the de-facto cross-platform convention.
+pub(crate) const DEFAULT_WHEEL_SCROLL_LINES: u32 = 3;
+
+/// Sentinel `SPI_GETWHEELSCROLLLINES` value meaning "scroll one PAGE per notch"
+/// (`WHEEL_PAGESCROLL` == `UINT_MAX`), which the user selects by dragging the
+/// Windows mouse-wheel slider to the top.
+pub(crate) const WHEEL_PAGESCROLL: u32 = u32::MAX;
+
+/// Upper bound on lines-per-notch honoured from the OS. The Windows control
+/// panel tops out well below this; the clamp only stops a pathological registry
+/// value from turning one notch into a runaway scroll.
+const MAX_WHEEL_SCROLL_LINES: u32 = 100;
+
+/// Hard cap on the rows ONE frame's wheel delta may move, so a single absurd
+/// delta cannot ask for a nonsensical jump (`scroll_view` clamps at the
+/// scrollback ends anyway — this just keeps the arithmetic sane).
+const MAX_WHEEL_LINES_PER_FRAME: f32 = 10_000.0;
+
+/// The OS's configured mouse-wheel scroll magnitude, in LINES PER NOTCH.
+///
+/// Windows exposes this as `SPI_GETWHEELSCROLLLINES` (Settings → Mouse → "Choose
+/// how many lines to scroll each time", default 3, or the `WHEEL_PAGESCROLL`
+/// sentinel for "one screen at a time"). Honouring it is what makes the wheel
+/// feel the same in the terminal as everywhere else on the machine, instead of
+/// a magnitude the app invented.
+///
+/// Read once and cached: the value is a user preference that changes at most a
+/// handful of times in a session, and the alternative is a `user32` call on
+/// every wheel event of every pane. A change made while the app is running takes
+/// effect on the next launch.
+///
+/// Non-Windows targets have no equivalent system-wide setting (GTK/macOS bake
+/// the magnitude into their own scroll pipelines), so they take the documented
+/// [`DEFAULT_WHEEL_SCROLL_LINES`] rather than pretending to read one.
+pub(crate) fn os_wheel_scroll_lines() -> u32 {
+    static CACHED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(read_os_wheel_scroll_lines)
+}
+
+#[cfg(windows)]
+fn read_os_wheel_scroll_lines() -> u32 {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    };
+    let mut lines: u32 = DEFAULT_WHEEL_SCROLL_LINES;
+    // SAFETY: `SPI_GETWHEELSCROLLLINES` is documented to write exactly one `UINT`
+    // through `pvparam`; we hand it a pointer to a live, initialised `u32` local
+    // that outlives the call. `uiparam` is unused for this action and `fwinini` is
+    // empty because this is a pure READ (no setting is changed, nothing is
+    // broadcast). On failure the call writes nothing and `lines` keeps its
+    // initialised default.
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            Some(std::ptr::from_mut(&mut lines).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if ok.is_err() {
+        DEFAULT_WHEEL_SCROLL_LINES
+    } else {
+        lines
+    }
+}
+
+#[cfg(not(windows))]
+fn read_os_wheel_scroll_lines() -> u32 {
+    DEFAULT_WHEEL_SCROLL_LINES
+}
+
+/// Resolve `os_lines_per_notch` to a concrete row count for a `visible_rows`-tall
+/// viewport, honouring the `WHEEL_PAGESCROLL` sentinel ("one screen per notch",
+/// conventionally a screenful minus one row of overlap so the reader keeps a line
+/// of context) and clamping a pathological value.
+fn lines_per_notch(os_lines_per_notch: u32, visible_rows: usize) -> u32 {
+    if os_lines_per_notch == WHEEL_PAGESCROLL {
+        return (visible_rows.saturating_sub(1).max(1)).min(MAX_WHEEL_SCROLL_LINES as usize) as u32;
+    }
+    os_lines_per_notch.clamp(1, MAX_WHEEL_SCROLL_LINES)
+}
+
+/// How many scrollback ROWS one frame's wheel `delta` should move this pane.
+///
+/// Sign matches [`super::pane_term::PaneTerm::scroll_view`]: **positive goes BACK
+/// into history** (wheel up), negative forward toward the live bottom.
+///
+/// ## Why both axes
+///
+/// egui folds a wheel event into a SINGLE axis before the app ever sees it: with
+/// the horizontal-scroll modifier held (`InputOptions::horizontal_scroll_modifier`,
+/// **Shift** by default) it rewrites the delta as `vec2(x + y, 0.0)` and leaves
+/// `smooth_scroll_delta.y` at ZERO. A pane that reads only `.y` therefore does
+/// **nothing at all** on Shift+wheel — which silently broke the shell's own
+/// "hold Shift to force LOCAL scrolling while a program has grabbed the mouse"
+/// escape, the one route to the scrollback while vim/tmux/htop owns the pointer.
+/// This reads whichever axis egui folded the notch into.
+///
+/// A horizontal delta WITHOUT the modifier (a tilt wheel, a two-finger sideways
+/// trackpad swipe) is deliberately ignored: the terminal grid is exactly as wide
+/// as its pane — `CellMetrics::cols_rows` derives `cols` FROM the pane width, so
+/// no row ever extends past the right edge — and there is consequently nothing to
+/// scroll horizontally. Repurposing a genuine sideways gesture into vertical
+/// motion would be a surprise, not a feature.
+///
+/// ## Magnitude
+///
+/// `points_per_notch` is egui's own `InputOptions::line_scroll_speed` (the
+/// points it expands one wheel LINE into), so `delta / points_per_notch`
+/// recovers the physical notch count; multiplying by the OS's lines-per-notch
+/// ([`os_wheel_scroll_lines`]) gives the rows the user asked for. The previous
+/// `delta / cell_height` was font-size dependent and OS-setting blind — a larger
+/// font made the wheel scroll FEWER rows per notch, which is backwards.
+///
+/// Pure (no egui frame, no terminal, no syscall — the OS value is a parameter)
+/// so every axis/magnitude case is unit-testable. Degenerate inputs (non-finite
+/// delta, non-positive `points_per_notch`) return `0`.
+pub(crate) fn wheel_scroll_lines(
+    delta: egui::Vec2,
+    horizontal_modifier: bool,
+    points_per_notch: f32,
+    os_lines_per_notch: u32,
+    visible_rows: usize,
+) -> i32 {
+    // `is_finite` is checked SEPARATELY from the sign test: `NaN <= 0.0` is
+    // `false`, so a bare `<= 0.0` would wave a NaN scale straight through.
+    if !delta.x.is_finite()
+        || !delta.y.is_finite()
+        || !points_per_notch.is_finite()
+        || points_per_notch <= 0.0
+    {
+        return 0;
+    }
+    // With the modifier held egui has already folded the whole notch into `.x`;
+    // without it the notch is on `.y` and a stray `.x` is not ours to consume.
+    let points = if horizontal_modifier {
+        delta.x
+    } else {
+        delta.y
+    };
+    if points == 0.0 {
+        return 0;
+    }
+    let notches = points / points_per_notch;
+    let rows = notches * lines_per_notch(os_lines_per_notch, visible_rows) as f32;
+    rows.clamp(-MAX_WHEEL_LINES_PER_FRAME, MAX_WHEEL_LINES_PER_FRAME)
+        .round() as i32
+}
+
+/// Map a pointer position to a grid `(row, col)`, CLAMPED to the grid's edges.
+///
+/// Unlike [`cell_at_pos`] — which returns `None` above/left of the grid and lets
+/// high indices run past the last row/column — this always yields a cell inside
+/// `0..rows` × `0..cols`. That is what a drag-select needs: a pointer dragged off
+/// any edge must still name a sensible EDGE cell (so the selection head keeps
+/// following it) instead of vanishing or naming a row that does not exist.
+///
+/// Returns `None` only for a degenerate grid (zero cell size or zero extent).
+/// Non-finite coordinates clamp to `(0, 0)`; enormous ones clamp to the last
+/// cell — the `as usize` cast saturates, so nothing wraps and nothing panics.
+pub(crate) fn clamp_pos_to_grid_cell(
+    pos: egui::Pos2,
+    origin: egui::Pos2,
+    cw: f32,
+    ch: f32,
+    cols: usize,
+    rows: usize,
+) -> Option<(usize, usize)> {
+    if cw <= 0.0 || ch <= 0.0 || cols == 0 || rows == 0 {
+        return None;
+    }
+    let axis = |p: f32, o: f32, size: f32, count: usize| -> usize {
+        if !p.is_finite() || p <= o {
+            return 0;
+        }
+        (((p - o) / size).floor() as usize).min(count - 1)
+    };
+    Some((
+        axis(pos.y, origin.y, ch, rows),
+        axis(pos.x, origin.x, cw, cols),
+    ))
+}
+
 /// Whether two 1-D ranges overlap (open-interval test), used by directional
 /// pane focus to require orthogonal-axis overlap between two pane rects.
 pub(crate) fn ranges_overlap(a: egui::Rangef, b: egui::Rangef) -> bool {
@@ -390,6 +623,10 @@ pub(crate) fn paint_link_underlines(
 /// uses, so the quads land on the cell grid. GPU-free (egui rects only). A
 /// match whose `line` exceeds the visible row count is skipped (the grid may
 /// have scrolled since the match set was computed mid-frame).
+// Geometry primitive: every argument is an independent painting parameter
+// (surface, cell metrics, colours), like `glyph_button` above. Grouping them into
+// a struct would only move the same fields behind one name.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_search_highlight(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -397,6 +634,7 @@ pub(crate) fn paint_search_highlight(
     line_height_px: f32,
     padding: f32,
     colors: &theme::ChromeColors,
+    current_match: egui::Color32,
     hl: SearchHighlight<'_>,
 ) {
     if hl.spans.is_empty() {
@@ -417,16 +655,175 @@ pub(crate) fn paint_search_highlight(
         let w = (col_end - s.col_start) as f32 * cw;
         let y0 = origin.y + s.line as f32 * ch;
         let span = egui::Rect::from_min_size(egui::pos2(x0, y0), egui::vec2(w, ch));
-        // Dim accent tint behind every match.
-        painter.rect_filled(span, 1.0, colors.accent.gamma_multiply(0.30));
-        // The active match also gets a crisp outline so it reads as "current".
         if idx == hl.selected {
+            // The CURRENT match gets its own distinct FILL, not merely an
+            // outline over the same tint every other match uses. With one shared
+            // colour the active match was near-indistinguishable at a glance —
+            // an outline reads as a border, not as "this is the one you are on",
+            // which is the whole point of a find overlay. A solid-ish fill plus
+            // the outline makes it unmistakable.
+            painter.rect_filled(span, 1.0, current_match.gamma_multiply(0.75));
             painter.rect_stroke(
                 span,
                 1.0,
-                egui::Stroke::new(1.5f32, colors.accent),
+                egui::Stroke::new(1.5f32, current_match),
                 egui::StrokeKind::Inside,
             );
+        } else {
+            // Dim accent tint behind every OTHER match.
+            painter.rect_filled(span, 1.0, colors.accent.gamma_multiply(0.30));
         }
+    }
+}
+
+#[cfg(test)]
+mod wheel_tests {
+    use super::*;
+
+    /// egui's native `line_scroll_speed`: the points it expands one wheel LINE
+    /// into. Using the real value keeps the notch arithmetic honest.
+    const PPN: f32 = 40.0;
+
+    /// THE DEFECT THIS GUARDS: egui folds a Shift-held wheel into `.x` and
+    /// leaves `.y` at zero, so a pane that reads only `.y` scrolls NOTHING.
+    /// One notch must move the same rows whichever axis egui folded it into.
+    #[test]
+    fn a_shift_folded_notch_scrolls_the_same_rows_as_a_plain_notch() {
+        let plain = wheel_scroll_lines(egui::vec2(0.0, PPN), false, PPN, 3, 40);
+        let shifted = wheel_scroll_lines(egui::vec2(PPN, 0.0), true, PPN, 3, 40);
+        assert_eq!(plain, 3, "one notch at 3 OS lines/notch must move 3 rows");
+        assert_eq!(
+            shifted, plain,
+            "a Shift-folded notch (delta on .x, .y == 0 — exactly what egui hands              the app) must scroll as far as a plain notch; reading only .y makes              this 0, which is the dead Shift+wheel this test rejects"
+        );
+    }
+
+    /// A genuine sideways gesture WITHOUT the modifier must be ignored: the grid
+    /// is exactly as wide as its pane, so there is nothing to scroll — and
+    /// silently turning it into vertical motion would be a surprise.
+    #[test]
+    fn an_unmodified_horizontal_delta_is_ignored() {
+        assert_eq!(
+            wheel_scroll_lines(egui::vec2(PPN * 4.0, 0.0), false, PPN, 3, 40),
+            0,
+            "a tilt-wheel / trackpad sideways swipe must not scroll the scrollback"
+        );
+        assert_eq!(
+            wheel_scroll_lines(egui::vec2(-PPN * 4.0, 0.0), false, PPN, 3, 40),
+            0
+        );
+    }
+
+    /// With the modifier held the OTHER axis is not ours either — egui has
+    /// already emptied it, and consuming both would double-count a trackpad.
+    #[test]
+    fn with_the_modifier_held_only_the_folded_axis_is_consumed() {
+        assert_eq!(
+            wheel_scroll_lines(egui::vec2(0.0, PPN * 4.0), true, PPN, 3, 40),
+            0,
+            "under the modifier egui puts the whole notch on .x; a non-zero .y is              not a second scroll to add on top"
+        );
+    }
+
+    /// THE OS SETTING IS READ, NOT INVENTED: doubling the machine's
+    /// lines-per-notch must double the rows one notch moves. A hard-coded
+    /// magnitude passes neither half of this.
+    #[test]
+    fn magnitude_tracks_the_os_lines_per_notch_setting() {
+        let one_notch = egui::vec2(0.0, PPN);
+        let at_1 = wheel_scroll_lines(one_notch, false, PPN, 1, 40);
+        let at_3 = wheel_scroll_lines(one_notch, false, PPN, 3, 40);
+        let at_6 = wheel_scroll_lines(one_notch, false, PPN, 6, 40);
+        assert_eq!((at_1, at_3, at_6), (1, 3, 6));
+        assert_eq!(
+            at_6,
+            at_3 * 2,
+            "doubling SPI_GETWHEELSCROLLLINES must double the scroll distance"
+        );
+        // ...and the same must hold on the Shift-folded axis.
+        assert_eq!(
+            wheel_scroll_lines(egui::vec2(PPN, 0.0), true, PPN, 6, 40),
+            6
+        );
+    }
+
+    /// The `WHEEL_PAGESCROLL` sentinel means "one screen per notch", keeping a
+    /// row of overlap for context — never the literal `u32::MAX` rows.
+    #[test]
+    fn page_scroll_sentinel_moves_about_one_screenful() {
+        let one_notch = egui::vec2(0.0, PPN);
+        assert_eq!(
+            wheel_scroll_lines(one_notch, false, PPN, WHEEL_PAGESCROLL, 24),
+            23,
+            "a 24-row viewport pages by 23 rows, leaving one line of context"
+        );
+        // A degenerate one-row viewport still moves a row, never zero or a
+        // saturating monster.
+        assert_eq!(
+            wheel_scroll_lines(one_notch, false, PPN, WHEEL_PAGESCROLL, 1),
+            1
+        );
+    }
+
+    /// Wheel UP (positive delta) goes BACK into history — the sign convention
+    /// `PaneTerm::scroll_view` documents. An inverted sign would scroll the
+    /// wrong way while still "scrolling".
+    #[test]
+    fn sign_follows_scroll_view_positive_is_back_into_history() {
+        assert!(wheel_scroll_lines(egui::vec2(0.0, PPN), false, PPN, 3, 40) > 0);
+        assert!(wheel_scroll_lines(egui::vec2(0.0, -PPN), false, PPN, 3, 40) < 0);
+        assert!(wheel_scroll_lines(egui::vec2(PPN, 0.0), true, PPN, 3, 40) > 0);
+        assert!(wheel_scroll_lines(egui::vec2(-PPN, 0.0), true, PPN, 3, 40) < 0);
+    }
+
+    /// A pathological OS value cannot turn one notch into a runaway scroll, and
+    /// zero is floored to one row rather than silently disabling the wheel.
+    #[test]
+    fn os_lines_per_notch_is_clamped_at_both_ends() {
+        let one_notch = egui::vec2(0.0, PPN);
+        assert_eq!(wheel_scroll_lines(one_notch, false, PPN, 0, 40), 1);
+        assert_eq!(
+            wheel_scroll_lines(one_notch, false, PPN, 100_000, 40),
+            MAX_WHEEL_SCROLL_LINES as i32
+        );
+    }
+
+    /// Degenerate inputs return 0 instead of dividing by zero or saturating a
+    /// cast into a nonsense row count.
+    #[test]
+    fn degenerate_inputs_scroll_nothing() {
+        assert_eq!(
+            wheel_scroll_lines(egui::vec2(0.0, PPN), false, 0.0, 3, 40),
+            0
+        );
+        assert_eq!(
+            wheel_scroll_lines(egui::vec2(0.0, PPN), false, -1.0, 3, 40),
+            0
+        );
+        assert_eq!(
+            wheel_scroll_lines(egui::vec2(0.0, f32::NAN), false, PPN, 3, 40),
+            0
+        );
+        assert_eq!(
+            wheel_scroll_lines(egui::vec2(f32::INFINITY, 0.0), true, PPN, 3, 40),
+            0
+        );
+        assert_eq!(wheel_scroll_lines(egui::Vec2::ZERO, false, PPN, 3, 40), 0);
+    }
+
+    /// The OS reader never yields a value the resolver would reject, and on a
+    /// machine that cannot answer it falls back to the documented default rather
+    /// than to zero (a zero would silently disable the wheel).
+    #[test]
+    fn the_os_reader_yields_a_usable_lines_per_notch() {
+        let os = os_wheel_scroll_lines();
+        assert!(os > 0, "SPI_GETWHEELSCROLLLINES fallback must never be 0");
+        let resolved = lines_per_notch(os, 40);
+        assert!(
+            (1..=MAX_WHEEL_SCROLL_LINES).contains(&resolved),
+            "resolved lines-per-notch {resolved} out of range"
+        );
+        // Cached: two reads agree (and the second costs no syscall).
+        assert_eq!(os, os_wheel_scroll_lines());
     }
 }

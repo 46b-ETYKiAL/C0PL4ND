@@ -248,8 +248,8 @@ fn apply_terminal_env(cmd: &mut CommandBuilder, term: Option<&str>) {
 ///
 /// `cmd.exe`'s built-in default prompt is `$P$G` — the path followed by `>`
 /// with NO trailing space — so the cursor renders flush against the `>`
-/// (`C:\Users\.46b_>`). Setting `PROMPT=$P$G ` (note the trailing space) makes
-/// cmd render `C:\Users\.46b_> ` with the cursor one cell clear of the `>`.
+/// (`C:\Users\example>`). Setting `PROMPT=$P$G ` (note the trailing space) makes
+/// cmd render `C:\Users\example> ` with the cursor one cell clear of the `>`.
 /// PowerShell and POSIX shells (bash/zsh/fish) already end their default prompt
 /// with a space via their own `prompt` function / `PS1`, so they need no env.
 #[cfg(windows)]

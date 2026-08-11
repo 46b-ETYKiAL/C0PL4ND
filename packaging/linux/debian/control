@@ -4,9 +4,9 @@ Priority: optional
 Maintainer: Itasha.Corp <support@itasha.example>
 Build-Depends: debhelper-compat (= 13), cargo, rustc
 Standards-Version: 4.6.2
-Homepage: https://github.com/itasha-corp/c0pl4nd
-Vcs-Git: https://github.com/itasha-corp/c0pl4nd.git
-Vcs-Browser: https://github.com/itasha-corp/c0pl4nd
+Homepage: https://github.com/46b-ETYKiAL/C0PL4ND
+Vcs-Git: https://github.com/46b-ETYKiAL/C0PL4ND.git
+Vcs-Browser: https://github.com/46b-ETYKiAL/C0PL4ND
 Rules-Requires-Root: no
 
 Package: c0pl4nd

@@ -1,7 +1,7 @@
 # OpenSSF Scorecard — remediation notes
 
 This file documents how each OpenSSF Scorecard check is addressed for
-`Itasha.Corp_C0PL4ND`, including the findings that are resolved in code, the
+`C0PL4ND`, including the findings that are resolved in code, the
 ones that resolve automatically, and the ones that require a manual external
 action.
 
@@ -108,7 +108,7 @@ action.
 - **Action (manual, maintainer)**:
   1. Go to <https://www.bestpractices.dev/> and sign in with GitHub.
   2. Add a new project: <https://www.bestpractices.dev/en/projects/new>
-  3. Enter the repository URL: `https://github.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND`
+  3. Enter the repository URL: `https://github.com/46b-ETYKiAL/C0PL4ND`
   4. Complete the "passing" criteria (most are already satisfied: OSS license,
      `SECURITY.md`, public VCS, automated test suite, static analysis via
      CodeQL + clippy, dependency vetting via `cargo deny`/`cargo audit`).

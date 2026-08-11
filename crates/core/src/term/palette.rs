@@ -4,8 +4,48 @@
 //! module. Builds the protocol-default indexed palette that seeds OSC 4 query
 //! replies and OSC 104 resets. Colors are [`super::osc::Rgb`] triples — the same
 //! representation the rest of the terminal core uses.
+//!
+//! This module is the SINGLE SOURCE OF TRUTH for the extended (>= 16) xterm
+//! palette: both the OSC query/reset baseline ([`build_default_palette`]) and
+//! the RENDER path ([`crate::theme::Theme::ansi`]) resolve indices 16-255
+//! through [`extended_entry`]. There is deliberately no second cube/ramp
+//! implementation — the render path previously folded every index through
+//! `index % 8`, which turned `\e[38;5;208m` (orange) into black.
 
 use super::osc::Rgb;
+
+/// The xterm 6x6x6 cube component levels. Index 0 maps to 0 and 1..=5 map to
+/// 95, 135, 175, 215, 255 — NOT a linear 0,51,102,… ramp (the xterm quirk
+/// where the first non-zero step jumps straight to 95).
+pub(crate) const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+/// Resolve an EXTENDED xterm palette index (16-255) to its standard RGB.
+///
+/// Returns `None` for indices 0-15: those are the ANSI 16 and belong to the
+/// active theme's `normal` / `bright` rows, not to a fixed table.
+///
+/// * `16..=231` — the 6x6x6 color cube, components drawn from [`CUBE_LEVELS`]
+///   with blue varying fastest, then green, then red.
+/// * `232..=255` — the 24-step grayscale ramp, `8 + 10*n`.
+pub(crate) fn extended_entry(index: u8) -> Option<Rgb> {
+    match index {
+        0..=15 => None,
+        16..=231 => {
+            let i = (index - 16) as usize;
+            Some((
+                CUBE_LEVELS[(i / 36) % 6],
+                CUBE_LEVELS[(i / 6) % 6],
+                CUBE_LEVELS[i % 6],
+            ))
+        }
+        232..=255 => {
+            // 8, 18, …, 238. `u16` arithmetic keeps the multiply out of u8
+            // overflow territory; the max is 8 + 23*10 = 238.
+            let v = (8u16 + (index as u16 - 232) * 10) as u8;
+            Some((v, v, v))
+        }
+    }
+}
 
 /// Builds the standard xterm 256-color palette as `(r, g, b)` triples.
 ///

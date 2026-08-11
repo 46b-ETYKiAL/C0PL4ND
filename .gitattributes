@@ -1,0 +1,62 @@
+# Deterministic line endings across Windows/Linux/macOS contributors.
+#
+# Without this, normalization depends on each contributor's `core.autocrlf`,
+# so whether a file lands in the repository as LF or CRLF is a property of
+# whoever happened to commit it. Two concrete failures follow from that:
+#
+#   * A shell script committed with CRLF is unrunnable on Linux and macOS -
+#     the interpreter line becomes `#!/bin/sh\r` and `curl ... | sh` dies with
+#     a "bad interpreter" error that names a file that plainly exists.
+#   * A detached signature or other byte-exact blob committed through a text
+#     filter is silently corrupted, and the corruption only surfaces at verify
+#     time, long after the commit that caused it.
+#
+# Store everything as LF in the repository and check it out as LF.
+* text=auto eol=lf
+
+# Explicit text types (belt-and-suspenders over the auto detection).
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.sh    text eol=lf
+*.ps1   text eol=lf
+*.py    text eol=lf
+*.wxs   text eol=lf
+*.xsl   text eol=lf
+
+# Binary assets - never normalize or diff as text.
+*.ttf      binary
+*.otf      binary
+*.woff     binary
+*.woff2    binary
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.gif      binary
+*.ico      binary
+*.icns     binary
+*.gz       binary
+*.zip      binary
+*.wasm     binary
+*.minisig  binary
+
+# Why the `*.sh` (and `*.yml`/`*.yaml`) rules above are load-bearing rather
+# than cosmetic.
+#
+# `packaging/require-installer-signing.sh` is executed by the windows-installer
+# job, on windows-latest, via `shell: bash`. A CRLF checkout there does not
+# merely look untidy: the trailing \r becomes part of the last token on every
+# line, so `sh` reports `$'\r': command not found`, and — worse, because it
+# fails QUIETLY in the wrong direction — a comparison like
+#
+#     [ "${UNSIGNED_WINDOWS_INSTALLER_ACK:-}" = "${ACK_SENTINEL}" ]
+#
+# compares against a sentinel with a trailing \r and can never match, silently
+# turning the acknowledged path back into a hard failure. Whether that happens
+# depends on the runner image's core.autocrlf, which is not ours to control.
+# Declaring the endings above removes the dependency entirely. The workflows
+# carry embedded shell in `run:` blocks that runs on Linux and macOS runners,
+# so they are pinned for the same reason.

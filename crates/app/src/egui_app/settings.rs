@@ -57,6 +57,11 @@ const CATEGORIES: &[&str] = &[
     "Keybindings",
     "Updates",
     "Privacy",
+    // Config file management. This section is rendered by `render_sections` and was
+    // previously ABSENT from this list, which made it reachable only by typing a
+    // matching term into the settings search box — a built page with no way to click
+    // to it. `every_rendered_section_is_reachable` now fails if that recurs.
+    "Config",
 ];
 
 /// Cross-category search labels for the **Appearance** section. Kept as a named
@@ -72,9 +77,46 @@ const APPEARANCE_SEARCH_LABELS: &[&str] = &[
     "frost frosted glass",
     "grain",
     "always on top window level",
+    "quake mode drop down terminal global hotkey",
+    "quake hotkey combo shortcut",
+    "quake height fraction drop down size",
     "ui scale",
     "zoom",
     "accessibility",
+];
+
+/// The `row_visible` keyword strings for the three **Window → Closing and
+/// minimizing** rows, as named consts.
+///
+/// Each is passed BOTH to its own `row_visible(q, …)` call AND (via
+/// [`WINDOW_SEARCH_LABELS`]) to the section's `section_visible` label list, so
+/// the row and the section it lives in can never disagree about which query
+/// reveals them — a section that stays hidden while its row would have matched
+/// is a control the user can see on the tab but never find by searching.
+const CLOSE_TO_TRAY_LABEL: &str = "close to tray system tray notification area minimise";
+const MINIMIZE_TO_TRAY_LABEL: &str = "minimize to tray taskbar hide system tray minimise";
+const WARN_RUNNING_LABEL: &str = "warn running command close confirm prompt process";
+
+/// Cross-category search labels for the **Window** section. Shared with the
+/// `the_new_window_rows_are_reachable_by_search` test so the invariant is checked
+/// against the PRODUCTION labels, not an inline copy that would pass even after
+/// the real list was emptied.
+const WINDOW_SEARCH_LABELS: &[&str] = &[
+    "padding",
+    "columns",
+    "rows",
+    "panes",
+    "dividers",
+    "linked",
+    "symmetrical",
+    "status bar",
+    "graphics",
+    "backend",
+    "gpu",
+    "renderer",
+    CLOSE_TO_TRAY_LABEL,
+    MINIMIZE_TO_TRAY_LABEL,
+    WARN_RUNNING_LABEL,
 ];
 
 /// Cross-category search labels for the **Motion** section. Each entry is the
@@ -107,9 +149,37 @@ const MOTION_SEARCH_LABELS: &[&str] = &[
     "boot glitch",
 ];
 
-/// The release channels the Updates section offers. Mirrors the channels the
-/// `c0pl4nd update` checker understands; a free choice list, not invented.
-const UPDATE_CHANNELS: &[&str] = &["stable", "beta", "nightly"];
+/// Cross-category search labels for the **Keybindings** section: the label of
+/// every binding row, lowercased. Kept as a named const (like
+/// [`MOTION_SEARCH_LABELS`]) so `keybinding_search_labels_cover_every_binding`
+/// can pin it against the LIVE schema — a binding added to
+/// `Keybindings::entries` without a search label would be a row no query could
+/// ever reveal.
+const KEYBINDING_SEARCH_LABELS: &[&str] = &[
+    "copy selection",
+    "paste",
+    "new tab",
+    "close pane",
+    "focus next pane",
+    "split right",
+    "split down",
+    "find in terminal",
+    "command palette",
+    "command-history sidebar",
+    "increase font size",
+    "decrease font size",
+    "reset font size",
+    "zoom pane",
+    "equalize panes",
+    "toggle grid / tabs view",
+    "settings",
+    "fullscreen",
+    "clear scrollback",
+    "copy everything",
+    "scroll to top",
+    "scroll to bottom",
+    "reopen closed pane",
+];
 
 /// The usable range of the chromatic-aberration INTENSITY slider.
 ///
@@ -1482,6 +1552,88 @@ fn render_sections(
 
         group(
             ui,
+            "Quake mode",
+            "A drop-down terminal: one global hotkey slides the window in from the \
+             top of whichever monitor the mouse is on, and hides it again.",
+        );
+        grid("appearance_quake").show(ui, |ui| {
+            // A global hotkey is claimed process-wide and denied to every other
+            // application, so this is strictly opt-in and takes effect on the next
+            // launch (the registration happens once, at window creation).
+            if row_visible(q, "quake mode drop down terminal global hotkey") {
+                changed |= ui
+                    .checkbox(&mut config.quake.enabled, "Quake mode (drop-down)")
+                    .on_hover_text(
+                        "Register a GLOBAL hotkey that drops C0PL4ND down from the \
+                         top of the monitor under the mouse and hides it again. \
+                         Off by default: a global hotkey is claimed system-wide and \
+                         taken away from every other app. Applies on restart.",
+                    )
+                    .changed();
+                ui.label(""); // checkbox carries its own label
+                changed |= reset_to_default(ui, &mut config.quake.enabled, &def.quake.enabled);
+                ui.end_row();
+            }
+
+            if row_visible(q, "quake hotkey combo shortcut") {
+                ui.label("Quake hotkey").on_hover_text(
+                    "The combo, written as Mod+Mod+Key — e.g. Ctrl+Shift+Grave, \
+                     Win+F12, Alt+Space. Modifiers: Ctrl, Alt, Shift, Win. \
+                     At least one modifier is required.",
+                );
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add_enabled(
+                            config.quake.enabled,
+                            egui::TextEdit::singleline(&mut config.quake.hotkey)
+                                .desired_width(140.0),
+                        )
+                        .changed();
+                    // Validate with the SAME parser that registers the hotkey, so
+                    // the user learns here that a combo is unusable instead of
+                    // restarting into a quake mode that silently never arms.
+                    if config.quake.parsed_hotkey().is_none() {
+                        ui.colored_label(egui::Color32::from_rgb(0xE0, 0x6C, 0x75), "invalid")
+                            .on_hover_text(
+                                "Not a combo we can register. It needs at least one \
+                                 modifier plus one key — a bare key would be taken \
+                                 from every other application. Quake mode stays off \
+                                 until this parses.",
+                            );
+                    }
+                });
+                changed |= reset_to_default(ui, &mut config.quake.hotkey, &def.quake.hotkey);
+                ui.end_row();
+            }
+
+            if row_visible(q, "quake height fraction drop down size") {
+                ui.label("Quake height").on_hover_text(
+                    "How much of the monitor's WORK AREA (the desktop minus the \
+                     taskbar) the drop-down covers. The window is always full \
+                     work-area width and never overlaps the taskbar.",
+                );
+                changed |= ui
+                    .add_enabled(
+                        config.quake.enabled,
+                        egui::Slider::new(
+                            &mut config.quake.height_fraction,
+                            c0pl4nd_core::config::QuakeConfig::MIN_HEIGHT_FRACTION
+                                ..=c0pl4nd_core::config::QuakeConfig::MAX_HEIGHT_FRACTION,
+                        )
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                    )
+                    .changed();
+                changed |= reset_to_default(
+                    ui,
+                    &mut config.quake.height_fraction,
+                    &def.quake.height_fraction,
+                );
+                ui.end_row();
+            }
+        });
+
+        group(
+            ui,
             "Interface scale",
             "Accessibility zoom for the whole interface, saved across launches.",
         );
@@ -1781,6 +1933,8 @@ fn render_sections(
             "shell",
             "copy on select",
             "paste",
+            "clipboard read",
+            "osc 52",
         ],
     ) {
         ui.heading("Terminal");
@@ -1883,30 +2037,43 @@ fn render_sections(
                 );
                 ui.end_row();
             }
+
+            if row_visible(q, "clipboard read osc 52 allow program security") {
+                // DEFAULT-DENY, and deliberately phrased as a risk rather than a
+                // feature. Clipboard WRITES from a program are always accepted
+                // (worst case: a clobbered clipboard); a READ is an exfiltration
+                // primitive — anything that can write to the tty could siphon
+                // whatever was last copied, which is routinely a password.
+                changed |= ui
+                    .checkbox(
+                        &mut config.clipboard_read_allow,
+                        "Allow programs to read the clipboard (OSC 52)",
+                    )
+                    .on_hover_text(
+                        "Security: OFF by default. When ON, any program running in \
+                         a pane can read your system clipboard — including one you \
+                         did not start, or output piped in over ssh/tmux. Whatever \
+                         you last copied (passwords, tokens) becomes readable. \
+                         Copying TO the clipboard from a program always works and \
+                         is unaffected. While OFF, a read request is refused with \
+                         an empty reply, so well-behaved programs continue rather \
+                         than hang.",
+                    )
+                    .changed();
+                ui.label("");
+                changed |= reset_to_default(
+                    ui,
+                    &mut config.clipboard_read_allow,
+                    &def.clipboard_read_allow,
+                );
+                ui.end_row();
+            }
         });
         group_gap(ui);
     }
 
     // -------------------------------------------------------------------- Window
-    if section_visible(
-        sel,
-        q,
-        "Window",
-        &[
-            "padding",
-            "columns",
-            "rows",
-            "panes",
-            "dividers",
-            "linked",
-            "symmetrical",
-            "status bar",
-            "graphics",
-            "backend",
-            "gpu",
-            "renderer",
-        ],
-    ) {
+    if section_visible(sel, q, "Window", WINDOW_SEARCH_LABELS) {
         ui.heading("Window");
         help(
             ui,
@@ -1959,6 +2126,72 @@ fn render_sections(
                     .changed();
                 ui.label("");
                 changed |= reset_to_default(ui, &mut config.show_status_bar, &def.show_status_bar);
+                ui.end_row();
+            }
+        });
+
+        group(
+            ui,
+            "Closing and minimizing",
+            "What the close button and the minimize button actually do.",
+        );
+        grid("window_close").show(ui, |ui| {
+            if row_visible(q, CLOSE_TO_TRAY_LABEL) {
+                changed |= ui
+                    .checkbox(&mut config.window.close_to_tray, "Close to tray")
+                    .on_hover_text(
+                        "Closing the window hides it to the system tray instead of \
+                         quitting, so the running shells keep going. Click the tray \
+                         icon to bring it back, or use the tray menu's Quit to \
+                         really exit. Ignored if the tray icon could not be created.",
+                    )
+                    .changed();
+                ui.label("");
+                changed |= reset_to_default(
+                    ui,
+                    &mut config.window.close_to_tray,
+                    &def.window.close_to_tray,
+                );
+                ui.end_row();
+            }
+
+            if row_visible(q, MINIMIZE_TO_TRAY_LABEL) {
+                changed |= ui
+                    .checkbox(&mut config.window.minimize_to_tray, "Minimize to tray")
+                    .on_hover_text(
+                        "Minimizing hides the window to the system tray instead of \
+                         leaving it on the taskbar. Ignored if the tray icon could \
+                         not be created.",
+                    )
+                    .changed();
+                ui.label("");
+                changed |= reset_to_default(
+                    ui,
+                    &mut config.window.minimize_to_tray,
+                    &def.window.minimize_to_tray,
+                );
+                ui.end_row();
+            }
+
+            if row_visible(q, WARN_RUNNING_LABEL) {
+                changed |= ui
+                    .checkbox(
+                        &mut config.window.warn_on_close_running,
+                        "Warn if a command is still running",
+                    )
+                    .on_hover_text(
+                        "Closing kills every shell outright, so an in-flight build \
+                         or migration dies with no prompt. This asks first. Needs \
+                         shell prompt integration (OSC 133) to know a command is \
+                         running — a shell without it never triggers the prompt.",
+                    )
+                    .changed();
+                ui.label("");
+                changed |= reset_to_default(
+                    ui,
+                    &mut config.window.warn_on_close_running,
+                    &def.window.warn_on_close_running,
+                );
                 ui.end_row();
             }
         });
@@ -2578,72 +2811,67 @@ fn render_sections(
     }
 
     // --------------------------------------------------------------- Keybindings
-    if section_visible(
-        sel,
-        q,
-        "Keybindings",
-        &[
-            "copy",
-            "paste",
-            "new tab",
-            "close tab",
-            "next tab",
-            "split right",
-            "split down",
-            "search",
-            "command palette",
-            "increase font",
-            "decrease font",
-        ],
-    ) {
+    if section_visible(sel, q, "Keybindings", KEYBINDING_SEARCH_LABELS) {
         ui.heading("Keybindings");
         help(
             ui,
-            "Reference — the shell's shortcuts are currently FIXED (not yet \
-             user-rebindable in this shell). \"mod\" is Ctrl+Shift on \
-             Windows/Linux, Cmd on macOS.",
+            "Edit a shortcut by typing its combo. \"mod\" is the platform command \
+             modifier (Ctrl on Windows/Linux, Cmd on macOS); combine it with \
+             \"shift\" / \"alt\" and one key, e.g. \"mod+shift+t\". Changes apply \
+             immediately \u{2014} no restart.",
         );
-        // READ-ONLY: a configurable-keybinding dispatcher is not wired in the
-        // egui shell — the shortcuts are hardcoded in `frame_tick`. The rows are
-        // shown disabled (the active combo, for reference) rather than as
-        // editable fields that silently control nothing (the prior dead-editor
-        // state). Matches the ligatures / copy-on-select honest-disable pattern.
+        // These rows are LIVE: `C0pl4ndApp::dispatch_keybindings` resolves every
+        // shortcut from these exact strings on every frame, so an edit here really
+        // moves the chord. The rows are generated from `entries_mut()` so a
+        // binding added to the schema can never end up without an editor.
+        //
+        // Copy/Paste are the one honest exception: `egui-winit` intercepts the
+        // clipboard chords in its own window-event dispatcher and delivers them as
+        // `Event::Copy` / `Event::Cut` rather than `Event::Key`, so they never
+        // reach the dispatcher. They stay DISABLED (shown for reference) rather
+        // than pretending to be rebindable.
+        let dispatched: Vec<&'static str> = super::actions::Action::ALL
+            .iter()
+            .map(|a| a.binding())
+            .collect();
         grid("keybindings_grid").show(ui, |ui| {
-            macro_rules! keybind_row {
-                ($field:ident, $label:literal, $search:literal) => {
-                    if row_visible(q, $search) {
-                        ui.label($label);
-                        ui.add_enabled_ui(false, |ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut config.keybindings.$field)
-                                    .desired_width(180.0)
-                                    .font(egui::TextStyle::Monospace),
-                            )
-                            .on_hover_text(
-                                "Fixed shortcut — not yet user-rebindable in this shell.",
-                            );
-                        });
-                        ui.end_row();
+            for (name, combo) in config.keybindings.entries_mut() {
+                let label = c0pl4nd_core::config::action_label(name);
+                if !row_visible(q, label) {
+                    continue;
+                }
+                ui.label(label);
+                let editable = dispatched.contains(&name);
+                let before = combo.clone();
+                ui.add_enabled_ui(editable, |ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(combo)
+                            .desired_width(180.0)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    if editable {
+                        resp.on_hover_text("Live shortcut. Modifiers: mod (Ctrl/Cmd), shift, alt.");
+                    } else {
+                        resp.on_hover_text(
+                            "Handled by the platform clipboard integration, not the \
+                             shortcut dispatcher \u{2014} shown for reference.",
+                        );
                     }
-                };
+                });
+                if *combo != before {
+                    changed = true;
+                }
+                ui.end_row();
             }
-            keybind_row!(copy, "Copy", "copy");
-            keybind_row!(paste, "Paste", "paste");
-            keybind_row!(new_tab, "New tab", "new tab");
-            keybind_row!(close_tab, "Close tab", "close tab");
-            keybind_row!(next_tab, "Next tab", "next tab");
-            keybind_row!(split_right, "Split right", "split right");
-            keybind_row!(split_down, "Split down", "split down");
-            keybind_row!(search, "Search", "search");
-            keybind_row!(command_palette, "Command palette", "command palette");
-            keybind_row!(increase_font, "Increase font", "increase font");
-            keybind_row!(decrease_font, "Decrease font", "decrease font");
         });
-        // F5-1: surface keybinding conflicts + blank bindings inline. The combos
-        // are free-text, so two actions can collide on one combo (only one wins)
-        // or a binding can be left empty (the action becomes unreachable) — both
-        // silently. validate() makes that explicit right under the editor instead
-        // of the user wondering why a shortcut "does nothing".
+        // Surface conflicts, blank bindings, and unparseable combos inline. The
+        // combos are free text, so two actions can collide on one chord (only one
+        // wins), a binding can be left empty (the action becomes keyboard-
+        // unreachable), or a combo can be unreadable — all silently. `validate()`
+        // makes that explicit right under the editor instead of the user
+        // wondering why a shortcut "does nothing". Collisions are grouped by the
+        // CANONICAL chord, so "ctrl+shift+c" and "mod+shift+c" are correctly
+        // reported as one physical shortcut.
         for issue in config.keybindings.validate() {
             ui.colored_label(
                 egui::Color32::from_rgb(0xff, 0xb0, 0x00),
@@ -2784,30 +3012,26 @@ fn render_sections(
                 ui.end_row();
             }
 
-            // ---- Release channel ----
-            if row_visible(q, "channel release stable beta nightly") {
-                let networked = config.update.mode != UpdateMode::Off;
-                ui.add_enabled_ui(networked, |ui| {
-                    ui.label("Release channel")
-                        .on_hover_text("Which release line update checks follow.");
-                });
-                let channel_variants: Vec<(String, &str)> = UPDATE_CHANNELS
-                    .iter()
-                    .map(|c| (c.to_string(), *c))
-                    .collect();
-                let cur_channel = config.update.channel.clone();
-                ui.add_enabled_ui(networked, |ui| {
-                    changed |= dropdown_with_stepper(
-                        ui,
-                        "c0pl4nd-update-channel",
-                        &mut config.update.channel,
-                        &channel_variants,
-                        Some(&cur_channel),
-                    );
-                });
-                changed |= reset_to_default(ui, &mut config.update.channel, &def.update.channel);
-                ui.end_row();
-            }
+            // ---- Release channel: DELIBERATELY NOT RENDERED ----
+            //
+            // There was a "Release channel" (stable/beta/nightly) dropdown here.
+            // It wrote `config.update.channel`, which the IN-APP updater never
+            // reads: nothing under `update_engine/` references it, and
+            // `update_engine::net` refuses any prerelease/draft release
+            // UNCONDITIONALLY as a channel-pin security gate, whatever the
+            // setting said. The "Check for updates" button a few rows below
+            // calls `start_check(ctx, kind)` and takes no channel at all.
+            //
+            // So the control sat immediately above a button it did not affect,
+            // and picking "beta" silently changed nothing. A setting that does
+            // not do what it says is worse than an absent one.
+            //
+            // The CONFIG FIELD stays. The legacy CLI path
+            // (`update::latest_version(channel)`) genuinely consumes it, and
+            // dropping it would be a breaking config change for anyone who set
+            // it. Wiring the UI properly is the other option, but it means
+            // relaxing that unconditional prerelease refusal -- a security gate
+            // -- which is not a change to make alongside a release.
         });
 
         // ---- Check for updates + inline status + action buttons ----
@@ -2857,6 +3081,51 @@ fn render_sections(
                     update_engine::UPDATE_REPO
                 )));
             }
+        }
+
+        // ---- What's new: the running version's changelog entry, in-app ----
+        //
+        // The link above is a browser hand-off. This panel answers the same
+        // question WITHOUT leaving the app, from the changelog compiled into
+        // this binary (`c0pl4nd_core::changelog`) — so it always describes the
+        // build actually running, and works with no network and no install-dir
+        // layout assumptions.
+        if row_visible(q, "changelog release notes what is new version history") {
+            ui.add_space(4.0);
+            let entry = c0pl4nd_core::changelog::current();
+            egui::CollapsingHeader::new(format!("What's new in {}", entry.heading))
+                .id_salt("changelog_panel")
+                .default_open(false)
+                .show(ui, |ui| {
+                    // A changelog panel that silently shows nothing is worse
+                    // than one that says it could not load, so every fallback
+                    // and every miss is stated HERE, in the UI — not only in a
+                    // log the user never sees.
+                    if let Some(notice) = &entry.notice {
+                        ui.colored_label(egui::Color32::from_rgb(0xff, 0xb0, 0x00), notice);
+                        ui.add_space(6.0);
+                    }
+                    if entry.is_empty() {
+                        // The notice above is the whole content — by contract it
+                        // is always present on this path.
+                        return;
+                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("changelog_body")
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            // Monospace preserves the Keep a Changelog structure
+                            // (nested `###` groups, `-` bullets) without pulling
+                            // in a markdown renderer; selectable so a user can
+                            // copy a line into a bug report.
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(entry.body.as_str()).monospace(),
+                                )
+                                .selectable(true),
+                            );
+                        });
+                });
         }
         group_gap(ui);
     }
@@ -3379,6 +3648,71 @@ fn step_line_height_px(px: f32, delta: f32) -> f32 {
 mod tests {
     use super::*;
 
+    /// Every section `render_sections` actually renders must be reachable from the
+    /// left-nav.
+    ///
+    /// The **Config** section regressed exactly this way: the page was fully built,
+    /// but `"Config"` was missing from [`CATEGORIES`], so `sel` could never equal it
+    /// and the only way to reach the page was to type a matching term into the
+    /// settings search box. A built page nobody can click to is indistinguishable
+    /// from a missing feature.
+    ///
+    /// This scans THIS file's own source for the section names passed to
+    /// `section_visible` and asserts each one is offered in the nav. The needle is
+    /// assembled with `concat!` so the scan cannot match this test's own text.
+    ///
+    /// The scan is deliberately truncated at the start of this `#[cfg(test)]` module:
+    /// the tests below call `section_visible` with LITERAL arguments
+    /// (`section_visible("Font", "", "Font", …)`), which a naive whole-file scan
+    /// would mistake for rendered production sections. A guard that reads its own
+    /// test code is the classic way these wiring checks go quietly wrong.
+    #[test]
+    fn every_rendered_section_is_reachable_from_the_nav() {
+        let whole = include_str!("settings.rs");
+        // First occurrence is the real module boundary; any later match is inside
+        // this test's own text and cannot precede it.
+        let src = match whole.find(concat!("#[cfg", "(test)]")) {
+            Some(end) => &whole[..end],
+            None => whole,
+        };
+        let needle = concat!("section_", "visible(");
+        let mut rendered: Vec<&str> = Vec::new();
+        let mut rest = src;
+        while let Some(hit) = rest.find(needle) {
+            let (before, after) = rest.split_at(hit);
+            // Skip the function DEFINITION — only call sites name a section.
+            let is_definition = before.trim_end().ends_with("fn");
+            rest = &after[needle.len()..];
+            if is_definition {
+                continue;
+            }
+            // Args are `sel, q, "Name", &[…]` — the first string literal after the
+            // open paren is the section name, in both rustfmt layouts.
+            let Some(open) = rest.find('"') else { continue };
+            let tail = &rest[open + 1..];
+            let Some(close) = tail.find('"') else {
+                continue;
+            };
+            rendered.push(&tail[..close]);
+        }
+
+        assert!(
+            !rendered.is_empty(),
+            "the source scan found no section_visible call sites — the scan itself \
+             has broken, which would make this test vacuously green"
+        );
+
+        let missing: Vec<&&str> = rendered
+            .iter()
+            .filter(|name| !CATEGORIES.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these settings sections are rendered but NOT listed in CATEGORIES, so \
+             they are unreachable from the left-nav: {missing:?}"
+        );
+    }
+
     #[test]
     fn builtin_themes_include_the_default() {
         assert!(
@@ -3468,6 +3802,183 @@ mod tests {
             // resolve. Mirror that condition by asserting the app-id constant
             // matches the `with_app_id` in egui_main.rs.
             None => assert_eq!(EFRAME_APP_ID, "com.itashacorp.c0pl4nd"),
+        }
+    }
+
+    #[test]
+    fn keybinding_search_labels_cover_every_binding() {
+        // A binding added to the schema without a matching search label would
+        // render a row that no search query can reveal (the phantom-section
+        // failure `every_rendered_section_is_reachable` guards elsewhere).
+        for (name, _) in c0pl4nd_core::config::Keybindings::default().entries() {
+            let label = c0pl4nd_core::config::action_label(name).to_lowercase();
+            assert!(
+                KEYBINDING_SEARCH_LABELS.contains(&label.as_str()),
+                "binding '{name}' (label {label:?}) has no Keybindings search label"
+            );
+        }
+    }
+
+    #[test]
+    fn every_dispatched_binding_is_editable_and_clipboard_rows_are_not() {
+        // The row loop enables an editor only for bindings the dispatcher
+        // actually resolves. If an action were dropped from `Action::ALL`, its
+        // row would silently become a dead editor again — the exact fakery this
+        // section was rewritten to remove.
+        let dispatched: Vec<&str> = super::super::actions::Action::ALL
+            .iter()
+            .map(|a| a.binding())
+            .collect();
+        for (name, _) in c0pl4nd_core::config::Keybindings::default().entries() {
+            let expected_editable = name != "copy" && name != "paste";
+            assert_eq!(
+                dispatched.contains(&name),
+                expected_editable,
+                "binding '{name}' editability does not match the dispatch table"
+            );
+        }
+    }
+
+    // ---- Window > Closing and minimizing: the three new toggles ----
+
+    /// Drive the REAL `show` through a headless kittest harness with the Window
+    /// category selected, then click `label` and report the resulting config.
+    ///
+    /// This exercises the production render path, so a row that was written but
+    /// never reached (wrong section, wrong `row_visible` keyword, `end_row`
+    /// mismatch) fails here rather than shipping invisible.
+    fn click_window_row(label: &str) -> (Config, Config) {
+        use egui_kittest::kittest::Queryable;
+
+        let config = std::cell::RefCell::new(Config::default());
+        let before = config.borrow().clone();
+        let open = std::cell::RefCell::new(true);
+        let colors =
+            super::super::theme::ChromeColors::from_theme(&c0pl4nd_core::Theme::builtin_void());
+
+        #[allow(deprecated)]
+        let mut h = egui_kittest::Harness::new(|ctx| {
+            let mut cfg = config.borrow_mut();
+            let mut op = open.borrow_mut();
+            let _ = show(ctx, &mut cfg, &mut op, colors, false, false);
+        });
+        h.set_size(egui::vec2(1200.0, 900.0));
+        h.run();
+        // Switch to the Window category (the toggles live in its own group).
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Window")
+            .click();
+        h.run();
+        h.get_by_label(label).click();
+        h.run();
+        let after = config.borrow().clone();
+        (before, after)
+    }
+
+    #[test]
+    fn clicking_close_to_tray_flips_only_that_field() {
+        let (before, after) = click_window_row("Close to tray");
+        assert!(
+            !before.window.close_to_tray,
+            "precondition: close-to-tray ships OFF"
+        );
+        assert!(
+            after.window.close_to_tray,
+            "clicking the row must opt the LIVE config in"
+        );
+        // Its two neighbours in the same group must be untouched — a click that
+        // flipped the wrong `&mut` would otherwise pass a single-field check.
+        assert_eq!(
+            after.window.minimize_to_tray,
+            before.window.minimize_to_tray
+        );
+        assert_eq!(
+            after.window.warn_on_close_running,
+            before.window.warn_on_close_running
+        );
+    }
+
+    #[test]
+    fn clicking_minimize_to_tray_flips_only_that_field() {
+        let (before, after) = click_window_row("Minimize to tray");
+        assert!(!before.window.minimize_to_tray);
+        assert!(
+            after.window.minimize_to_tray,
+            "clicking the row must opt the LIVE config in"
+        );
+        assert_eq!(after.window.close_to_tray, before.window.close_to_tray);
+        assert_eq!(
+            after.window.warn_on_close_running,
+            before.window.warn_on_close_running
+        );
+    }
+
+    #[test]
+    fn clicking_the_running_command_warning_flips_only_that_field() {
+        let (before, after) = click_window_row("Warn if a command is still running");
+        assert!(
+            before.window.warn_on_close_running,
+            "precondition: the warning ships ON"
+        );
+        assert!(
+            !after.window.warn_on_close_running,
+            "clicking the row must opt the LIVE config OUT"
+        );
+        assert_eq!(after.window.close_to_tray, before.window.close_to_tray);
+        assert_eq!(
+            after.window.minimize_to_tray,
+            before.window.minimize_to_tray
+        );
+    }
+
+    #[test]
+    fn the_new_window_rows_are_reachable_by_search() {
+        // Asserted against the PRODUCTION consts the render path uses — an inline
+        // copy of the keyword list would keep passing after the real list was
+        // emptied or typo'd, which is exactly the row-you-cannot-find failure
+        // this test exists to catch.
+        //
+        // Each row's keyword string must contain the terms a user would type.
+        for term in ["tray", "close", "notification"] {
+            assert!(
+                row_visible(term, CLOSE_TO_TRAY_LABEL),
+                "close-to-tray row must be findable by {term:?}"
+            );
+        }
+        for term in ["tray", "minimize", "taskbar"] {
+            assert!(
+                row_visible(term, MINIMIZE_TO_TRAY_LABEL),
+                "minimize-to-tray row must be findable by {term:?}"
+            );
+        }
+        for term in ["running", "warn", "confirm"] {
+            assert!(
+                row_visible(term, WARN_RUNNING_LABEL),
+                "running-command warning row must be findable by {term:?}"
+            );
+        }
+
+        // ...and the Window SECTION must surface for those same terms in a
+        // cross-category search from another tab. A row whose keyword matches
+        // inside a section whose list does NOT is unreachable from the search
+        // box: the section never renders, so the row never gets the chance.
+        for term in ["tray", "notification", "taskbar", "confirm"] {
+            assert!(
+                section_visible("Appearance", term, "Window", WINDOW_SEARCH_LABELS),
+                "the Window section must surface for a cross-category {term:?} search"
+            );
+        }
+
+        // The section list must literally carry each row's keyword string, so
+        // the two can never drift apart.
+        for label in [
+            CLOSE_TO_TRAY_LABEL,
+            MINIMIZE_TO_TRAY_LABEL,
+            WARN_RUNNING_LABEL,
+        ] {
+            assert!(
+                WINDOW_SEARCH_LABELS.contains(&label),
+                "WINDOW_SEARCH_LABELS is missing the row keyword {label:?}"
+            );
         }
     }
 
@@ -3673,16 +4184,6 @@ mod tests {
         // matching row. The row labels ARE the search labels by construction.
         assert!(MOTION_SEARCH_LABELS.contains(&"chromatic aberration"));
         assert!(MOTION_SEARCH_LABELS.contains(&"cursor trail"));
-    }
-
-    #[test]
-    fn update_channels_include_the_default_channel() {
-        // The channel combo must offer the default channel, or selecting it back
-        // would be impossible.
-        assert!(
-            UPDATE_CHANNELS.contains(&Config::default().update.channel.as_str()),
-            "the default update channel must be one of the offered choices"
-        );
     }
 
     #[test]

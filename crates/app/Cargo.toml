@@ -25,7 +25,6 @@ path = "src/lib.rs"
 
 # The modern eframe/egui chrome shell — the canonical C0PL4ND app. It draws each
 # pane's terminal grid with egui's native coloured-text painter.
-# See `.s4f3-data/recon-c0pl4nd-egui-modernization.md`.
 [[bin]]
 name = "c0pl4nd"
 path = "src/egui_main.rs"
@@ -125,6 +124,17 @@ rfd = { version = "=0.16.0", default-features = false, features = ["xdg-portal",
 # grid-snapshot + paste/scroll allocation churn. Set as `#[global_allocator]` in
 # both binary roots. Pure-Rust-friendly vendored C, no runtime deps.
 mimalloc = "=0.1.52"
+# System-clipboard READ for OSC 52 clipboard queries (`crate::clipboard_read`).
+# egui exposes clipboard WRITES (`Context::copy_text`) but no read API — a paste
+# can only arrive as an OS-delivered `Event::Paste`, which needs a user
+# keystroke an OSC 52 query does not have. Already in the lock graph at this
+# exact version (egui-winit uses it for the write side), so no new
+# supply-chain surface. Exact-pinned per dependency-management.md. MIT/Apache-2.0.
+arboard = "=3.6.1"
+# Wipe the clipboard plaintext an OSC 52 read pulls (routinely a password or
+# token) from its allocation on drop, matching the write path's `ClipboardWrite`
+# discipline in core. Same exact version core pins; already in the lock graph.
+zeroize = "=1.9.0"
 
 [dev-dependencies]
 # Headless egui UI tests (kittest = AccessKit-driven). State-assertion tests run
@@ -137,10 +147,20 @@ egui_kittest = { version = "0.34", features = ["wgpu", "snapshot", "eframe"] }
 # dir — so it is available to the round-trip tests without a dev-dep entry.
 minisign = "0.9"
 
-# Proves every BUNDLED font face actually parses with the SAME glyph crate epaint
+# Proves every BUNDLED font face actually parses with the glyph crate epaint
 # uses (already in the lock graph transitively via epaint), so a bad/variable face
 # can never panic epaint's atlas build when the user selects it. VERIFY-only in a
 # test; the app never imports it directly. Pinned to the version epaint pulls.
+#
+# epaint 0.34 parses fonts with SKRIFA, not ab_glyph: `epaint::text::font::
+# FontFace::new` calls `skrifa::FontRef::from_index(bytes, index)?` and
+# `epaint::text::fonts` turns that error into
+# `panic!("Error parsing {name:?} TTF/OTF font file: {err}")`. A test that parsed
+# with ab_glyph was therefore checking a parser this app's render path never
+# runs, so it could not catch its own target class. `ab_glyph` is kept ONLY as
+# the negative control that proves the two parsers really do disagree (see
+# `a_face_skrifa_accepts_can_still_be_rejected_by_ab_glyph` in fonts.rs).
+skrifa = "=0.40.0"
 ab_glyph = "=0.2.32"
 
 # Round-trip test for the persisted layout snapshot. eframe serializes its
@@ -158,13 +178,35 @@ winresource = "=0.1.31"
 # D4 (Windows-only): Win32 custom-frame Aero Snap on the frameless window.
 # Used solely by the `#[cfg(windows)]` `win_snap` module; not linked elsewhere.
 [target.'cfg(windows)'.dependencies]
+# System-tray icon (Windows). `tray-icon` posts click/menu events that are
+# pumped through winit's existing message loop and delivered to a global handler
+# on the event-loop thread (so a tray click restores the window even while it is
+# minimized/hidden and egui has stopped repainting). `muda` is its context-menu
+# backend, re-exported by tray-icon as `tray_icon::menu` — pinned to the SAME
+# exact version tray-icon resolves so the two see one identical `Menu` type.
+# `default-features = false` drops the Linux gtk/libxdo backends; Windows uses
+# the modern `common-controls-v6` menu backend. Exact-pinned per
+# dependency-management.md (production). MIT/Apache-2.0, actively maintained
+# (tao/wry ecosystem, 20M+ downloads).
+tray-icon = { version = "=0.24.1", default-features = false, features = ["common-controls-v6"] }
+muda = { version = "=0.19.3", default-features = false, features = ["common-controls-v6"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_System_LibraryLoader", # SetDefaultDllDirectories / SetDllDirectoryW — DLL-planting defence
+    "Win32_System_DataExchange",  # COPYDATASTRUCT — the single-instance argv forward (WM_COPYDATA)
     "Win32_System_JobObjects",    # KILL_ON_JOB_CLOSE — kill every PTY child on app exit (no orphans)
     "Win32_System_Threading",     # OpenProcess — resolve a child PID to a handle to assign to the job
-    "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse", # TrackMouseEvent — WM_NCMOUSELEAVE hover tracking for the Snap-Layouts caption subclass
+    "Win32_UI_Shell",             # SetWindowSubclass / DefSubclassProc — the additive win_chrome caption subclass
     "Win32_UI_WindowsAndMessaging",
+    # --- WinRT (not Win32) namespaces for the OSC 9 / OSC 777 desktop toast ---
+    # `crate::notify` builds a ToastGeneric document and hands it to the shell.
+    # These project SAFE Rust (they return windows::core::Result), so they add
+    # no `unsafe` beyond the one Win32 AUMID setter, which uses the
+    # already-enabled Win32_UI_Shell above. Same crate, same pinned 0.62 -- no
+    # new dependency, only additional generated bindings.
+    "Data_Xml_Dom",     # XmlDocument -- parses the toast payload
+    "UI_Notifications", # ToastNotificationManager / ToastNotification
 ] }

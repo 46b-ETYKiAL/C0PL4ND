@@ -1,4 +1,16 @@
-# Pinned toolchain for reproducible builds across local dev + CI.
+# Default toolchain for local dev + CI. Note `channel = "stable"` FLOATS — this
+# tracks whatever stable is current, it does not pin an exact version.
+#
+# MSRV implication: this file is a rustup DIRECTORY OVERRIDE, so it outranks
+# rustup's default toolchain in every process whose cwd is this repo. That is
+# why the `msrv` job in .github/workflows/ci.yml must set RUSTUP_TOOLCHAIN (env
+# outranks this file) rather than just `rustup default` the MSRV — otherwise the
+# MSRV check silently runs on the channel below and can never fail.
+#
+# The workspace floor (Cargo.toml `rust-version`) is currently 1.95, which is
+# also what stable resolves to today — so this file and the MSRV job happen to
+# agree right now. They are still independent knobs: when stable moves to 1.96
+# this keeps floating, while the MSRV job stays pinned at the declared floor.
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]

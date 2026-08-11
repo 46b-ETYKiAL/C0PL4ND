@@ -1,0 +1,143 @@
+name: Release drift check
+
+# Catches the "version bumped in source but never released" gap.
+#
+# Scope, stated precisely so this job is not mistaken for more than it is: it
+# gates ONE direction — source AHEAD of the newest published release with no tag
+# cut for it. The opposite skew (source BEHIND the latest release, e.g. an
+# out-of-band hotfix) is reported and deliberately NOT failed, and whether a cut
+# release actually published correctly is owned by release.yml +
+# post-release-verify.yml, not here.
+#
+# Before this job C0PL4ND had NO
+# drift check at all: `release.yml` is tag-gated, so a `[workspace.package]`
+# version bump that never got a tag simply meant release.yml never ran. Nothing
+# went red, no release appeared, and the in-app updater correctly reported every
+# user as "current" — because there was genuinely no newer release to offer. The
+# gap was silent in both directions and could only be noticed by a human
+# comparing Cargo.toml against the Releases page.
+#
+# Ported from the sibling editor SCR1B3, which has carried this job since its own
+# v0.4.36/v0.4.37 incident. Adapted to C0PL4ND's conventions: the repo's existing
+# harden-runner + actions/checkout SHA pins, and the workspace version read from
+# `[workspace.package]` (C0PL4ND is a 3-crate workspace; the member crates all
+# inherit `version.workspace = true`, so the workspace value IS the shipped one).
+#
+# This job FAILS (loud, persistent red on master) whenever the workspace version
+# is AHEAD of the latest published release with no tag cut for it. To clear it:
+# cut the release (`git tag vX.Y.Z && git push origin vX.Y.Z`, which triggers
+# release.yml). It publishes NOTHING itself — releasing stays a deliberate,
+# human-triggered step; this only makes the gap impossible to miss.
+
+on:
+  push:
+    branches: [master]
+  schedule:
+    - cron: "0 12 * * *" # daily safety net even with no pushes
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: source version vs latest published release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner (egress audit)
+        # step-security/harden-runner@v2.19.4
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        # actions/checkout@v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Compare workspace version to latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The workspace version is the first top-level `version = "..."` line
+          # (it lives under [workspace.package]; the member crates inherit it).
+          #
+          # The `|| true` is load-bearing, not defensive noise. Under
+          # `set -euo pipefail`, a `grep` that matches nothing exits 1, pipefail
+          # propagates that through the pipeline, and the failing command
+          # substitution kills the script on the assignment itself — BEFORE the
+          # `-z` guard below can run. Falsified: with a Cargo.toml carrying no
+          # version line, this step exited 1 having printed absolutely nothing,
+          # so the guard was unreachable code and the failure had no diagnosis
+          # at all. Swallowing the pipeline status here is what makes the
+          # explicit `::error::` below reachable.
+          src="$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+          if [ -z "$src" ]; then
+            echo "::error::could not read the workspace version from Cargo.toml (no top-level 'version = \"...\"' line under [workspace.package])"
+            exit 1
+          fi
+          # "No releases exist" and "we could not ASK about releases" must not be
+          # the same branch. The previous shape — `gh release view … 2>/dev/null
+          # || true` feeding a `[ -z "$latest" ]` vacuous pass — collapsed EVERY
+          # failure mode (auth expiry, rate limit, network blip, egress policy,
+          # gh absent from the image, broken remote resolution) into "nothing to
+          # compare against, exit 0". Because this job runs on cron and on every
+          # master push, a persistent auth fault would have made it silently
+          # inert forever while still logging a green premise that was false —
+          # the exact "a gate you never run is indistinguishable from a gate that
+          # passes" shape this job exists to prevent. It also disagreed with the
+          # tag probe below, which already fails closed on an API error.
+          #
+          # So: probe reachability with `gh release list` and read its STATUS
+          # separately from its output. A non-zero status is a loud red; only a
+          # successful query that returns nothing is the genuine no-releases case.
+          gh_err="$(mktemp)"
+          if ! releases="$(gh release list --limit 1 2>"$gh_err")"; then
+            echo "::error::could not query the release list, so drift cannot be evaluated and must NOT pass vacuously (auth, rate limit, egress policy, or gh itself). gh said: $(tr '\n' ' ' <"$gh_err")"
+            rm -f "$gh_err"
+            exit 1
+          fi
+          if [ -z "$(printf '%s' "$releases" | tr -d '[:space:]')" ]; then
+            rm -f "$gh_err"
+            echo "source=v$src  latest_published_release=<none>"
+            echo "::warning::no published releases yet — nothing to compare against."
+            exit 0
+          fi
+          if ! latest_tag="$(gh release view --json tagName -q .tagName 2>"$gh_err")"; then
+            echo "::error::the release list is non-empty but the latest release could not be read, so drift cannot be evaluated and must NOT pass vacuously. gh said: $(tr '\n' ' ' <"$gh_err")"
+            rm -f "$gh_err"
+            exit 1
+          fi
+          rm -f "$gh_err"
+          latest="${latest_tag#v}"
+          if [ -z "$latest" ]; then
+            echo "::error::the latest release was read but carries an empty tag name; drift cannot be evaluated."
+            exit 1
+          fi
+          echo "source=v$src  latest_published_release=v$latest"
+
+          if [ "$src" = "$latest" ]; then
+            echo "In sync: source v$src matches the latest published release."
+            exit 0
+          fi
+          # Determine which is higher with semver-aware sort.
+          highest="$(printf '%s\n%s\n' "$src" "$latest" | sort -V | tail -1)"
+          if [ "$highest" = "$src" ]; then
+            # A tag `v$src` means the release WAS cut — it may still be building /
+            # publishing (release.yml runs well AFTER the merge-push that fires
+            # this check, so on every release this job briefly sees the source
+            # ahead of the not-yet-published release). That is an in-flight
+            # release, not a bump-without-release drift; whether it publishes
+            # correctly is owned by release.yml + the post-release-verify tripwire.
+            if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v$src" >/dev/null 2>&1; then
+              echo "::notice::Cargo.toml is at v$src and tag v$src exists — the release is cut (publishing or published). Not a bump-without-release drift."
+              exit 0
+            fi
+            echo "::error::Cargo.toml is at v$src but the newest published release is v$latest AND no tag v$src exists. A release was never cut, so the in-app updater will report users as 'current' on the older build. Cut it: 'git tag v$src && git push origin v$src' (triggers release.yml)."
+            exit 1
+          fi
+          # Source is BEHIND the latest release (e.g. a hotfix released out of band) — not a drift we gate on.
+          echo "Source v$src is behind the latest release v$latest; not a bump-without-release gap."

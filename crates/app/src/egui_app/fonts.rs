@@ -80,9 +80,16 @@ macro_rules! bundled {
 /// Display / variable faces (Wallpoet, Michroma, Zen Dots, and the variable-axis
 /// files Doto / Red Hat Mono / Teko / Saira / Spline Sans Mono) are NOT monospace,
 /// which is fine for an opt-in terminal font CHOICE — the built-in monospace stays
-/// the default. egui 0.34's `ab_glyph` backend has no variable-axis selection, so a
-/// variable `.ttf` loads its DEFAULT named instance (identical to how SCR1B3 embeds
-/// them) — no special handling needed, none skipped.
+/// the default.
+///
+/// A variable `.ttf` here loads its DEFAULT instance (identical to how SCR1B3
+/// embeds them) — no special handling needed, none skipped. That is this app's
+/// CHOICE, not a backend limitation: epaint 0.34 rasterises through `skrifa`
+/// (not `ab_glyph`) and DOES expose variable-axis selection — it resolves a
+/// `skrifa` `Location` from `FontTweak::coords` chained with the per-`TextFormat`
+/// coords. This app sets neither, so every axis stays at its default coordinate.
+/// Wiring a weight/width axis would mean populating `FontTweak::coords` on the
+/// registered face; nothing in the backend prevents it.
 pub const BUNDLED_FONTS: &[BundledFont] = &[
     // Monospace coding faces.
     bundled!(
@@ -355,6 +362,65 @@ pub fn is_builtin_family(family: &str) -> bool {
 /// gracefully). Prefers a non-italic, ~regular-weight face so the grid renders
 /// upright text; falls back to the first match if no plain face exists.
 pub fn face_bytes_for_family(db: &fontdb::Database, family: &str) -> Option<(Vec<u8>, u32)> {
+    face_bytes_for_weight(db, family, REGULAR_WEIGHT)
+}
+
+/// The OpenType weight class of a normal face — the target [`face_bytes_for_weight`]
+/// scores against for the body text of the grid.
+const REGULAR_WEIGHT: u16 = 400;
+
+/// The OpenType weight class of a bold face (SGR `1`).
+const BOLD_WEIGHT: u16 = 700;
+
+/// The lowest weight class that still counts as a GENUINE bold cut. A family
+/// whose heaviest installed face is lighter than this has no bold at all, so the
+/// renderer must fall back to faux-bold rather than silently drawing SGR-1 text
+/// in the regular weight (which is what "no bold face is loaded" looked like).
+const MIN_BOLD_WEIGHT: u16 = 600;
+
+/// The synthetic egui family name the BOLD monospace face is registered under.
+/// A distinct family (rather than a weight on `FontFamily::Monospace`) is the
+/// only way to reach a second face in egui, whose `FontId` selects a family, not
+/// a weight.
+pub const BOLD_MONOSPACE_FAMILY: &str = "c0pl4nd-mono-bold";
+
+/// The egui font family the renderer uses for SGR-1 (bold) cells.
+///
+/// [`build_font_definitions`] always registers this family, so a `FontId` built
+/// from it is always resolvable: it holds the real bold faces when the machine
+/// has any, and otherwise mirrors the regular monospace stack (in which case
+/// [`bold_face_available`] reports `false` and the renderer applies faux-bold).
+pub fn bold_monospace_family() -> egui::FontFamily {
+    egui::FontFamily::Name(BOLD_MONOSPACE_FAMILY.into())
+}
+
+/// Whether the last [`build_font_definitions`] call found a GENUINE bold face.
+///
+/// When this is `false` the bold family is just the regular stack, so bold text
+/// would be indistinguishable from plain text — the renderer compensates by
+/// double-striking the glyph at a sub-pixel offset (faux bold). Stored as a
+/// process-global because the font stack is process-global: the renderer needs
+/// the answer per-glyph, deep inside the paint loop, where threading a font-load
+/// result through every call would add a parameter to the whole render path for
+/// a value that can only change when the fonts are re-installed.
+pub fn bold_face_available() -> bool {
+    BOLD_FACE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static BOLD_FACE_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Read the raw bytes of the face of `family` closest to `want_weight`.
+///
+/// Generalises [`face_bytes_for_family`] (which targets the regular weight) so
+/// the same matching logic serves the BOLD lookup — one implementation, so the
+/// upright preference and the `.ttc` face-index handling can never drift between
+/// the two weights. Returns the file bytes and the face's index WITHIN that file.
+pub fn face_bytes_for_weight(
+    db: &fontdb::Database,
+    family: &str,
+    want_weight: u16,
+) -> Option<(Vec<u8>, u32)> {
     let want = family.trim().to_lowercase();
     if want.is_empty() {
         return None;
@@ -365,18 +431,26 @@ pub fn face_bytes_for_family(db: &fontdb::Database, family: &str) -> Option<(Vec
             .map(|(name, _)| name.to_lowercase() == want)
             .unwrap_or(false)
     });
-    // Prefer an upright, regular-weight face; otherwise take whatever matched.
+    // Prefer an upright face at the wanted weight; otherwise take whatever matched.
     let mut best: Option<(&fontdb::FaceInfo, i32)> = None;
     for f in matches {
         let upright = matches!(f.style, fontdb::Style::Normal);
-        // Distance from the regular weight (400); smaller is better.
-        let weight_dist = (f.weight.0 as i32 - 400).abs();
+        // Distance from the wanted weight; smaller is better.
+        let weight_dist = (f.weight.0 as i32 - want_weight as i32).abs();
         let score = if upright { 0 } else { 10_000 } + weight_dist;
         if best.as_ref().map(|(_, s)| score < *s).unwrap_or(true) {
             best = Some((f, score));
         }
     }
-    let id = best?.0.id;
+    let best = best?;
+    // A bold REQUEST that only matched a light face is not a bold face. Reject it
+    // so the caller can fall back to faux-bold instead of registering the regular
+    // cut under the bold family (which renders SGR-1 identically to plain text —
+    // the bug this lookup exists to fix).
+    if want_weight >= MIN_BOLD_WEIGHT && best.0.weight.0 < MIN_BOLD_WEIGHT {
+        return None;
+    }
+    let id = best.0.id;
     // Return the raw file bytes AND the face's index WITHIN that file. Many
     // Windows system fonts (MS Gothic, Malgun Gothic, …) are TrueType Collections
     // (.ttc) holding multiple faces; `with_face_data` yields the whole-file bytes
@@ -532,7 +606,60 @@ pub fn build_font_definitions(
             mono.insert(0, key.clone());
         }
     }
+
+    // --- BOLD face (SGR `1`) ---------------------------------------------
+    // egui's `FontId` selects a FAMILY, not a weight, so the only way to reach a
+    // second (bold) cut is to register it under its own synthetic family. Without
+    // this the grid loaded no bold face at all and SGR-1 text drew identically to
+    // plain text — the "some text is more coloured / heavier in Windows Terminal"
+    // half of the reported gap.
+    let mut bold_keys: Vec<String> = Vec::new();
+    for name in &wanted {
+        if let Some((bytes, index)) = face_bytes_for_weight(db, name, BOLD_WEIGHT) {
+            let key = bold_font_data_key(name);
+            let mut face = egui::FontData::from_owned(bytes);
+            face.index = index;
+            base.font_data.insert(key.clone(), face.into());
+            bold_keys.push(key);
+            tracing::debug!(font = %name, index, "loaded bold monospace font face");
+        } else {
+            tracing::debug!(
+                font = %name,
+                "no bold cut installed for this family; bold cells fall back to faux-bold"
+            );
+        }
+    }
+    let bold_found = !bold_keys.is_empty();
+    BOLD_FACE_AVAILABLE.store(bold_found, std::sync::atomic::Ordering::Relaxed);
+
+    // The bold family is ALWAYS registered, so a `FontId` naming it always
+    // resolves. Real bold cuts come first; the whole regular monospace stack
+    // follows as the fallback chain, which keeps glyph COVERAGE identical to the
+    // regular family (a bold cut missing a CJK glyph still resolves it via the
+    // OS CJK fallback rather than drawing tofu). When no bold cut was found the
+    // family is exactly the regular stack and `bold_face_available()` is false,
+    // which is the renderer's signal to faux-bold instead.
+    let mono_chain = base
+        .families
+        .get(&egui::FontFamily::Monospace)
+        .cloned()
+        .unwrap_or_default();
+    let mut bold_chain = bold_keys;
+    for key in mono_chain {
+        if !bold_chain.contains(&key) {
+            bold_chain.push(key);
+        }
+    }
+    base.families.insert(bold_monospace_family(), bold_chain);
+
     (base, loaded_any)
+}
+
+/// The egui `font_data` key for a family's BOLD face. Distinct from
+/// [`font_data_key`] so a family's regular and bold cuts never collide on one
+/// key (which would silently overwrite one with the other).
+fn bold_font_data_key(family: &str) -> String {
+    format!("c0pl4nd-user-font-bold::{}", family.trim().to_lowercase())
 }
 
 #[cfg(test)]
@@ -752,29 +879,113 @@ mod tests {
         assert_eq!(BUNDLED_JP_FALLBACK_KEY, "c0pl4nd-bundled-jp");
     }
 
+    /// A copy of `src` whose sfnt version tag is clobbered — the corrupted-face
+    /// fixture the parse guards below are calibrated against. `skrifa` reads that
+    /// tag first and rejects the blob outright, which is exactly what makes it a
+    /// usable CONTROL: it proves the assertion can fire, so a green run is
+    /// evidence rather than a vacuous pass.
+    fn with_broken_sfnt_tag(src: &[u8]) -> Vec<u8> {
+        let mut bytes = src.to_vec();
+        bytes[0..4].copy_from_slice(b"XXXX");
+        bytes
+    }
+
     /// Every bundled face — including the 5 VARIABLE fonts (Doto/RedHatMono/Saira/
-    /// SplineSansMono/Teko) and the JP fallback — MUST parse with `ab_glyph`, the
-    /// exact glyph crate epaint builds its atlas with. epaint `panic!`s ("Error
-    /// parsing … font") when a selected family's bytes fail to parse, so a face that
-    /// only *registers* but cannot be parsed would crash the app the moment the user
-    /// picks it — a class the registration-only tests cannot catch. Asserting a
-    /// successful `FontRef` parse here proves that selection path is panic-free.
+    /// SplineSansMono/Teko) and the JP fallback — MUST parse with **`skrifa`**, the
+    /// glyph crate epaint actually builds its atlas with. `epaint::text::font::
+    /// FontFace::new` calls `skrifa::FontRef::from_index(bytes, index)?` — the ONLY
+    /// fallible step in it — and `epaint::text::fonts` turns that error into
+    /// `panic!("Error parsing {name:?} TTF/OTF font file: {err}")`. So a face that
+    /// only *registers* but cannot be parsed crashes the app the moment the user
+    /// picks it, a class the registration-only tests cannot catch.
+    ///
+    /// This test previously parsed with `ab_glyph`, on the stale premise that
+    /// `ab_glyph` was "the exact glyph crate epaint builds its atlas with". epaint
+    /// 0.34 moved to `skrifa` (see its `Cargo.lock` deps: `skrifa`, no `ab_glyph`),
+    /// so the guard was exercising a parser this app's render path never runs — it
+    /// could not catch its own target class. The two parsers provably disagree; see
+    /// [`a_face_skrifa_accepts_can_still_be_rejected_by_ab_glyph`].
     #[test]
-    fn every_bundled_face_parses_with_ab_glyph() {
-        use ab_glyph::FontRef;
+    fn every_bundled_face_parses_with_skrifa() {
+        // CONTROL FIRST: a corrupted face must be REJECTED, or the loop below is
+        // an assertion that cannot fail.
+        let corrupt = with_broken_sfnt_tag(BUNDLED_FONTS[0].bytes);
+        assert!(
+            skrifa::FontRef::from_index(&corrupt, 0).is_err(),
+            "control: a face with a clobbered sfnt tag must be REJECTED by skrifa, \
+             otherwise the per-face assertions below can never fire"
+        );
+
         for bf in BUNDLED_FONTS {
             assert!(
-                FontRef::try_from_slice(bf.bytes).is_ok(),
-                "bundled face {} ({}) must parse with ab_glyph so epaint never \
-                 panics when it is selected",
+                skrifa::FontRef::from_index(bf.bytes, 0).is_ok(),
+                "bundled face {} ({}) must parse with skrifa so epaint never \
+                 panics (\"Error parsing … TTF/OTF font file\") when it is selected",
                 bf.display,
                 bf.key
             );
         }
         assert!(
-            FontRef::try_from_slice(NOTO_SANS_JP_SUBSET).is_ok(),
-            "the bundled JP fallback must parse with ab_glyph"
+            skrifa::FontRef::from_index(NOTO_SANS_JP_SUBSET, 0).is_ok(),
+            "the bundled JP fallback must parse with skrifa"
         );
+    }
+
+    /// Pins WHY the guard above had to change parsers: `ab_glyph` and `skrifa` do
+    /// not agree on what a font is, so an `ab_glyph` verdict carries no information
+    /// about whether epaint will panic.
+    ///
+    /// Both fixtures below are real JetBrains Mono bytes with one targeted
+    /// mutation. `ab_glyph` (ttf-parser) eagerly requires `head`/`hhea`/`maxp` and
+    /// rejects both; `skrifa::FontRef::from_index` only reads the table directory
+    /// and accepts both — and epaint, which uses skrifa, would therefore load them
+    /// without panicking. So the old test could go RED on a face epaint is
+    /// perfectly happy with (a false alarm), which is the same thing as saying its
+    /// GREEN was never evidence about epaint either.
+    ///
+    /// `ab_glyph` stays a dev-dependency purely to hold this control in place; the
+    /// app never parses with it.
+    #[test]
+    fn a_face_skrifa_accepts_can_still_be_rejected_by_ab_glyph() {
+        let base = BUNDLED_FONTS[0].bytes;
+
+        // (1) Rename the `head` table tag in the directory.
+        let mut renamed_head = base.to_vec();
+        let table_count = u16::from_be_bytes([renamed_head[4], renamed_head[5]]) as usize;
+        let mut renamed = false;
+        for i in 0..table_count {
+            let at = 12 + i * 16;
+            if &renamed_head[at..at + 4] == b"head" {
+                renamed_head[at..at + 4].copy_from_slice(b"zzzz");
+                renamed = true;
+            }
+        }
+        assert!(
+            renamed,
+            "fixture setup: the base face must carry a `head` table"
+        );
+
+        // (2) Keep the directory, zero every byte of table DATA.
+        let mut hollow = base.to_vec();
+        for byte in &mut hollow[12 + table_count * 16..] {
+            *byte = 0;
+        }
+
+        for (label, bytes) in [
+            ("head-tag-renamed", &renamed_head),
+            ("body-zeroed", &hollow),
+        ] {
+            assert!(
+                skrifa::FontRef::from_index(bytes, 0).is_ok(),
+                "{label}: skrifa (the parser epaint runs) is expected to ACCEPT this"
+            );
+            assert!(
+                ab_glyph::FontRef::try_from_slice(bytes).is_err(),
+                "{label}: ab_glyph is expected to REJECT this — if it ever agrees \
+                 with skrifa here, this control has stopped proving the two \
+                 parsers diverge and the parser choice above needs re-deriving"
+            );
+        }
     }
 
     #[test]

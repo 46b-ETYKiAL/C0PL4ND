@@ -47,6 +47,56 @@ pub(crate) fn load_config_from(
     }
 }
 
+/// Honour an OS forced-colors / high-contrast request on a freshly loaded
+/// config, returning `true` when the theme was auto-selected.
+///
+/// C0PL4ND ships high-contrast themes but, until this seam existed, never asked
+/// the OS whether the user had turned high contrast ON — so a user running in
+/// High Contrast mode got the ordinary brand theme and had to find the setting
+/// by hand.
+///
+/// The precedence decision itself lives in
+/// [`c0pl4nd_core::forced_colors::auto_theme_override`] as a pure function with
+/// its own tests: **an explicit theme choice always wins**, and auto-selection
+/// only applies when the stored theme is still provably the shipped default.
+/// This seam does nothing but apply that verdict.
+///
+/// The assignment mutates the in-memory config exactly as `follow_os_theme_tick`
+/// does for the dark/light follow, which means it can later be persisted by an
+/// unrelated save. That is deliberate and consistent with the existing
+/// auto-theming behaviour: once written, the value is no longer the default, so
+/// it reads as a deliberate choice and sticks — which is also what makes it
+/// straightforward for the user to override from the theme picker at any time.
+///
+/// `high_contrast` is passed in rather than sampled here. The real caller
+/// ([`super::C0pl4ndApp`]'s window constructor) needs the OS answer for its own
+/// `forced_colors` field as well, so a wrapper that re-sampled internally would
+/// be a second source for one process-cached fact; and taking it as a parameter
+/// is what makes the precedence testable without a machine in High Contrast
+/// mode.
+pub(crate) fn apply_forced_colors_auto_theme_with(
+    config: &mut c0pl4nd_core::Config,
+    high_contrast: bool,
+) -> bool {
+    let shipped_default = c0pl4nd_core::Config::default().theme;
+    match c0pl4nd_core::forced_colors::auto_theme_override(
+        &config.theme,
+        &shipped_default,
+        high_contrast,
+    ) {
+        Some(theme) => {
+            tracing::info!(
+                target: "c0pl4nd::a11y",
+                theme,
+                "OS high contrast is on and no theme was chosen; selecting the accessible theme"
+            );
+            config.theme = theme.to_string();
+            true
+        }
+        None => false,
+    }
+}
+
 /// Load the terminal colour theme named by `config.theme` from the bundled
 /// themes dir (next to the binary or in the source tree during development),
 /// falling back to the built-in Itasha.Corp void theme when the file is absent.

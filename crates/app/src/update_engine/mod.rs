@@ -41,7 +41,7 @@ pub mod verify;
 /// GitHub repo coordinates for the Releases API. Public values, shared by the
 /// in-app [`net`] / [`updater`] modules and the "View all releases" link.
 pub const UPDATE_OWNER: &str = "46b-ETYKiAL";
-pub const UPDATE_REPO: &str = "Itasha.Corp_C0PL4ND";
+pub const UPDATE_REPO: &str = "C0PL4ND";
 
 #[cfg(test)]
 mod tests {
@@ -54,7 +54,7 @@ mod tests {
         // "View all releases" link. A wrong value silently points the updater
         // at the wrong repo, so pin the exact expected strings.
         assert_eq!(UPDATE_OWNER, "46b-ETYKiAL");
-        assert_eq!(UPDATE_REPO, "Itasha.Corp_C0PL4ND");
+        assert_eq!(UPDATE_REPO, "C0PL4ND");
     }
 
     #[test]
@@ -76,7 +76,7 @@ mod tests {
             format!("https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest");
         assert_eq!(
             url,
-            "https://api.github.com/repos/46b-ETYKiAL/Itasha.Corp_C0PL4ND/releases/latest"
+            "https://api.github.com/repos/46b-ETYKiAL/C0PL4ND/releases/latest"
         );
     }
 }

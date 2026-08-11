@@ -5,6 +5,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub mod keybindings;
+
+pub use keybindings::{action_label, canonical_key_token, Chord, KeybindingIssue, Keybindings};
+
 /// A configuration load error with enough context to point the user at the
 /// offending line — never a bare panic on a malformed file.
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +38,27 @@ pub enum ConfigError {
     #[error("config validation error: {0}")]
     Invalid(String),
 }
+
+/// What a [`Config::save_to_reporting`] write did to the file that was already
+/// on disk. Purely informational — the write itself already succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveOutcome {
+    /// No file existed; the config was written fresh.
+    Created,
+    /// An existing, parseable file was MERGED into: every key this build has no
+    /// field for (e.g. a key written by a NEWER build) survived verbatim.
+    Merged,
+    /// The existing file could not be parsed as TOML at all (or the merged
+    /// document could not be re-emitted losslessly), so it was renamed aside to
+    /// the returned path BEFORE the new body was written. Nothing was
+    /// destroyed; the caller SHOULD tell the user where the backup went.
+    Quarantined(PathBuf),
+}
+
+/// Suffix appended to a config file that had to be set aside before a write.
+/// Keep-one-prior, matching the update engine's backup discipline: a second
+/// quarantine in the same install replaces the first.
+pub const CONFIG_BACKUP_SUFFIX: &str = ".bak";
 
 /// Font configuration: the primary family, size, line height, and glyph
 /// fallback chain.
@@ -175,167 +200,6 @@ pub enum PanelSide {
     Right,
 }
 
-/// User-rebindable key bindings (action name -> key combo string).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Keybindings {
-    /// Copy the selection to the clipboard.
-    pub copy: String,
-    /// Paste from the clipboard.
-    pub paste: String,
-    /// Open a new tab.
-    pub new_tab: String,
-    /// Close the current tab.
-    pub close_tab: String,
-    /// Switch to the next tab.
-    pub next_tab: String,
-    /// Split the focused pane to the right.
-    pub split_right: String,
-    /// Split the focused pane downward.
-    pub split_down: String,
-    /// Open the in-buffer find / search overlay.
-    pub search: String,
-    /// Open the command palette.
-    pub command_palette: String,
-    /// Toggle the command-history quick-run sidebar (`#21`).
-    pub history_sidebar: String,
-    /// Increase the font size.
-    pub increase_font: String,
-    /// Decrease the font size.
-    pub decrease_font: String,
-}
-
-impl Default for Keybindings {
-    fn default() -> Self {
-        // Platform-sensible defaults; the modifier is Ctrl+Shift on Win/Linux,
-        // Cmd on macOS (the UI layer maps "mod" to the platform modifier).
-        Keybindings {
-            copy: "mod+shift+c".into(),
-            paste: "mod+shift+v".into(),
-            new_tab: "mod+shift+t".into(),
-            close_tab: "mod+shift+w".into(),
-            next_tab: "mod+shift+]".into(),
-            split_right: "mod+shift+d".into(),
-            split_down: "mod+shift+e".into(),
-            search: "mod+shift+f".into(),
-            command_palette: "mod+shift+p".into(),
-            history_sidebar: "mod+shift+h".into(),
-            increase_font: "mod+plus".into(),
-            decrease_font: "mod+minus".into(),
-        }
-    }
-}
-
-/// A problem found in a [`Keybindings`] set by [`Keybindings::validate`] (F5-1).
-///
-/// The bindings are user-editable, so two actions can end up bound to the SAME
-/// combo (only one would ever fire) or a binding can be left blank (the action
-/// becomes unreachable) — both silently, with no surfacing. `validate` makes
-/// these explicit so the settings UI can warn instead of the user wondering why
-/// a shortcut "does nothing".
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KeybindingIssue {
-    /// `action` has an empty / whitespace-only combo — it can never trigger.
-    Empty { action: &'static str },
-    /// `actions` (≥2) are all bound to the same `combo` (normalized) — they
-    /// collide; at most one can win.
-    Conflict {
-        combo: String,
-        actions: Vec<&'static str>,
-    },
-}
-
-impl KeybindingIssue {
-    /// A human-readable, settings-surfaceable description of the issue.
-    pub fn message(&self) -> String {
-        match self {
-            KeybindingIssue::Empty { action } => {
-                format!("'{action}' has no key bound — it cannot be triggered")
-            }
-            KeybindingIssue::Conflict { combo, actions } => {
-                format!(
-                    "'{combo}' is bound to multiple actions: {}",
-                    actions.join(", ")
-                )
-            }
-        }
-    }
-}
-
-impl Keybindings {
-    /// Every (action-name, combo) pair, in a stable declaration order. The
-    /// single source of truth both [`Keybindings::validate`] and any UI iteration
-    /// key off, so a new binding is covered by adding ONE line here.
-    pub fn entries(&self) -> [(&'static str, &str); 12] {
-        [
-            ("copy", &self.copy),
-            ("paste", &self.paste),
-            ("new_tab", &self.new_tab),
-            ("close_tab", &self.close_tab),
-            ("next_tab", &self.next_tab),
-            ("split_right", &self.split_right),
-            ("split_down", &self.split_down),
-            ("search", &self.search),
-            ("command_palette", &self.command_palette),
-            ("history_sidebar", &self.history_sidebar),
-            ("increase_font", &self.increase_font),
-            ("decrease_font", &self.decrease_font),
-        ]
-    }
-
-    /// Canonical form of a combo for conflict comparison: lowercased, trimmed,
-    /// split on `+`, empties dropped, tokens sorted — so `"shift+mod+c"` and
-    /// `"mod+shift+c"` compare equal. An all-empty combo normalizes to `""`.
-    fn normalize_combo(combo: &str) -> String {
-        let mut parts: Vec<String> = combo
-            .split('+')
-            .map(|p| p.trim().to_ascii_lowercase())
-            .filter(|p| !p.is_empty())
-            .collect();
-        parts.sort();
-        parts.join("+")
-    }
-
-    /// Detect keybinding issues: blank bindings (unreachable actions) and combos
-    /// bound to more than one action (collisions). Returns an empty Vec when the
-    /// set is clean — the default set is clean by construction. Pure + order-
-    /// deterministic (empties first in declaration order, then conflicts sorted
-    /// by combo) so the settings surfacing is stable frame-to-frame.
-    pub fn validate(&self) -> Vec<KeybindingIssue> {
-        let entries = self.entries();
-        let mut issues = Vec::new();
-
-        // Blank bindings: an action with no resolvable combo can never fire.
-        for (name, combo) in entries.iter() {
-            if Self::normalize_combo(combo).is_empty() {
-                issues.push(KeybindingIssue::Empty { action: name });
-            }
-        }
-
-        // Collisions: group non-empty bindings by their normalized combo.
-        let mut groups: Vec<(String, Vec<&'static str>)> = Vec::new();
-        for (name, combo) in entries.iter() {
-            let norm = Self::normalize_combo(combo);
-            if norm.is_empty() {
-                continue;
-            }
-            if let Some(slot) = groups.iter_mut().find(|(c, _)| *c == norm) {
-                slot.1.push(name);
-            } else {
-                groups.push((norm, vec![name]));
-            }
-        }
-        groups.sort_by(|a, b| a.0.cmp(&b.0));
-        for (combo, actions) in groups {
-            if actions.len() > 1 {
-                issues.push(KeybindingIssue::Conflict { combo, actions });
-            }
-        }
-
-        issues
-    }
-}
-
 /// The shape of the text cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -390,6 +254,25 @@ pub struct WindowConfig {
     /// is only restored when that monitor is still connected (multi-monitor
     /// safety). Matched against `MonitorHandle::name()` at restore time.
     pub monitor: Option<String>,
+    /// Closing the window (caption ✕ / Alt+F4 / taskbar Close) hides it to the
+    /// system tray instead of quitting. OFF by default: the ✕ meaning "quit" is
+    /// the platform expectation, and a user who has never seen the tray icon
+    /// would otherwise think the app vanished while its shells kept running.
+    /// Honoured only when a tray icon actually exists — see
+    /// [`WindowConfig::close_action`].
+    pub close_to_tray: bool,
+    /// Minimizing the window hides it to the system tray instead of leaving it
+    /// on the taskbar. OFF by default, same reasoning as
+    /// [`close_to_tray`](Self::close_to_tray). Honoured only when a tray icon
+    /// actually exists — see [`WindowConfig::minimize_action`].
+    pub minimize_to_tray: bool,
+    /// Ask for confirmation before closing while a shell command is still
+    /// running. ON by default: closing kills every child process outright, so an
+    /// in-flight `cargo build` / `rsync` / migration dies with no prompt — a real
+    /// data-loss surface. The prompt can only fire when the shell reports OSC 133
+    /// command marks, so a shell with no prompt integration never sees it (see
+    /// [`WindowConfig::close_guard`]).
+    pub warn_on_close_running: bool,
 }
 
 impl Default for WindowConfig {
@@ -404,6 +287,93 @@ impl Default for WindowConfig {
             size_h: None,
             maximized: None,
             monitor: None,
+            close_to_tray: false,
+            minimize_to_tray: false,
+            warn_on_close_running: true,
+        }
+    }
+}
+
+/// What a window-close request should actually do — the decision
+/// [`WindowConfig::close_action`] makes for the app's close paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseAction {
+    /// Run the real shutdown (persist config, reap every PTY child) and exit.
+    Exit,
+    /// Keep the process alive and hide the window to the tray instead.
+    HideToTray,
+}
+
+/// What a window-minimize request should actually do — the decision
+/// [`WindowConfig::minimize_action`] makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinimizeAction {
+    /// Ordinary minimize to the taskbar.
+    Minimize,
+    /// Hide the window entirely; the tray icon is the only way back.
+    HideToTray,
+}
+
+/// Whether a close may proceed, or must first confirm with the user — the
+/// decision [`WindowConfig::close_guard`] makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseGuard {
+    /// Nothing is running (or the warning is off): close immediately.
+    Proceed,
+    /// `busy_panes` panes have a command in flight; confirm before killing them.
+    Confirm {
+        /// How many panes report an unfinished command (always `>= 1`).
+        busy_panes: usize,
+    },
+}
+
+impl WindowConfig {
+    /// What a close request should do.
+    ///
+    /// * `tray_available` — whether a tray icon was actually created. The tray
+    ///   build is best-effort (a headless/session-0 shell has none), and hiding
+    ///   to a tray that does not exist would strand the window with no way back
+    ///   and no visible process. So a missing tray always degrades to
+    ///   [`CloseAction::Exit`], never to an unrecoverable hide.
+    /// * `explicit_quit` — the request came from a real "quit" affordance (the
+    ///   tray menu's Quit, a File→Quit item). This ALWAYS exits. Without it,
+    ///   close-to-tray would swallow the tray's own Quit — which posts `WM_CLOSE`
+    ///   into this very path — and the app could never be closed at all.
+    #[must_use]
+    pub fn close_action(&self, tray_available: bool, explicit_quit: bool) -> CloseAction {
+        if !explicit_quit && self.close_to_tray && tray_available {
+            CloseAction::HideToTray
+        } else {
+            CloseAction::Exit
+        }
+    }
+
+    /// What a minimize request should do. `tray_available` degrades a hide to an
+    /// ordinary minimize for the same reason as [`close_action`](Self::close_action):
+    /// never hide a window the user cannot get back.
+    #[must_use]
+    pub fn minimize_action(&self, tray_available: bool) -> MinimizeAction {
+        if self.minimize_to_tray && tray_available {
+            MinimizeAction::HideToTray
+        } else {
+            MinimizeAction::Minimize
+        }
+    }
+
+    /// Whether a close must confirm first, given how many panes have a command
+    /// in flight.
+    ///
+    /// `already_confirmed` is the user's answer to a previous prompt ("Close
+    /// anyway"). It short-circuits to [`CloseGuard::Proceed`] so the second pass
+    /// through the close path cannot re-prompt — without it the confirmation
+    /// would loop forever, since the commands are still running when the user
+    /// says yes.
+    #[must_use]
+    pub fn close_guard(&self, busy_panes: usize, already_confirmed: bool) -> CloseGuard {
+        if already_confirmed || !self.warn_on_close_running || busy_panes == 0 {
+            CloseGuard::Proceed
+        } else {
+            CloseGuard::Confirm { busy_panes }
         }
     }
 }
@@ -842,6 +812,259 @@ impl Default for ToolbarConfig {
     }
 }
 
+/// The default quake-mode drop-down height, as a fraction of the monitor WORK
+/// area (the desktop minus the taskbar). A free function so `#[serde(default =
+/// ...)]` can name it. Half the work area is the conventional drop-down terminal
+/// size (Guake / Windows Terminal quake window).
+fn default_quake_height_fraction() -> f32 {
+    0.5
+}
+
+/// The default quake-mode hotkey combo. Parsed by the app's quake module; the
+/// grammar is `Mod+Mod+Key` (see `QuakeConfig::hotkey`). Inert while
+/// [`QuakeConfig::enabled`] is false (the default), so this string never
+/// registers an OS-level hotkey unless the user opts in.
+fn default_quake_hotkey() -> String {
+    "Ctrl+Shift+Grave".to_string()
+}
+
+/// Quake-mode ("drop-down terminal") configuration: a GLOBAL hotkey that slides
+/// the window in from the top of the monitor under the cursor, takes focus, and
+/// hides it again on the next press.
+///
+/// **Every field is inert until [`enabled`](Self::enabled) is turned on, and
+/// `enabled` defaults to `false`.** A global hotkey is an OS-level privilege — it
+/// is claimed process-wide and denies the combo to every other application — so
+/// it is strictly opt-in, registered only when this flag is set, and
+/// unregistered when the window is destroyed. Additive: an older config with no
+/// `[quake]` table loads with quake mode fully off.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QuakeConfig {
+    /// Master ON/OFF for quake mode. **Default `false`.** While off, NO global
+    /// hotkey is registered at all — the combo stays available to other apps.
+    pub enabled: bool,
+    /// The global hotkey combo, as `Mod+Mod+Key`.
+    ///
+    /// Modifiers (case-insensitive, any order, at least ONE required):
+    /// `Ctrl`/`Control`, `Alt`, `Shift`, `Win`/`Super`/`Meta`. Keys: `A`–`Z`,
+    /// `0`–`9`, `F1`–`F24`, `Grave`/`` ` ``, `Space`, `Tab`, `Esc`, `Enter`.
+    ///
+    /// A combo with no modifier is REJECTED (it would swallow a bare keystroke
+    /// system-wide), as is an unparseable one — in both cases no hotkey is
+    /// registered and quake mode stays inert rather than claiming something
+    /// unintended.
+    pub hotkey: String,
+    /// Drop-down height as a fraction of the monitor WORK area (the desktop minus
+    /// the taskbar), so the window never overlaps the taskbar. Clamped to
+    /// `0.1..=1.0` on use by `effective_height_fraction`, and a non-finite value
+    /// falls back to the default, so a malformed config can never produce a
+    /// zero-height or off-screen window.
+    pub height_fraction: f32,
+}
+
+impl Default for QuakeConfig {
+    /// Quake mode OFF (the opt-in default), the default combo parked but inert,
+    /// and a half-work-area drop-down height.
+    fn default() -> Self {
+        QuakeConfig {
+            enabled: false,
+            hotkey: default_quake_hotkey(),
+            height_fraction: default_quake_height_fraction(),
+        }
+    }
+}
+
+impl QuakeConfig {
+    /// The lowest permitted drop-down height fraction — below this the window
+    /// would be too short to show a usable grid.
+    pub const MIN_HEIGHT_FRACTION: f32 = 0.1;
+    /// The highest permitted drop-down height fraction (the full work area).
+    pub const MAX_HEIGHT_FRACTION: f32 = 1.0;
+
+    /// The height fraction to actually apply: clamped to
+    /// [`MIN_HEIGHT_FRACTION`](Self::MIN_HEIGHT_FRACTION)`..=`[`MAX_HEIGHT_FRACTION`](Self::MAX_HEIGHT_FRACTION)
+    /// and guarded against a non-finite (NaN/inf) value from a malformed config,
+    /// so the drop-down can never be zero-height or taller than the work area.
+    #[must_use]
+    pub fn effective_height_fraction(&self) -> f32 {
+        if self.height_fraction.is_finite() {
+            self.height_fraction
+                .clamp(Self::MIN_HEIGHT_FRACTION, Self::MAX_HEIGHT_FRACTION)
+        } else {
+            default_quake_height_fraction()
+        }
+    }
+
+    /// The parsed [`hotkey`](Self::hotkey), or `None` when it names no combo we
+    /// will register (see [`parse_hotkey`]). The Settings UI calls this to tell
+    /// the user their typed combo is unusable BEFORE they restart into a quake
+    /// mode that silently never arms.
+    #[must_use]
+    pub fn parsed_hotkey(&self) -> Option<HotkeySpec> {
+        parse_hotkey(&self.hotkey)
+    }
+}
+
+/// `MOD_ALT` — the `RegisterHotKey` modifier bit for Alt. Spelled out here (core
+/// is platform-independent and has no `windows` dependency); the app's `quake`
+/// module carries a windows-only drift-guard test asserting each of these equals
+/// the real Win32 constant.
+pub const MOD_ALT_BIT: u32 = 0x0001;
+/// `MOD_CONTROL` — the modifier bit for Ctrl.
+pub const MOD_CONTROL_BIT: u32 = 0x0002;
+/// `MOD_SHIFT` — the modifier bit for Shift.
+pub const MOD_SHIFT_BIT: u32 = 0x0004;
+/// `MOD_WIN` — the modifier bit for the Windows key.
+pub const MOD_WIN_BIT: u32 = 0x0008;
+/// `MOD_NOREPEAT` — suppresses auto-repeat, so HOLDING the combo toggles ONCE
+/// instead of machine-gunning at the keyboard repeat rate. Added at registration
+/// time by [`HotkeySpec::register_modifiers`], never by the parser, so a parsed
+/// spec compares cleanly against the user's combo.
+pub const MOD_NOREPEAT_BIT: u32 = 0x4000;
+
+/// `VK_OEM_3` — the grave/tilde key on a US layout.
+pub const VK_GRAVE: u32 = 0xC0;
+/// `VK_SPACE`.
+pub const VK_SPACE_KEY: u32 = 0x20;
+/// `VK_TAB`.
+pub const VK_TAB_KEY: u32 = 0x09;
+/// `VK_ESCAPE`.
+pub const VK_ESCAPE_KEY: u32 = 0x1B;
+/// `VK_RETURN`.
+pub const VK_RETURN_KEY: u32 = 0x0D;
+/// `VK_F1` — the F-key block is contiguous, so `F<n>` is `VK_F1 + (n - 1)`.
+pub const VK_F1_KEY: u32 = 0x70;
+/// The highest supported function key (`VK_F24` = `VK_F1 + 23`).
+const MAX_FUNCTION_KEY: u32 = 24;
+
+/// A parsed global-hotkey combo: the `RegisterHotKey` modifier bitmask and the
+/// virtual-key code.
+///
+/// Lives in core (not the app's Win32 module) so the Settings UI — which is in
+/// the lib target and cannot reach the shipping binary's `quake` module — can
+/// validate a combo the user types with the SAME parser that registers it. One
+/// implementation, no drift between "the UI says it is valid" and "the hotkey
+/// actually registers".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HotkeySpec {
+    /// The OR of the `MOD_*` bits the user asked for (never includes
+    /// `MOD_NOREPEAT` — see [`register_modifiers`](Self::register_modifiers)).
+    pub modifiers: u32,
+    /// The virtual-key code of the non-modifier key.
+    pub vk: u32,
+}
+
+impl HotkeySpec {
+    /// The modifier bitmask to actually pass to `RegisterHotKey`: the user's
+    /// modifiers plus `MOD_NOREPEAT`, so holding the combo down toggles the window
+    /// exactly once instead of flickering at the key-repeat rate.
+    #[must_use]
+    pub const fn register_modifiers(&self) -> u32 {
+        self.modifiers | MOD_NOREPEAT_BIT
+    }
+}
+
+/// Map one non-modifier token to a virtual-key code, or `None` when it names no
+/// key we support. Accepts `A`–`Z`, `0`–`9`, `` ` ``, `F1`–`F24`, and the named
+/// keys `Grave`/`Tilde`/`Backtick`, `Space`, `Tab`, `Esc`/`Escape`,
+/// `Enter`/`Return`. Case-insensitive.
+#[must_use]
+fn parse_key_token(token: &str) -> Option<u32> {
+    let t = token.trim();
+    if t.is_empty() {
+        return None;
+    }
+    // Single ASCII letter / digit / backtick — the common case. The VK codes for
+    // letters and digits ARE their uppercase-ASCII codes (asserted against the
+    // `windows` crate by the app's drift-guard test).
+    if t.len() == 1 {
+        let c = t.as_bytes()[0];
+        if c.is_ascii_alphabetic() {
+            return Some(u32::from(c.to_ascii_uppercase()));
+        }
+        if c.is_ascii_digit() {
+            return Some(u32::from(c));
+        }
+        if c == b'`' {
+            return Some(VK_GRAVE);
+        }
+    }
+    let lower = t.to_ascii_lowercase();
+    // F1..F24 (the VK block is contiguous). A bare `f` is the LETTER F, handled
+    // by the single-char branch above.
+    if let Some(digits) = lower.strip_prefix('f') {
+        if let Ok(n) = digits.parse::<u32>() {
+            if (1..=MAX_FUNCTION_KEY).contains(&n) {
+                return Some(VK_F1_KEY + (n - 1));
+            }
+            // An out-of-range F-key is a REFUSAL. Belt-and-braces: the name table
+            // below holds no `f<digits>` entry today, so falling through would
+            // also yield `None` — this guards the day one is added. The RANGE
+            // BOUND above is what actually rejects `F0`/`F25` right now, and it
+            // is the thing the wire-cut test pins.
+            return None;
+        }
+    }
+    match lower.as_str() {
+        "grave" | "tilde" | "backtick" => Some(VK_GRAVE),
+        "space" => Some(VK_SPACE_KEY),
+        "tab" => Some(VK_TAB_KEY),
+        "esc" | "escape" => Some(VK_ESCAPE_KEY),
+        "enter" | "return" => Some(VK_RETURN_KEY),
+        _ => None,
+    }
+}
+
+/// Parse a `Mod+Mod+Key` combo string into a [`HotkeySpec`].
+///
+/// Returns `None` — meaning **register nothing, stay inert** — for every input we
+/// cannot honour exactly:
+///
+/// * no modifier (`"F12"`): a bare key would be swallowed system-wide, stealing it
+///   from every other application. Refused by design.
+/// * no key (`"Ctrl+Shift"`), an unknown key name, an empty token (`"Ctrl++"`),
+///   or two non-modifier keys (`"Ctrl+A+B"`).
+///
+/// Modifier names are case-insensitive and order-independent:
+/// `Ctrl`/`Control`, `Alt`, `Shift`, `Win`/`Super`/`Meta`/`Cmd`.
+#[must_use]
+pub fn parse_hotkey(spec: &str) -> Option<HotkeySpec> {
+    let mut modifiers = 0u32;
+    let mut key: Option<u32> = None;
+    for token in spec.split('+') {
+        let t = token.trim();
+        // Belt-and-braces, like the F-key guard below: an empty token would also
+        // be rejected downstream by `parse_key_token`, so removing this line does
+        // not currently change any answer. It stays because rejecting `"Ctrl+"` /
+        // `"Ctrl++Q"` HERE states the grammar rule at the point it is violated,
+        // instead of depending on a sibling function's internal check.
+        if t.is_empty() {
+            return None;
+        }
+        match t.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => modifiers |= MOD_CONTROL_BIT,
+            "alt" => modifiers |= MOD_ALT_BIT,
+            "shift" => modifiers |= MOD_SHIFT_BIT,
+            "win" | "super" | "meta" | "cmd" => modifiers |= MOD_WIN_BIT,
+            _ => {
+                if key.is_some() {
+                    // Two non-modifier keys — ambiguous, refuse rather than guess.
+                    return None;
+                }
+                key = Some(parse_key_token(t)?);
+            }
+        }
+    }
+    let vk = key?;
+    if modifiers == 0 {
+        // A modifier-less global hotkey would steal a bare keystroke from the
+        // whole desktop. Never register one.
+        return None;
+    }
+    Some(HotkeySpec { modifiers, vk })
+}
+
 /// W1TN3SS manual "Report an issue" coordinates: the GitHub `owner/repo` the
 /// prefilled Issue-Form deep link targets, and the support email alias the
 /// `mailto:` fallback addresses. Both have sane C0PL4ND defaults and are
@@ -853,14 +1076,31 @@ pub struct IssueIntakeConfig {
     /// The GitHub `owner/repo` the prefilled Issue-Form deep link targets.
     pub repo: String,
     /// The support email alias the `mailto:` fallback addresses.
+    ///
+    /// **Empty by default, and that default is load-bearing.** This value is
+    /// compiled into every shipped binary of a PUBLIC repository, so a real
+    /// mailbox here is published to everyone who downloads the app (and to every
+    /// address harvester that reads the source). It previously defaulted to a
+    /// maintainer's personal address.
+    ///
+    /// Empty means the app offers the GitHub Issue form + the clipboard
+    /// fallback and simply does not offer the email route — see
+    /// `email_fallback_offered`. An operator who has a real support alias sets
+    /// it in `config.toml`:
+    ///
+    /// ```toml
+    /// [reporting.issue_intake]
+    /// mailto_alias = "support@example.org"
+    /// ```
     pub mailto_alias: String,
 }
 
 impl Default for IssueIntakeConfig {
     fn default() -> Self {
         IssueIntakeConfig {
-            repo: "46b-ETYKiAL/Itasha.Corp_C0PL4ND".to_string(),
-            mailto_alias: "46b.AbandonSomething@proton.me".to_string(),
+            repo: "46b-ETYKiAL/C0PL4ND".to_string(),
+            // No address ships. See the field doc.
+            mailto_alias: String::new(),
         }
     }
 }
@@ -908,6 +1148,21 @@ fn default_tint() -> String {
 /// migration; any other value (a user's custom tint) is preserved verbatim.
 const LEGACY_DEFAULT_TINT: &str = "#121212";
 
+/// The pre-v3 default issue-intake repo, carrying the GitHub repository's FORMER
+/// name (renamed `Itasha.Corp_C0PL4ND` → `C0PL4ND`). A stored config whose
+/// `reporting.issue_intake.repo` is PROVABLY this old default is re-pointed to
+/// the current default by the v2 → v3 migration; any other value (an operator's
+/// own fork coordinates) is preserved verbatim.
+///
+/// This migration is load-bearing rather than cosmetic: every field serializes
+/// (there is no `skip_serializing_if`), and [`Config::save_to`] runs on ordinary
+/// actions such as persisting window geometry — so essentially every existing
+/// user already has the old name written into `config.toml`. Because
+/// `#[serde(default)]` makes a STORED value win over the source default, bumping
+/// the [`IssueIntakeConfig::default`] string alone would never reach them, and
+/// their "Report an issue" link would keep depending on GitHub's rename redirect.
+const LEGACY_ISSUE_INTAKE_REPO: &str = "46b-ETYKiAL/Itasha.Corp_C0PL4ND";
+
 /// Current config schema version. Bumped whenever a one-time, version-gated
 /// migration is needed (see [`Config::migrate`]). A config written before schema
 /// versioning existed deserializes with `schema_version == 0` (the serde default
@@ -920,7 +1175,11 @@ const LEGACY_DEFAULT_TINT: &str = "#121212";
 ///   `schema_version < 2`. (The earlier v1 legacy-transparency promotion was
 ///   retired when the multi-mode transparency model collapsed to the single
 ///   `opacity` model in v0.4.21; its former fields are now ignored on load.)
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+/// - v3 (repository rename): a stored config whose `reporting.issue_intake.repo`
+///   is PROVABLY the old [`LEGACY_ISSUE_INTAKE_REPO`] default is re-pointed to
+///   the renamed repository exactly once. An operator's custom value is left
+///   UNTOUCHED. Gated on `schema_version < 3`.
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Top-level configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1011,6 +1270,13 @@ pub struct Config {
     /// (written before this field) loading cleanly with the flag off.
     #[serde(default)]
     pub always_on_top: bool,
+    /// Quake mode ("drop-down terminal"): a GLOBAL hotkey that drops the window
+    /// in from the top of the monitor under the cursor and hides it again.
+    /// **Default OFF** — see [`QuakeConfig`]; a global hotkey is an OS-level
+    /// privilege and is registered only while `quake.enabled` is true. Additive:
+    /// an older config with no `[quake]` table loads with quake mode off.
+    #[serde(default)]
+    pub quake: QuakeConfig,
     pub cursor: CursorConfig,
     pub window: WindowConfig,
     pub effects: EffectsConfig,
@@ -1078,6 +1344,36 @@ pub struct Config {
     /// such a paste shows a confirm overlay first. A security feature — set
     /// `false` to paste multi-line content without confirmation.
     pub paste_warn_multiline: bool,
+    /// Warn before pasting more than this many BYTES of clipboard text, even
+    /// when it is a single line.
+    ///
+    /// The multi-line gate above catches the classic pastejacking payload (a
+    /// command that runs on its embedded newline), but a SINGLE-line paste of
+    /// tens of kilobytes is the other half of the same footgun: a hidden
+    /// terminal-width-spanning command, a giant base64 blob piped to `sh`, or an
+    /// accidental whole-file paste that floods the PTY. This is the size half of
+    /// the gate. `0` disables it (size is then never a reason to confirm);
+    /// the multi-line gate is independent and unaffected.
+    #[serde(default = "default_paste_warn_bytes")]
+    pub paste_warn_bytes: usize,
+    /// Allow a program running inside the terminal to READ the system clipboard
+    /// via an `OSC 52 ; c ; ?` query. **Default `false` (deny)** — this is the
+    /// security-relevant half of OSC 52.
+    ///
+    /// Clipboard *writes* (a program setting the clipboard) are always accepted:
+    /// the worst case is a clobbered clipboard. A *read* is an exfiltration
+    /// primitive — anything that can write to the tty (a compromised tool, a
+    /// hostile file dumped with `cat`, output relayed over ssh/tmux) could siphon
+    /// whatever the user last copied, which is routinely a password or an API
+    /// token. So the read direction is opt-in, never on by default.
+    ///
+    /// Denying does NOT mean staying silent: a query is answered with an
+    /// empty-payload OSC 52 reply, so the asking program resumes immediately
+    /// instead of blocking on a response that never comes, and zero clipboard
+    /// bytes are disclosed. `#[serde(default)]` keeps older config files (written
+    /// before this field existed) loading with reads denied.
+    #[serde(default)]
+    pub clipboard_read_allow: bool,
     /// Keep split-pane dividers LINKED so every sibling pane stays the same size.
     /// When `true`, the dividers are held at equal positions each frame — drag one
     /// and they hold equal ("move together"). Defaults to `false` so panes are
@@ -1123,6 +1419,16 @@ fn default_true() -> bool {
     true
 }
 
+/// serde default for [`Config::paste_warn_bytes`] — 4 KiB.
+///
+/// Chosen so an ordinary single-line paste (a path, a URL, a one-line command,
+/// even a long `curl` invocation) never prompts, while an accidental
+/// whole-file / giant-blob paste does. Comfortably above a terminal-width line
+/// yet far below "a program's worth of text".
+fn default_paste_warn_bytes() -> usize {
+    4096
+}
+
 /// serde default for [`Config::frost_amount`] — a tasteful mid-low wash, so
 /// enabling the frosted-glass toggle shows the effect immediately (not a no-op
 /// at 0). The user tunes it up/down from here.
@@ -1164,6 +1470,7 @@ impl Default for Config {
             frost_color: String::new(),
             frost_grain: true,
             always_on_top: false,
+            quake: QuakeConfig::default(),
             cursor: CursorConfig::default(),
             window: WindowConfig::default(),
             effects: EffectsConfig::default(),
@@ -1182,6 +1489,11 @@ impl Default for Config {
             ligatures: false,
             copy_on_select: false,
             paste_warn_multiline: true,
+            paste_warn_bytes: default_paste_warn_bytes(),
+            // DEFAULT-DENY. An on-by-default OSC 52 clipboard read is an
+            // exfiltration hole; the user opts in explicitly (Settings →
+            // Terminal → Clipboard).
+            clipboard_read_allow: false,
             history_capture_enabled: true,
             reporting: ReportingConfig::default(),
             settings_win_w: None,
@@ -1307,6 +1619,19 @@ impl Config {
             changed = true;
         }
 
+        // The GitHub repository was renamed (`Itasha.Corp_C0PL4ND` → `C0PL4ND`).
+        // A config whose issue-intake repo is PROVABLY the old shipped default is
+        // re-pointed once; ANY other value (an operator pointing at their own
+        // fork) is left untouched — no silent clobber. One-shot: after this,
+        // `schema_version == 3` and the block is skipped forever.
+        if self.schema_version < 3 {
+            if self.reporting.issue_intake.repo == LEGACY_ISSUE_INTAKE_REPO {
+                self.reporting.issue_intake.repo = IssueIntakeConfig::default().repo;
+            }
+            self.schema_version = 3;
+            changed = true;
+        }
+
         // Migration invariants (debug-only): it must never LOWER the version, and
         // any config that started below the current schema must end exactly at it.
         // A FORWARD-version config (`original > CURRENT`, e.g. a file written by a
@@ -1396,60 +1721,243 @@ impl Config {
         toml::to_string_pretty(self).map_err(|e| ConfigError::Invalid(e.to_string()))
     }
 
-    /// Persist to a specific path, creating parent directories as needed.
-    /// Used by the settings panel and the window-geometry persistence so the
-    /// config file stays the single source of truth.
+    /// Persist to a specific path, creating parent directories as needed,
+    /// **preserving every key already in the file that this build has no field
+    /// for**. Thin wrapper over [`Config::save_to_reporting`] for callers that
+    /// do not need to know what happened to the prior file.
+    pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
+        self.save_to_reporting(path).map(|_| ())
+    }
+
+    /// Persist to a specific path, reporting what happened to the file that was
+    /// already there.
+    ///
+    /// **Preserving by construction.** The existing file is parsed as a raw TOML
+    /// document and this config is DEEP-MERGED over it, so a key the file
+    /// carries but this build has no field for — a key written by a NEWER build,
+    /// most importantly — is written back verbatim instead of being silently
+    /// dropped. Before this, `to_toml` emitted only the struct's own fields and
+    /// every unknown key was destroyed on the next save. (Comments and blank
+    /// lines are not preserved; they never were — `to_toml` has always re-emitted
+    /// the document from scratch.)
+    ///
+    /// **Never silently destructive.** If the existing file cannot be parsed as
+    /// TOML (a hand-edit mid-save, a truncated write, a binary blob), it is
+    /// RENAMED to `<name>.bak` before the new body is written and the caller
+    /// receives [`SaveOutcome::Quarantined`] carrying that path.
     ///
     /// The file is created **owner-only** from the start (roadmap P-V2): `0600`
     /// on Unix, an owner-only DACL on Windows. The config may reflect the user's
-    /// environment, so other local accounts should not be able to read it.
-    ///
-    /// The write goes through [`atomic_write_owner_only`], which writes the body
-    /// to a sibling temp file, tightens it (on Unix `0600` is applied to the temp
-    /// file **before** the rename), then atomically renames it over the
-    /// destination. This closes the previous race where `std::fs::write` then
-    /// `restrict_to_owner` left a brief window in which the file carried default
-    /// (umask/inherited) permissions (audit P3-#2). Permission tightening itself
-    /// remains BEST-EFFORT — a restrictive filesystem can never block a save —
-    /// but is no longer applied after the content already exists world-readable.
-    pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
-        let body = self.to_toml()?;
-        // `atomic_write_owner_only` creates parent dirs, writes to a sibling
-        // temp file, tightens perms (Unix: on the temp file pre-rename; Windows:
-        // on the final path post-rename), and renames atomically — so the
-        // destination never exists in a world-readable, default-perms state.
+    /// environment, so other local accounts should not be able to read it. The
+    /// write goes through [`crate::atomic_write::atomic_write_owner_only`],
+    /// which creates parent dirs, writes the body to a sibling temp file,
+    /// tightens it (on Unix `0600` is applied to the temp file **before** the
+    /// rename), then atomically renames it over the destination — so the
+    /// destination never exists in a world-readable, default-perms state.
+    pub fn save_to_reporting(&self, path: &Path) -> Result<SaveOutcome, ConfigError> {
+        let rendered = self.to_toml()?;
+        let (body, outcome) = match std::fs::read_to_string(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (rendered, SaveOutcome::Created),
+            // A file that exists but cannot be READ cannot be merged, and
+            // blindly overwriting it is exactly the destruction this method
+            // exists to prevent. Fail rather than clobber.
+            Err(e) => {
+                return Err(ConfigError::Io {
+                    path: path.to_path_buf(),
+                    source: e,
+                })
+            }
+            Ok(existing) => Self::merge_over_existing(&existing, &rendered, path)?,
+        };
         crate::atomic_write::atomic_write_owner_only(path, body.as_bytes()).map_err(|e| {
             ConfigError::Io {
                 path: path.to_path_buf(),
                 source: e,
             }
         })?;
-        Ok(())
+        Ok(outcome)
+    }
+
+    /// Build the body to write by merging `rendered` (this config) over
+    /// `existing` (the on-disk document). Falls back to
+    /// quarantine-then-plain-render when the existing text is not TOML, or when
+    /// the merged document cannot be re-emitted losslessly.
+    fn merge_over_existing(
+        existing: &str,
+        rendered: &str,
+        path: &Path,
+    ) -> Result<(String, SaveOutcome), ConfigError> {
+        let mine: toml::Table = rendered
+            .parse()
+            .map_err(|e: toml::de::Error| ConfigError::Invalid(e.to_string()))?;
+        let Ok(mut merged) = existing.parse::<toml::Table>() else {
+            let bak = quarantine_config_file(path)?;
+            return Ok((rendered.to_string(), SaveOutcome::Quarantined(bak)));
+        };
+        merge_toml_tables(&mut merged, mine);
+        let body =
+            toml::to_string_pretty(&merged).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        // Never write a body we cannot read back as the document we intended.
+        // TOML binds a bare `key = value` that follows a `[table]` header to that
+        // table, and a merge can introduce a key alongside existing tables.
+        // `toml::to_string_pretty` emits every scalar BEFORE every table at each
+        // nesting level (verified empirically against `toml 1.1.3`, which is also
+        // why no manual key reordering is needed here), so this holds today — but
+        // asserting it is what makes the guarantee load-bearing rather than
+        // assumed, and what makes a future serializer change a caught,
+        // recoverable condition instead of a mangled config.
+        if body
+            .parse::<toml::Table>()
+            .is_ok_and(|round| round == merged)
+        {
+            Ok((body, SaveOutcome::Merged))
+        } else {
+            let bak = quarantine_config_file(path)?;
+            Ok((rendered.to_string(), SaveOutcome::Quarantined(bak)))
+        }
+    }
+
+    /// Write ONLY the six persisted window-geometry keys into the file at
+    /// `path`, leaving every other byte of the user's config untouched.
+    ///
+    /// This never constructs a [`Config`] and never runs [`Config::validate`],
+    /// so a file that fails validation (e.g. a hand-edited `opacity = 1.5`)
+    /// still gets its geometry persisted instead of being overwritten with
+    /// defaults. A file that is not valid TOML at all cannot be patched, and is
+    /// left EXACTLY as it is — the error is returned, never papered over.
+    ///
+    /// A `None` geometry field REMOVES the key rather than writing a null, so
+    /// "no remembered position" round-trips as absence, matching the
+    /// `Option`-with-`serde(default)` shape of [`WindowConfig`].
+    pub fn patch_window_geometry(path: &Path, window: &WindowConfig) -> Result<(), ConfigError> {
+        let mut doc: toml::Table = match std::fs::read_to_string(path) {
+            Ok(src) => src
+                .parse()
+                .map_err(|e: toml::de::Error| ConfigError::Parse {
+                    path: path.to_path_buf(),
+                    message: e.to_string(),
+                })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+            Err(e) => {
+                return Err(ConfigError::Io {
+                    path: path.to_path_buf(),
+                    source: e,
+                })
+            }
+        };
+        if !doc.contains_key("window") {
+            doc.insert("window".to_string(), toml::Value::Table(toml::Table::new()));
+        }
+        let Some(toml::Value::Table(win)) = doc.get_mut("window") else {
+            // `window` exists but is not a table (a hand-edit such as
+            // `window = "x"`). Refuse rather than clobber the user's line.
+            return Err(ConfigError::Invalid(
+                "`window` is not a table; refusing to patch geometry".into(),
+            ));
+        };
+        set_or_remove(
+            win,
+            "pos_x",
+            window.pos_x.map(|v| toml::Value::Integer(v.into())),
+        );
+        set_or_remove(
+            win,
+            "pos_y",
+            window.pos_y.map(|v| toml::Value::Integer(v.into())),
+        );
+        set_or_remove(
+            win,
+            "size_w",
+            window.size_w.map(|v| toml::Value::Integer(v.into())),
+        );
+        set_or_remove(
+            win,
+            "size_h",
+            window.size_h.map(|v| toml::Value::Integer(v.into())),
+        );
+        set_or_remove(win, "maximized", window.maximized.map(toml::Value::Boolean));
+        set_or_remove(
+            win,
+            "monitor",
+            window.monitor.clone().map(toml::Value::String),
+        );
+        let body = toml::to_string_pretty(&doc).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        crate::atomic_write::atomic_write_owner_only(path, body.as_bytes()).map_err(|e| {
+            ConfigError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            }
+        })
     }
 
     /// Update only the persisted window-geometry fields on the file at
-    /// [`Config::default_path`], preserving every other field the user set.
-    /// Best-effort: a load/parse failure falls back to the in-memory config so
-    /// a corrupt file never blocks geometry capture. Returns the path written.
+    /// [`Config::default_path`], leaving every other byte the user set exactly
+    /// as it is. Returns the path written, or `None` when no config path
+    /// resolves or the file could not be patched (it is then left untouched).
+    ///
+    /// This deliberately does NOT load a [`Config`]. It previously did, via
+    /// `Config::load_from(&path).unwrap_or_default()` — and because this is an
+    /// associated function with no config in scope, `unwrap_or_default()`
+    /// synthesised a FRESH `Config::default()` and wrote it over the user's
+    /// file, destroying every setting, on any load failure (e.g. a hand-edited
+    /// out-of-range value that `validate` rejects).
     pub fn persist_geometry(window: WindowConfig) -> Option<PathBuf> {
         let path = Config::default_path()?;
-        let mut cfg = Config::load_from(&path).unwrap_or_default();
-        // Copy only geometry; leave cols/rows/padding (size-on-first-launch)
-        // untouched so an explicit user value is never clobbered.
-        cfg.window.pos_x = window.pos_x;
-        cfg.window.pos_y = window.pos_y;
-        cfg.window.size_w = window.size_w;
-        cfg.window.size_h = window.size_h;
-        cfg.window.maximized = window.maximized;
-        cfg.window.monitor = window.monitor;
         // Surface a save failure (audit LO-4): previously `.ok()?` swallowed it
         // silently, unlike the loader's `tracing::warn!` convention, so a
         // persistently-unwritable config dir lost window geometry with no trace.
-        if let Err(e) = cfg.save_to(&path) {
+        if let Err(e) = Config::patch_window_geometry(&path, &window) {
             tracing::warn!("failed to persist window geometry to {path:?}: {e}");
             return None;
         }
         Some(path)
+    }
+}
+
+/// Rename `path` aside to `<name>.bak` so an unreadable config is preserved
+/// rather than overwritten. Returns the backup path.
+pub fn quarantine_config_file(path: &Path) -> Result<PathBuf, ConfigError> {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_else(|| std::ffi::OsString::from("config.toml"));
+    name.push(CONFIG_BACKUP_SUFFIX);
+    let bak = path.with_file_name(name);
+    std::fs::rename(path, &bak).map_err(|e| ConfigError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    Ok(bak)
+}
+
+/// Insert `value`, or REMOVE `key` when it is `None`, so an absent `Option`
+/// field round-trips as an absent TOML key.
+fn set_or_remove(table: &mut toml::Table, key: &str, value: Option<toml::Value>) {
+    match value {
+        Some(v) => {
+            table.insert(key.to_string(), v);
+        }
+        None => {
+            table.remove(key);
+        }
+    }
+}
+
+/// Deep-merge `overlay` onto `base`. A key in `overlay` replaces the value in
+/// `base`, EXCEPT when both sides are tables, where the merge recurses. A key
+/// present ONLY in `base` survives untouched — that is the forward-compatibility
+/// guarantee: a key written by a newer build, for which this build's [`Config`]
+/// has no field, is not dropped on save.
+fn merge_toml_tables(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(base_table)), toml::Value::Table(overlay_table)) => {
+                merge_toml_tables(base_table, overlay_table);
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
     }
 }
 
@@ -1812,12 +2320,6 @@ mod tests {
     }
 
     #[test]
-    fn default_keybindings_have_no_conflicts() {
-        // The shipped default set must be clean — no collisions, no blanks.
-        assert!(Keybindings::default().validate().is_empty());
-    }
-
-    #[test]
     fn ui_scale_defaults_to_one_and_backfills_for_old_configs() {
         assert_eq!(Config::default().ui_scale, 1.0);
         // A config file with no `ui_scale` key backfills via serde(default).
@@ -1837,52 +2339,6 @@ mod tests {
         assert_eq!(mk(99.0).effective_ui_scale(), 3.0); // clamped down to the ceil
         assert_eq!(mk(f32::NAN).effective_ui_scale(), 1.0); // garbage → safe default
         assert_eq!(mk(f32::INFINITY).effective_ui_scale(), 1.0);
-    }
-
-    #[test]
-    fn validate_detects_a_duplicate_combo_collision() {
-        // Bind `paste` to the SAME combo as `copy` (order-insensitive form to
-        // prove normalization): copy = "mod+shift+c".
-        let kb = Keybindings {
-            paste: "shift+mod+c".into(),
-            ..Default::default()
-        };
-        let issues = kb.validate();
-        assert_eq!(issues.len(), 1, "exactly one conflict expected: {issues:?}");
-        match &issues[0] {
-            KeybindingIssue::Conflict { combo, actions } => {
-                assert_eq!(combo, "c+mod+shift"); // normalized: sorted tokens
-                assert!(actions.contains(&"copy") && actions.contains(&"paste"));
-            }
-            other => panic!("expected a Conflict, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn validate_detects_an_empty_binding() {
-        let kb = Keybindings {
-            search: "   ".into(), // whitespace-only → unreachable
-            ..Default::default()
-        };
-        let issues = kb.validate();
-        assert!(
-            issues
-                .iter()
-                .any(|i| matches!(i, KeybindingIssue::Empty { action } if *action == "search")),
-            "an empty binding must be reported: {issues:?}"
-        );
-    }
-
-    #[test]
-    fn keybinding_issue_messages_are_human_readable() {
-        let empty = KeybindingIssue::Empty { action: "copy" };
-        assert!(empty.message().contains("copy"));
-        let conflict = KeybindingIssue::Conflict {
-            combo: "mod+shift+c".into(),
-            actions: vec!["copy", "paste"],
-        };
-        let m = conflict.message();
-        assert!(m.contains("copy") && m.contains("paste") && m.contains("mod+shift+c"));
     }
 
     #[test]
@@ -1977,6 +2433,219 @@ mod tests {
         let s = c2.to_toml().expect("serialize config to TOML");
         let back = Config::from_toml(&s, &p).expect("config TOML round-trip");
         assert!(back.always_on_top);
+    }
+
+    #[test]
+    fn quake_defaults_off_and_round_trips() {
+        let c = Config::default();
+        assert!(
+            !c.quake.enabled,
+            "quake mode claims a GLOBAL hotkey — it must be opt-in (off by default)"
+        );
+        assert_eq!(c.quake.hotkey, "Ctrl+Shift+Grave");
+        assert!((c.quake.height_fraction - 0.5).abs() < f32::EPSILON);
+
+        // A pre-field config must still load with quake fully off — upgrading must
+        // never silently claim a system-wide hotkey.
+        let p = PathBuf::from("test.toml");
+        let old = Config::from_toml("theme = \"ghost-paper\"\n", &p)
+            .expect("a pre-quake config must still load");
+        assert!(!old.quake.enabled, "an older config must not enable quake");
+
+        // Enable + customise → serialize → deserialize → preserved.
+        let mut c2 = c.clone();
+        c2.quake.enabled = true;
+        c2.quake.hotkey = "Win+F12".to_string();
+        c2.quake.height_fraction = 0.75;
+        let s = c2.to_toml().expect("serialize config to TOML");
+        let back = Config::from_toml(&s, &p).expect("config TOML round-trip");
+        assert!(back.quake.enabled);
+        assert_eq!(back.quake.hotkey, "Win+F12");
+        assert!((back.quake.height_fraction - 0.75).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn parse_hotkey_reads_modifiers_in_any_order_and_case() {
+        let want = HotkeySpec {
+            modifiers: MOD_CONTROL_BIT | MOD_SHIFT_BIT,
+            vk: VK_GRAVE,
+        };
+        for spec in [
+            "Ctrl+Shift+Grave",
+            "shift+ctrl+grave",
+            "CONTROL+SHIFT+`",
+            "  Ctrl + Shift + Tilde  ",
+        ] {
+            assert_eq!(parse_hotkey(spec), Some(want), "{spec:?} must parse");
+        }
+        // Every modifier name maps to its own bit.
+        assert_eq!(
+            parse_hotkey("Win+Alt+Shift+Ctrl+Q").map(|h| h.modifiers),
+            Some(MOD_WIN_BIT | MOD_ALT_BIT | MOD_SHIFT_BIT | MOD_CONTROL_BIT),
+        );
+        for alias in ["Win", "Super", "Meta", "Cmd"] {
+            assert_eq!(
+                parse_hotkey(&format!("{alias}+Q")).map(|h| h.modifiers),
+                Some(MOD_WIN_BIT),
+                "{alias} must map to MOD_WIN"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_hotkey_reads_letters_digits_and_function_keys() {
+        assert_eq!(parse_hotkey("Ctrl+q").map(|h| h.vk), Some(u32::from(b'Q')));
+        assert_eq!(parse_hotkey("Ctrl+7").map(|h| h.vk), Some(u32::from(b'7')));
+        assert_eq!(parse_hotkey("Ctrl+F1").map(|h| h.vk), Some(VK_F1_KEY));
+        assert_eq!(parse_hotkey("Ctrl+f12").map(|h| h.vk), Some(VK_F1_KEY + 11));
+        assert_eq!(parse_hotkey("Ctrl+F24").map(|h| h.vk), Some(VK_F1_KEY + 23));
+        // A bare `F` is the LETTER F, not a malformed function key.
+        assert_eq!(parse_hotkey("Ctrl+F").map(|h| h.vk), Some(u32::from(b'F')));
+        for (spec, vk) in [
+            ("Ctrl+Space", VK_SPACE_KEY),
+            ("Ctrl+Tab", VK_TAB_KEY),
+            ("Ctrl+Esc", VK_ESCAPE_KEY),
+            ("Ctrl+Escape", VK_ESCAPE_KEY),
+            ("Ctrl+Enter", VK_RETURN_KEY),
+            ("Ctrl+Return", VK_RETURN_KEY),
+        ] {
+            assert_eq!(parse_hotkey(spec).map(|h| h.vk), Some(vk), "{spec:?}");
+        }
+    }
+
+    #[test]
+    fn parse_hotkey_refuses_a_modifier_less_combo() {
+        // THE safety rule: a bare-key global hotkey would swallow that keystroke
+        // for the WHOLE desktop. Refuse it — quake mode stays inert instead.
+        for spec in ["F12", "Grave", "q", "`", "Escape"] {
+            assert_eq!(
+                parse_hotkey(spec),
+                None,
+                "{spec:?} has no modifier and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_hotkey_refuses_malformed_combos() {
+        for spec in [
+            "",             // empty
+            "Ctrl",         // modifiers only, no key
+            "Ctrl+Shift",   // ditto
+            "Ctrl+",        // trailing separator
+            "+Q",           // leading separator
+            "Ctrl++Q",      // empty token
+            "Ctrl+Nope",    // unknown key name
+            "Ctrl+F0",      // out-of-range function key
+            "Ctrl+F25",     // ditto
+            "Ctrl+A+B",     // two non-modifier keys
+            "Ctrl+Shift+@", // unsupported punctuation
+        ] {
+            assert_eq!(parse_hotkey(spec), None, "{spec:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn register_modifiers_adds_norepeat_without_disturbing_the_combo() {
+        let h = parse_hotkey("Ctrl+Shift+Grave").expect("parses");
+        // Holding the combo must toggle ONCE, not machine-gun at the repeat rate.
+        assert_eq!(
+            h.register_modifiers(),
+            MOD_CONTROL_BIT | MOD_SHIFT_BIT | MOD_NOREPEAT_BIT
+        );
+        // The parsed combo itself stays clean (no NOREPEAT leaking into equality).
+        assert_eq!(h.modifiers, MOD_CONTROL_BIT | MOD_SHIFT_BIT);
+        assert_eq!(h.register_modifiers() & MOD_NOREPEAT_BIT, MOD_NOREPEAT_BIT);
+    }
+
+    #[test]
+    fn register_modifiers_unions_bits_and_never_toggles_one_off() {
+        // `register_modifiers` is a UNION (`|`), not a toggle (`^`). The two are
+        // indistinguishable while the input never already carries NOREPEAT — and
+        // `HotkeySpec`'s fields are public, so a caller CAN hand one back in
+        // (re-registering an already-prepared mask is the obvious way to do it).
+        // With a toggle, that round-trip silently CLEARS `MOD_NOREPEAT` and the
+        // hotkey machine-guns at the key-repeat rate instead of toggling once —
+        // exactly the failure the flag exists to prevent. So assert the union
+        // property over EVERY subset of the modifier bits, NOREPEAT included:
+        // the result is always a superset of the input, and always has NOREPEAT.
+        const BITS: [u32; 5] = [
+            MOD_ALT_BIT,
+            MOD_CONTROL_BIT,
+            MOD_SHIFT_BIT,
+            MOD_WIN_BIT,
+            MOD_NOREPEAT_BIT,
+        ];
+        for mask in 0u32..(1 << BITS.len()) {
+            let modifiers = BITS
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| (mask >> i) & 1 == 1)
+                .fold(0u32, |acc, (_, bit)| acc | bit);
+            let spec = HotkeySpec {
+                modifiers,
+                vk: VK_GRAVE,
+            };
+            let registered = spec.register_modifiers();
+            assert_eq!(
+                registered & modifiers,
+                modifiers,
+                "register_modifiers dropped a bit it was given: \
+                 {modifiers:#06x} -> {registered:#06x}"
+            );
+            assert_eq!(
+                registered & MOD_NOREPEAT_BIT,
+                MOD_NOREPEAT_BIT,
+                "MOD_NOREPEAT must always be set, even when the input already \
+                 carries it: {modifiers:#06x} -> {registered:#06x}"
+            );
+            assert_eq!(
+                registered,
+                modifiers | MOD_NOREPEAT_BIT,
+                "the mask is exactly the user's bits plus NOREPEAT"
+            );
+        }
+    }
+
+    #[test]
+    fn quake_parsed_hotkey_matches_the_free_parser_and_the_default_is_usable() {
+        // The Settings UI calls `parsed_hotkey()`; the Win32 path calls
+        // `parse_hotkey()`. They must be the same answer, or the UI would tell the
+        // user a combo is fine that never registers.
+        let mut q = QuakeConfig::default();
+        assert_eq!(q.parsed_hotkey(), parse_hotkey(&q.hotkey));
+        assert!(
+            q.parsed_hotkey().is_some(),
+            "the shipped default combo must be registerable"
+        );
+        q.hotkey = "F12".to_string();
+        assert_eq!(q.parsed_hotkey(), None, "modifier-less combo is refused");
+        assert_eq!(q.parsed_hotkey(), parse_hotkey(&q.hotkey));
+    }
+
+    #[test]
+    fn quake_height_fraction_is_clamped_and_nan_guarded() {
+        let mut q = QuakeConfig {
+            height_fraction: 0.0,
+            ..Default::default()
+        };
+        // A malformed config must never produce a zero-height or oversized window.
+        assert!((q.effective_height_fraction() - QuakeConfig::MIN_HEIGHT_FRACTION).abs() < 1e-6);
+        q.height_fraction = -3.0;
+        assert!((q.effective_height_fraction() - QuakeConfig::MIN_HEIGHT_FRACTION).abs() < 1e-6);
+        q.height_fraction = 9.0;
+        assert!((q.effective_height_fraction() - QuakeConfig::MAX_HEIGHT_FRACTION).abs() < 1e-6);
+        // Non-finite falls back to the default, never propagates NaN into geometry.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            q.height_fraction = bad;
+            assert!(
+                (q.effective_height_fraction() - 0.5).abs() < 1e-6,
+                "{bad} must fall back to the default fraction"
+            );
+        }
+        // An in-range value passes through untouched.
+        q.height_fraction = 0.35;
+        assert!((q.effective_height_fraction() - 0.35).abs() < 1e-6);
     }
 
     #[test]
@@ -2153,10 +2822,7 @@ mod tests {
         assert_eq!(c.reporting.streams.crash_reports, ReportingMode::Off);
         assert_eq!(c.reporting.streams.manual_issues, ReportingMode::Off);
         // Issue-intake coords backfill to the C0PL4ND defaults.
-        assert_eq!(
-            c.reporting.issue_intake.repo,
-            "46b-ETYKiAL/Itasha.Corp_C0PL4ND"
-        );
+        assert_eq!(c.reporting.issue_intake.repo, "46b-ETYKiAL/C0PL4ND");
     }
 
     #[test]
@@ -2340,6 +3006,249 @@ mod tests {
         assert!(c.validate().is_ok());
     }
 
+    // ---- Tray / close-guard decisions (the pure logic the app's close paths call) ----
+
+    #[test]
+    fn tray_and_close_warning_defaults_are_off_off_on() {
+        // The tray toggles ship OFF (the ✕ keeps meaning "quit" until the user
+        // opts in) and the running-command warning ships ON (it guards a real
+        // data-loss surface and can only fire when a command is actually live).
+        let w = WindowConfig::default();
+        assert!(!w.close_to_tray, "close_to_tray must default OFF");
+        assert!(!w.minimize_to_tray, "minimize_to_tray must default OFF");
+        assert!(
+            w.warn_on_close_running,
+            "warn_on_close_running must default ON"
+        );
+    }
+
+    #[test]
+    fn close_action_covers_every_flag_combination() {
+        // Exhaustive over (close_to_tray, tray_available, explicit_quit): the
+        // ONLY hide is opt-in + tray-present + not an explicit quit.
+        for &close_to_tray in &[false, true] {
+            for &tray_available in &[false, true] {
+                for &explicit_quit in &[false, true] {
+                    let w = WindowConfig {
+                        close_to_tray,
+                        ..WindowConfig::default()
+                    };
+                    let expected = if close_to_tray && tray_available && !explicit_quit {
+                        CloseAction::HideToTray
+                    } else {
+                        CloseAction::Exit
+                    };
+                    assert_eq!(
+                        w.close_action(tray_available, explicit_quit),
+                        expected,
+                        "close_to_tray={close_to_tray} tray_available={tray_available} \
+                         explicit_quit={explicit_quit}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn close_to_tray_never_hides_without_a_tray() {
+        // The stranding case: hiding to a tray that failed to build would leave
+        // the window invisible with no icon to restore it and the shells still
+        // running. A missing tray must always degrade to a real exit.
+        let w = WindowConfig {
+            close_to_tray: true,
+            ..WindowConfig::default()
+        };
+        assert_eq!(w.close_action(false, false), CloseAction::Exit);
+        assert_eq!(w.close_action(true, false), CloseAction::HideToTray);
+    }
+
+    #[test]
+    fn explicit_quit_always_exits_even_with_close_to_tray_on() {
+        // The tray menu's Quit posts WM_CLOSE into the same close path. Without
+        // the explicit-quit escape the app would hide instead of quitting and
+        // could never be closed at all.
+        let w = WindowConfig {
+            close_to_tray: true,
+            ..WindowConfig::default()
+        };
+        assert_eq!(w.close_action(true, true), CloseAction::Exit);
+    }
+
+    #[test]
+    fn minimize_action_covers_every_flag_combination() {
+        for &minimize_to_tray in &[false, true] {
+            for &tray_available in &[false, true] {
+                let w = WindowConfig {
+                    minimize_to_tray,
+                    ..WindowConfig::default()
+                };
+                let expected = if minimize_to_tray && tray_available {
+                    MinimizeAction::HideToTray
+                } else {
+                    MinimizeAction::Minimize
+                };
+                assert_eq!(
+                    w.minimize_action(tray_available),
+                    expected,
+                    "minimize_to_tray={minimize_to_tray} tray_available={tray_available}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn close_guard_confirms_only_when_enabled_busy_and_unconfirmed() {
+        // Exhaustive over (warn_on_close_running, busy_panes==0?, already_confirmed).
+        for &warn in &[false, true] {
+            for &busy in &[0usize, 1, 3] {
+                for &confirmed in &[false, true] {
+                    let w = WindowConfig {
+                        warn_on_close_running: warn,
+                        ..WindowConfig::default()
+                    };
+                    let expected = if warn && busy > 0 && !confirmed {
+                        CloseGuard::Confirm { busy_panes: busy }
+                    } else {
+                        CloseGuard::Proceed
+                    };
+                    assert_eq!(
+                        w.close_guard(busy, confirmed),
+                        expected,
+                        "warn={warn} busy={busy} confirmed={confirmed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn close_guard_reports_the_real_busy_pane_count() {
+        // The count reaches the prompt, so the dialog can say "2 panes are still
+        // running a command" rather than a generic message. A guard that returned
+        // a constant would satisfy a bare is-Confirm assertion.
+        let w = WindowConfig::default();
+        assert_eq!(
+            w.close_guard(2, false),
+            CloseGuard::Confirm { busy_panes: 2 }
+        );
+        assert_eq!(
+            w.close_guard(7, false),
+            CloseGuard::Confirm { busy_panes: 7 }
+        );
+    }
+
+    #[test]
+    fn close_guard_confirmed_answer_stops_the_prompt_looping() {
+        // The commands are STILL running when the user clicks "Close anyway", so
+        // without the already-confirmed short-circuit the second pass through the
+        // close path would prompt again, forever.
+        let w = WindowConfig::default();
+        assert_eq!(
+            w.close_guard(4, false),
+            CloseGuard::Confirm { busy_panes: 4 }
+        );
+        assert_eq!(w.close_guard(4, true), CloseGuard::Proceed);
+    }
+
+    #[test]
+    fn tray_and_warning_flags_round_trip_through_toml() {
+        // The toggles must survive save→load, and a config written before these
+        // fields existed must still parse (serde(default) on WindowConfig).
+        let mut c = Config::default();
+        c.window.close_to_tray = true;
+        c.window.minimize_to_tray = true;
+        c.window.warn_on_close_running = false;
+        let toml = c.to_toml().expect("serialise");
+        let back = Config::from_toml(&toml, Path::new("round.toml")).expect("parse");
+        assert!(back.window.close_to_tray);
+        assert!(back.window.minimize_to_tray);
+        assert!(!back.window.warn_on_close_running);
+
+        // A legacy [window] table with none of the three keys falls back to the
+        // documented defaults rather than failing to parse.
+        let legacy = Config::from_toml(
+            "[window]\ncols = 100\nrows = 30\n",
+            Path::new("legacy.toml"),
+        )
+        .expect("legacy config must still parse");
+        assert!(!legacy.window.close_to_tray);
+        assert!(!legacy.window.minimize_to_tray);
+        assert!(legacy.window.warn_on_close_running);
+    }
+
+    #[test]
+    fn persist_geometry_copies_only_geometry_not_the_tray_toggles() {
+        // The geometry patch writes the geometry keys only. If it ever started
+        // writing the whole WindowConfig it would clobber a tray toggle the user
+        // changed in the settings window with whatever the geometry-capture
+        // snapshot happened to hold.
+        //
+        // This test previously asserted against its OWN hand-mirrored copy of
+        // `persist_geometry`'s field-by-field assignment and never called the
+        // real function, so it could not fail for any change to it — which is
+        // why the clobber defect (652c44b) survived. It now drives the real
+        // `patch_window_geometry` against a seeded file.
+        let path =
+            std::env::temp_dir().join(format!("c0pl4nd-cfg-{}-geom-tray.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "[window]\nclose_to_tray = true\nminimize_to_tray = true\n\
+             warn_on_close_running = false\n",
+        )
+        .expect("seed");
+
+        let captured = WindowConfig {
+            pos_x: Some(11),
+            pos_y: Some(22),
+            size_w: Some(800),
+            size_h: Some(600),
+            maximized: Some(true),
+            monitor: Some("DISPLAY1".to_string()),
+            ..WindowConfig::default()
+        };
+        Config::patch_window_geometry(&path, &captured).expect("patch");
+
+        let doc: toml::Table = std::fs::read_to_string(&path)
+            .expect("read")
+            .parse()
+            .expect("valid TOML");
+        let win = doc
+            .get("window")
+            .and_then(|v| v.as_table())
+            .expect("[window]");
+        assert_eq!(
+            win.get("pos_x").and_then(|v| v.as_integer()),
+            Some(11),
+            "geometry must be written"
+        );
+        assert_eq!(
+            win.get("monitor").and_then(|v| v.as_str()),
+            Some("DISPLAY1")
+        );
+        assert_eq!(
+            win.get("close_to_tray").and_then(|v| v.as_bool()),
+            Some(true),
+            "close_to_tray must survive"
+        );
+        assert_eq!(
+            win.get("minimize_to_tray").and_then(|v| v.as_bool()),
+            Some(true),
+            "minimize_to_tray must survive"
+        );
+        assert_eq!(
+            win.get("warn_on_close_running").and_then(|v| v.as_bool()),
+            Some(false),
+            "warn_on_close_running must survive"
+        );
+        // And the captured snapshot's own defaults are NOT what landed.
+        assert_ne!(
+            win.get("warn_on_close_running").and_then(|v| v.as_bool()),
+            Some(captured.warn_on_close_running),
+            "the geometry snapshot's default must not have overwritten the user's value"
+        );
+    }
+
     // ---- ConfigError variants: construction, Display, and the load/save Io arms ----
 
     #[test]
@@ -2506,11 +3415,38 @@ mod tests {
     #[test]
     fn issue_intake_defaults_are_the_c0pl4nd_coordinates() {
         let i = IssueIntakeConfig::default();
-        assert_eq!(i.repo, "46b-ETYKiAL/Itasha.Corp_C0PL4ND");
-        assert_eq!(i.mailto_alias, "46b.AbandonSomething@proton.me");
+        assert_eq!(i.repo, "46b-ETYKiAL/C0PL4ND");
         // The top-level ReportingConfig embeds those same defaults.
         let r = ReportingConfig::default();
         assert_eq!(r.issue_intake, i);
+    }
+
+    /// NO EMAIL ADDRESS MAY SHIP IN THE DEFAULT CONFIG.
+    ///
+    /// This default is compiled into every binary of a public repo. It used to
+    /// carry a maintainer's personal `proton.me` mailbox, published to every
+    /// downloader and every address harvester that reads the source.
+    ///
+    /// The assertion is on the SHAPE (`@`-free), not on one banned literal: a
+    /// test pinning the old string would have to be edited in lockstep with the
+    /// leak it was pinning — which is exactly how it survived — whereas an
+    /// `@`-free assertion rejects the next address too.
+    #[test]
+    fn no_email_address_ships_in_the_default_issue_intake_config() {
+        let i = IssueIntakeConfig::default();
+        assert!(
+            i.mailto_alias.is_empty(),
+            "the shipped default must carry NO mailbox; got {:?}",
+            i.mailto_alias
+        );
+        let toml = Config::default()
+            .to_toml()
+            .expect("the default config must serialize");
+        assert!(
+            !toml.contains('@'),
+            "the serialized default config must contain no email address; it is \
+             written to every user's disk and read from a public source tree"
+        );
     }
 
     // ---- PanelSide default + serde round-trip ----
@@ -2663,6 +3599,44 @@ mod tests {
     }
 
     #[test]
+    fn pre_v3_default_issue_repo_migrates_to_the_renamed_repository() {
+        // An EXISTING config that persisted the OLD shipped default (the
+        // repository's former name) is re-pointed on load. Without this, the
+        // stored value would win over the source default forever — `save_to`
+        // serializes every field, so essentially every existing user has this
+        // string on disk — and the issue link would keep depending on GitHub's
+        // rename redirect.
+        let p = PathBuf::from("legacy-repo.toml");
+        let c = Config::from_toml(
+            "[reporting.issue_intake]\nrepo = \"46b-ETYKiAL/Itasha.Corp_C0PL4ND\"\n",
+            &p,
+        )
+        .unwrap();
+        assert_eq!(
+            c.reporting.issue_intake.repo, "46b-ETYKiAL/C0PL4ND",
+            "the old default repo name must migrate to the renamed repository"
+        );
+        assert_eq!(c.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn pre_v3_custom_issue_repo_is_preserved_verbatim() {
+        // An operator pointing the issue form at their OWN fork must survive the
+        // v2 → v3 migration untouched — no silent clobber.
+        let p = PathBuf::from("custom-repo.toml");
+        let c = Config::from_toml(
+            "[reporting.issue_intake]\nrepo = \"someone-else/their-fork\"\n",
+            &p,
+        )
+        .unwrap();
+        assert_eq!(
+            c.reporting.issue_intake.repo, "someone-else/their-fork",
+            "a custom issue-intake repo is never remapped"
+        );
+        assert_eq!(c.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
     fn pre_v2_custom_tint_is_preserved_verbatim() {
         // A user's CUSTOM tint (any value ≠ the old `#121212` default) must survive
         // the v1 → v2 migration untouched — no silent clobber.
@@ -2725,6 +3699,338 @@ mod tests {
             "saved config must be owner-only 0600, got {:o}",
             mode & 0o777
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Serialises the tests that mutate the process-global env vars
+    /// [`Config::default_path`] reads. Mirrors the app crate's `WGPU_ENV_LOCK` /
+    /// `PATH_ENV_LOCK` pattern. Any future core test that sets `APPDATA` /
+    /// `XDG_CONFIG_HOME` / `HOME` MUST take this lock.
+    static CONFIG_PATH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Point [`Config::default_path`] at `dir` for the duration, restoring the
+    /// previous values on drop.
+    struct ConfigDirGuard {
+        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ConfigDirGuard {
+        fn new(dir: &Path) -> Self {
+            let keys: &[&'static str] = if cfg!(windows) {
+                &["APPDATA"]
+            } else {
+                &["XDG_CONFIG_HOME"]
+            };
+            let prev = keys
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect::<Vec<_>>();
+            for (k, _) in &prev {
+                std::env::set_var(k, dir);
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.prev {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn persist_geometry_never_overwrites_a_config_it_could_not_load() {
+        // REGRESSION (652c44b, 2026-05-30): `persist_geometry` did
+        // `Config::load_from(&path).unwrap_or_default()` — and because it is an
+        // associated fn with NO config in scope, a load failure synthesised a
+        // FRESH Config::default() and wrote it over the user's file. A single
+        // hand-edited out-of-range value (which `validate` rejects) therefore
+        // destroyed every setting the user ever made, on the next window move.
+        let _lock = CONFIG_PATH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("c0pl4nd-cfg-{}-geom-noclobber", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("c0pl4nd");
+        std::fs::create_dir_all(&dir).expect("seed config dir");
+        let path = dir.join("config.toml");
+        // A config that PARSES but fails validate(): opacity is out of range.
+        std::fs::write(
+            &path,
+            "theme = \"ghost-paper\"\nopacity = 1.5\nscrollback_lines = 42\n\
+             [font]\nfamily = \"Cascadia Code\"\n",
+        )
+        .expect("seed config");
+        assert!(
+            Config::load_from(&path).is_err(),
+            "precondition: the seeded config must fail to load"
+        );
+
+        let _guard = ConfigDirGuard::new(&root);
+        let written = Config::persist_geometry(WindowConfig {
+            pos_x: Some(11),
+            pos_y: Some(22),
+            size_w: Some(800),
+            size_h: Some(600),
+            maximized: Some(false),
+            ..WindowConfig::default()
+        });
+        assert_eq!(
+            written.as_deref(),
+            Some(path.as_path()),
+            "geometry must persist"
+        );
+
+        let after = std::fs::read_to_string(&path).expect("config must still exist");
+        let doc: toml::Table = after.parse().expect("still valid TOML");
+        assert_eq!(
+            doc.get("theme").and_then(|v| v.as_str()),
+            Some("ghost-paper"),
+            "the user's theme must survive a geometry persist over an invalid config"
+        );
+        assert_eq!(
+            doc.get("scrollback_lines").and_then(|v| v.as_integer()),
+            Some(42),
+            "every unrelated key must survive"
+        );
+        assert_eq!(
+            doc.get("font")
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get("family"))
+                .and_then(|v| v.as_str()),
+            Some("Cascadia Code"),
+            "nested tables must survive"
+        );
+        let win = doc
+            .get("window")
+            .and_then(|v| v.as_table())
+            .expect("[window]");
+        assert_eq!(win.get("pos_x").and_then(|v| v.as_integer()), Some(11));
+        assert_eq!(win.get("size_w").and_then(|v| v.as_integer()), Some(800));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_forward_version_config_keeps_its_unknown_keys_across_a_save() {
+        // A config written by a NEWER build carries keys this build has no field
+        // for. Because there is no `deny_unknown_fields`, they deserialize away —
+        // and `to_toml` emits only OUR fields, so a save silently dropped every
+        // v-next key while keeping the forward `schema_version`, leaving a file
+        // that claims v4 but holds v3 content. The save must MERGE over the
+        // existing document, not replace it.
+        let path =
+            std::env::temp_dir().join(format!("c0pl4nd-cfg-{}-forward.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let seeded = format!(
+            "schema_version = {}\n\
+             theme = \"ghost-paper\"\n\
+             remote_sync = \"wss://example.invalid\"\n\
+             [window]\ncols = 100\nsnap_to_edges = true\n\
+             [future]\nenabled = true\nweight = 3\n",
+            CURRENT_SCHEMA_VERSION + 1
+        );
+        std::fs::write(&path, &seeded).expect("seed");
+
+        let loaded = Config::load_from(&path).expect("a forward config still loads");
+        assert_eq!(loaded.schema_version, CURRENT_SCHEMA_VERSION + 1);
+        loaded.save_to(&path).expect("save");
+
+        let doc: toml::Table = std::fs::read_to_string(&path)
+            .expect("read")
+            .parse()
+            .expect("valid TOML");
+        assert_eq!(
+            doc.get("schema_version").and_then(|v| v.as_integer()),
+            Some(i64::from(CURRENT_SCHEMA_VERSION + 1)),
+            "the forward version is retained"
+        );
+        assert_eq!(
+            doc.get("remote_sync").and_then(|v| v.as_str()),
+            Some("wss://example.invalid"),
+            "a top-level key this build does not know must survive the save"
+        );
+        assert_eq!(
+            doc.get("window")
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get("snap_to_edges"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "an unknown key inside a KNOWN table must survive"
+        );
+        assert!(
+            doc.contains_key("future"),
+            "an entirely unknown table must survive"
+        );
+        assert_eq!(
+            doc.get("theme").and_then(|v| v.as_str()),
+            Some("ghost-paper"),
+            "known keys still round-trip"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn patch_window_geometry_touches_only_the_six_geometry_keys() {
+        // The geometry patch is a SURGICAL write: it edits six keys under
+        // `[window]` and leaves every other byte of the document — sibling keys
+        // in the same table, sibling tables, top-level scalars — exactly as the
+        // user left them. It never builds a `Config`, so it cannot substitute a
+        // default for a field it did not read.
+        let path = std::env::temp_dir().join(format!(
+            "c0pl4nd-cfg-{}-geom-patch.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "theme = \"ghost-paper\"\n\
+             [window]\ncols = 120\nrows = 40\nclose_to_tray = true\nmonitor = \"OLD\"\n\
+             [update]\nmode = \"off\"\n",
+        )
+        .expect("seed");
+
+        Config::patch_window_geometry(
+            &path,
+            &WindowConfig {
+                pos_x: Some(5),
+                size_w: Some(1280),
+                maximized: Some(true),
+                monitor: None, // an absent Option must REMOVE the key
+                ..WindowConfig::default()
+            },
+        )
+        .expect("patch");
+
+        let doc: toml::Table = std::fs::read_to_string(&path)
+            .expect("read")
+            .parse()
+            .expect("valid TOML");
+        let win = doc
+            .get("window")
+            .and_then(|v| v.as_table())
+            .expect("[window]");
+        assert_eq!(win.get("pos_x").and_then(|v| v.as_integer()), Some(5));
+        assert_eq!(win.get("size_w").and_then(|v| v.as_integer()), Some(1280));
+        assert_eq!(win.get("maximized").and_then(|v| v.as_bool()), Some(true));
+        assert!(
+            !win.contains_key("monitor"),
+            "a None geometry field removes the key rather than writing a default"
+        );
+        assert_eq!(
+            win.get("cols").and_then(|v| v.as_integer()),
+            Some(120),
+            "cols/rows/padding are NOT geometry and must not be touched"
+        );
+        assert_eq!(
+            win.get("close_to_tray").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            doc.get("theme").and_then(|v| v.as_str()),
+            Some("ghost-paper")
+        );
+        assert!(doc.contains_key("update"), "sibling tables survive");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_unparseable_config_is_set_aside_before_a_save_overwrites_it() {
+        // A file that cannot be parsed cannot be merged into, so the new body
+        // genuinely does replace it. That is only acceptable if the original
+        // bytes are preserved first and the caller is told where they went —
+        // otherwise a single truncated write destroys the user's settings with
+        // no way back.
+        let path = std::env::temp_dir().join(format!(
+            "c0pl4nd-cfg-{}-quarantine.toml",
+            std::process::id()
+        ));
+        let bak = path.with_extension("toml.bak");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&bak);
+        let garbage = "theme = \"ghost-paper\"\n[window\ncols = ";
+        std::fs::write(&path, garbage).expect("seed");
+        assert!(
+            garbage.parse::<toml::Table>().is_err(),
+            "precondition: the seeded file is not valid TOML"
+        );
+
+        let outcome = Config::default()
+            .save_to_reporting(&path)
+            .expect("the save itself still succeeds");
+        match outcome {
+            SaveOutcome::Quarantined(p) => assert_eq!(p, bak, "backup path is reported"),
+            other => panic!("expected Quarantined, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&bak).expect("backup exists"),
+            garbage,
+            "the user's original bytes are preserved verbatim"
+        );
+        assert!(
+            Config::load_from(&path).is_ok(),
+            "the new config is written and loadable"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&bak);
+    }
+
+    #[test]
+    fn a_merged_save_always_reparses_to_the_document_it_intended() {
+        // The one mechanical hazard of a document merge: TOML binds a bare
+        // `key = value` that follows a `[header]` to that table, so a body that
+        // emitted a scalar after a table would re-parse as a DIFFERENT document
+        // than the one intended — silently relocating the user's keys.
+        //
+        // Empirically (`toml 1.1.3`, no `preserve_order` feature anywhere in
+        // this workspace) `toml::Table` is BTreeMap-backed and
+        // `to_string_pretty` emits every scalar before every table at each
+        // nesting level, so this holds. This test is what keeps that a verified
+        // property rather than an assumption: a serializer change turns a
+        // mangled config into a caught, quarantined condition.
+        //
+        // The seed deliberately puts the unknown top-level scalar BEFORE the
+        // unknown table — the reverse is not expressible in TOML, since a bare
+        // key after `[zzz_unknown_table]` would belong to that table.
+        let path =
+            std::env::temp_dir().join(format!("c0pl4nd-cfg-{}-reparse.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "remote_sync = \"keep-me\"\n\n[zzz_unknown_table]\nk = 1\n",
+        )
+        .expect("seed");
+
+        let outcome = Config::default().save_to_reporting(&path).expect("save");
+        assert_eq!(
+            outcome,
+            SaveOutcome::Merged,
+            "a parseable existing file is merged, not quarantined"
+        );
+        let text = std::fs::read_to_string(&path).expect("read");
+        let doc: toml::Table = text
+            .parse()
+            .unwrap_or_else(|e| panic!("the written config must re-parse: {e}\n---\n{text}"));
+        assert_eq!(
+            doc.get("remote_sync").and_then(|v| v.as_str()),
+            Some("keep-me"),
+            "an unknown TOP-LEVEL scalar must survive the merge at top level"
+        );
+        assert_eq!(
+            doc.get("zzz_unknown_table")
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get("k"))
+                .and_then(|v| v.as_integer()),
+            Some(1),
+            "an unknown table and its contents must survive"
+        );
+        let reloaded = Config::load_from(&path).expect("and must load as a Config");
+        assert_eq!(reloaded.theme, Config::default().theme);
         let _ = std::fs::remove_file(&path);
     }
 }

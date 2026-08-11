@@ -13,8 +13,7 @@ packaging/
 ├── gen-icons.sh         # SVG -> PNG/.ico/.icns icon generator
 ├── icons/               # generated PNGs (created by gen-icons.sh)
 ├── windows/
-│   ├── wix/main.wxs     # cargo-wix MSI definition
-│   ├── c0pl4nd.wxs      # standalone WiX MSI definition (candle/light)
+│   ├── c0pl4nd.wxs      # WiX v3 MSI definition (candle/light)
 │   └── winget/Itasha.C0PL4ND.yaml  # winget manifest skeleton
 ├── macos/
 │   ├── Info.plist       # .app bundle metadata
@@ -33,7 +32,7 @@ packaging/
 ### Linux / macOS — one-liner
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND/main/packaging/linux/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/46b-ETYKiAL/C0PL4ND/master/packaging/linux/install.sh | sh
 ```
 
 This detects your OS/arch, downloads the latest release tarball, verifies its
@@ -56,7 +55,7 @@ winget install Itasha.C0PL4ND
 ### Manual
 
 Download the archive for your platform from the
-[Releases page](https://github.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND/releases), verify the
+[Releases page](https://github.com/46b-ETYKiAL/C0PL4ND/releases), verify the
 SHA256 against `SHA256SUMS`, extract, and put the binary on your `PATH`.
 
 ## Building installers (maintainers)
@@ -76,10 +75,20 @@ Generates `packaging/icons/*.png`, `packaging/windows/c0pl4nd.ico`, and
 
 ### Windows MSI
 
+The release workflow's `windows-msi` job builds it. To reproduce locally you
+need WiX Toolset **v3** (`candle`/`light`) on PATH:
+
 ```powershell
-cargo install cargo-wix
-cargo wix              # reads packaging/windows/wix/main.wxs
+candle -arch x64 -dBinPath=target\release\c0pl4nd.exe packaging\windows\c0pl4nd.wxs -o c0pl4nd.wixobj
+light  -ext WixUIExtension c0pl4nd.wixobj -o c0pl4nd.msi
 ```
+
+`c0pl4nd.wxs` is authored against the **WiX v3** schema. It previously used
+the v4/v6 schema (`<Package>` root, `StandardDirectory`, `Scope=`), which
+`candle`/`light` cannot parse at all -- so it had never been compiled by
+anything. There is no `cargo-wix` in this repo and no
+`packaging/windows/wix/` directory; both were described here but never
+existed.
 
 Generate the `UpgradeCode` GUID **once** (`uuidgen`) and keep it stable across
 every release so upgrades replace rather than stack. Provide a `License.rtf`
@@ -146,7 +155,7 @@ full suite.
 | Build             | Rust stable toolchain (`cargo`, `rustfmt`, `clippy`) |
 | Cross-Linux build | `cross` (release workflow installs it)               |
 | Icons             | `librsvg` (`rsvg-convert`) or ImageMagick; `iconutil` (macOS) or `png2icns` (libicns) for `.icns` |
-| Windows MSI       | `cargo-wix` + WiX Toolset v3                          |
+| Windows MSI       | WiX Toolset v3 (`candle`/`light`) — no cargo-wix     |
 | macOS DMG         | `hdiutil` (built into macOS); optional Developer ID for signing |
 | Linux AppImage    | `linuxdeploy`                                         |
 | Linux DEB         | `dpkg-deb`                                            |

@@ -33,6 +33,7 @@ Most settings are **top-level keys**; a handful are grouped into tables. This re
 | `startup_panel` | top-level | The neofetch-style launch splash (on by default) |
 | `shell` / `term` | top-level | Override the child shell program / its `TERM` value |
 | `ligatures` / `copy_on_select` / `paste_warn_multiline` / `history_capture_enabled` | top-level | Editor/selection/clipboard/history behaviour |
+| `clipboard_read_allow` | top-level | **Security, default `false`.** Allow a program to READ the system clipboard via OSC 52 |
 | `history_sidebar_side` / `view_mode` | top-level | Command-history sidebar side; pane shell layout |
 | `[font]` | table | Font family, size, line height, fallback chain |
 | `[cursor]` | table | Cursor shape and blink |
@@ -77,8 +78,11 @@ opacity = 1.0   # top-level: 0.0 (fully see-through) .. 1.0 (solid)
 cols = 80       # initial terminal width in columns
 rows = 24       # initial terminal height in rows
 padding = 8     # inner padding between the window edge and the grid, in pixels
-# pos_x / pos_y / size_w / size_h / maximized / monitor are written automatically
-# to remember your window geometry; you normally don't set these by hand.
+# pos_x / pos_y / size_w / size_h / maximized / monitor are read and written only
+# by the default-off `legacy-winit` binary. The shipped shell neither reads nor
+# writes them — it remembers window geometry through eframe's own native-window
+# state (`persist_window`), stored outside this file. Setting them here has no
+# effect on the shipped shell.
 ```
 
 ## Transparency, tint & frost
@@ -165,6 +169,11 @@ term = "xterm-256color"  # the TERM advertised to the child shell (default: xter
 ligatures = false            # enable programming ligatures / complex text shaping
 copy_on_select = false       # X11-style: copy a mouse selection the moment the drag ends
 paste_warn_multiline = true  # confirm before pasting clipboard text containing a newline (a safety feature)
+clipboard_read_allow = false # SECURITY, default deny: may a program in a pane READ your system
+                             # clipboard via `OSC 52 ; c ; ?`. Writing TO the clipboard from a
+                             # program always works and is unaffected. While denied, a read query
+                             # is answered with an empty payload, so well-behaved programs
+                             # continue instead of hanging. Turn on only if you need it.
 history_capture_enabled = true   # record echoed commands for the palette + history sidebar
 history_sidebar_side = "right"   # which side the command-history sidebar docks to: "left" | "right"
 view_mode = "grid"               # pane shell layout: "grid" (tiling) | "tabs" (single full-size pane)
@@ -230,9 +239,16 @@ crash_reports = "off"   # off | ask_each_time | … (default: off)
 manual_issues = "off"   # off | ask_each_time | … (default: off)
 
 [reporting.issue_intake]
-repo = "46b-ETYKiAL/Itasha.Corp_C0PL4ND"      # the GitHub owner/repo the "Report an issue" deep link targets
-mailto_alias = "46b.AbandonSomething@proton.me"   # the mailto: fallback address
+repo = "46b-ETYKiAL/C0PL4ND"                  # the GitHub owner/repo the "Report an issue" deep link targets
+mailto_alias = "you@example.com"              # the mailto: fallback address, used only if the deep link cannot open
 ```
+
+> `mailto_alias` is shown here with a placeholder. Set it to whatever address
+> you want "Report an issue" to fall back to. It is **empty by default and no
+> address ships** — a real mailbox compiled into a public binary would be
+> published to everyone who downloads the app. Leaving it unset simply means the
+> app offers the GitHub Issue form and the clipboard fallback, and does not
+> offer the email route at all.
 
 ## Keybindings
 
@@ -293,6 +309,7 @@ term = "xterm-256color"
 ligatures = false
 copy_on_select = false
 paste_warn_multiline = true
+clipboard_read_allow = false    # deny OSC 52 clipboard READ (security)
 history_capture_enabled = true
 history_sidebar_side = "right"  # "left" | "right"
 view_mode = "grid"              # "grid" | "tabs"

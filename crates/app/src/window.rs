@@ -1077,6 +1077,16 @@ impl App {
     /// Persist the current in-memory config to the user config file (D3). The
     /// settings panel calls this after every change so the file and the live
     /// state never drift. Errors are logged, never fatal.
+    ///
+    /// `save_to` now MERGES over the existing document, so a key this build has
+    /// no field for survives. This shell does NOT carry the egui app's
+    /// `config_unreadable` quarantine, though: if the startup load in `main.rs`
+    /// failed, `self.config` is defaults and this write replaces the user's
+    /// known-field values with them. That gap is accepted only because the
+    /// legacy winit shell is behind the default-off `legacy-winit` feature and
+    /// is a preserved comparison shell, not a shipped surface. Porting the
+    /// quarantine means routing this through the same seam as
+    /// `C0pl4ndApp::save_config_guarded`.
     fn persist_config(&self) {
         if let Some(path) = Config::default_path() {
             if let Err(e) = self.config.save_to(&path) {
@@ -3527,11 +3537,10 @@ impl ApplicationHandler for App {
         self.gpu = Some(gpu);
         if self.tabs.is_empty() {
             self.spawn_tab();
-            // Plan-575 P6 T6.4: restore the saved `default` workspace on
-            // launch when it carries a real multi-pane layout. Single-pane
-            // defaults are a no-op (same shape as the fresh tab above).
-            // Without this call the saved-on-exit default layout never
-            // re-materialises — the P0 wiring gap caught at QA review.
+            // Restore the saved `default` workspace on launch when it carries
+            // a real multi-pane layout. Single-pane defaults are a no-op (same
+            // shape as the fresh tab above). Without this call the
+            // saved-on-exit default layout never re-materialises.
             self.restore_default_workspace_on_startup();
         }
         if let Some(g) = &self.gpu {

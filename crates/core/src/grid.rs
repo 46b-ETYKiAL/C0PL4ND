@@ -46,15 +46,34 @@ pub enum UnderlineStyle {
 pub struct CellFlags {
     /// Bold / increased-intensity rendition (SGR `1`).
     pub bold: bool,
+    /// Dim / faint / decreased-intensity rendition (SGR `2`). Mutually
+    /// cancelled with [`CellFlags::bold`] by SGR `22`, which per ECMA-48 resets
+    /// BOTH intensities. The colour model blends a dim foreground toward its
+    /// background (see `theme::dim_foreground`).
+    pub dim: bool,
     /// Italic rendition (SGR `3`).
     pub italic: bool,
     /// Styled-underline selection (C20). `UnderlineStyle::None` means no
     /// underline. Use [`CellFlags::underline`] for a plain on/off check.
     pub underline_style: UnderlineStyle,
+    /// Slow-blink rendition (SGR `5`, cancelled by SGR `25`). The core only
+    /// records the request; whether to animate is the renderer's decision (and
+    /// must honour the reduced-motion preference).
+    pub blink: bool,
+    /// Rapid-blink rendition (SGR `6`, cancelled by SGR `25`). Recorded
+    /// separately from [`CellFlags::blink`] so a renderer can distinguish the
+    /// two rates; most terminals render both identically.
+    pub rapid_blink: bool,
     /// Reverse-video rendition: foreground and background are swapped (SGR `7`).
     pub inverse: bool,
+    /// Concealed / hidden rendition (SGR `8`, cancelled by SGR `28`). The
+    /// character still occupies the cell and is still copyable — only its
+    /// foreground is painted in the background colour.
+    pub conceal: bool,
     /// Strikethrough / crossed-out rendition (SGR `9`).
     pub strikeout: bool,
+    /// Overline rendition (SGR `53`, cancelled by SGR `55`).
+    pub overline: bool,
 }
 
 impl CellFlags {
@@ -67,9 +86,14 @@ impl CellFlags {
     ///
     /// let f = CellFlags::empty();
     /// assert!(!f.bold);
+    /// assert!(!f.dim);
     /// assert!(!f.italic);
+    /// assert!(!f.blink);
+    /// assert!(!f.rapid_blink);
     /// assert!(!f.inverse);
+    /// assert!(!f.conceal);
     /// assert!(!f.strikeout);
+    /// assert!(!f.overline);
     /// assert_eq!(f.underline_style, UnderlineStyle::None);
     /// // No rendition implies no underline.
     /// assert!(!f.underline());
@@ -77,10 +101,15 @@ impl CellFlags {
     pub const fn empty() -> Self {
         CellFlags {
             bold: false,
+            dim: false,
             italic: false,
             underline_style: UnderlineStyle::None,
+            blink: false,
+            rapid_blink: false,
             inverse: false,
+            conceal: false,
             strikeout: false,
+            overline: false,
         }
     }
 

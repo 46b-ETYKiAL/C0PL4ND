@@ -33,7 +33,7 @@ discussions, or pull requests.**
 
 Report privately using **GitHub Security Advisories** — open the repository's
 **Security → Advisories → Report a vulnerability** form
-(<https://github.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND/security/advisories/new>).
+(<https://github.com/46b-ETYKiAL/C0PL4ND/security/advisories/new>).
 A private advisory is visible only to you and the maintainers.
 
 Please include, as far as you can:

@@ -235,6 +235,12 @@ fn device_replies_are_7bit_clean_with_no_smuggled_controls() {
         let mut t = Terminal::new(4, 20);
         t.advance(inp);
         let reply = t.take_pty_response();
+        assert!(
+            !reply.is_empty(),
+            "no reply was queued for {inp:x?} — an empty reply makes the \
+             7-bit-clean scan below vacuous (it iterates nothing), and a device \
+             query the terminal silently ignores hangs the requesting app"
+        );
         for (i, &b) in reply.iter().enumerate() {
             let is_framing = b == 0x1b || b == 0x5c || b == 0x07; // ESC, '\', BEL
             let is_printable = (0x20..=0x7e).contains(&b);
@@ -1012,14 +1018,21 @@ fn osc52_primary_selection() {
 }
 
 #[test]
-fn osc52_read_default_off_emits_nothing() {
+fn osc52_read_default_off_replies_empty_and_leaks_nothing() {
     let mut t = Terminal::new(4, 20);
-    // Read request: payload is '?'. Default-off -> no PTY response, no write.
+    // Read request: payload is '?'. Default-off -> the refusal is an OSC 52
+    // reply with an EMPTY payload: no clipboard data crosses to the PTY, and
+    // the asking program is not left blocking on a reply that never arrives.
     t.advance(b"\x1b]52;c;?\x07");
     assert!(t.take_clipboard_write().is_none());
+    assert_eq!(
+        t.take_pty_response(),
+        b"\x1b]52;c;\x07".to_vec(),
+        "must refuse with an empty payload, never host clipboard contents"
+    );
     assert!(
-        t.take_pty_response().is_empty(),
-        "must NOT auto-respond with host clipboard contents"
+        t.take_clipboard_reads().is_empty(),
+        "a denied read must not park a request the host could later answer"
     );
 }
 
@@ -1037,6 +1050,156 @@ fn osc52_read_opt_in_uses_app_provided_text() {
     t.respond_clipboard_read(ClipboardSelection::Clipboard, "hi");
     // "hi" base64 = aGk=
     assert_eq!(t.take_pty_response().as_slice(), b"\x1b]52;c;aGk=\x07");
+}
+
+/// THE negative test. With the shipping default (reads denied), a program that
+/// asks for the clipboard must never receive its contents — not from the parser,
+/// and not even if the host layer erroneously tries to answer. Asserted on the
+/// bytes that actually reach the PTY.
+#[test]
+fn osc52_read_denied_by_default_never_leaks_clipboard_bytes_to_pty() {
+    const SECRET: &str = "hunter2-api-token";
+    // base64("hunter2-api-token"); the exact substring that must never appear.
+    let secret_b64 = super::osc::base64_encode(SECRET.as_bytes());
+
+    let mut t = Terminal::new(4, 20);
+    assert!(
+        !t.clipboard_read_enabled(),
+        "the shipping default must deny clipboard reads"
+    );
+
+    // A hostile program asks for the clipboard, on both selections and via the
+    // empty-selection form (which defaults to the system clipboard).
+    t.advance(b"\x1b]52;c;?\x07");
+    t.advance(b"\x1b]52;p;?\x07");
+    t.advance(b"\x1b]52;;?\x07");
+
+    // The host has the secret on its clipboard and — simulating a wiring bug —
+    // tries to answer anyway. The core must refuse: `respond_clipboard_read` is
+    // gated on the same flag, so no amount of host-side eagerness can leak.
+    assert!(
+        t.take_clipboard_reads().is_empty(),
+        "a denied read must never be surfaced to the host as a servable request"
+    );
+    t.respond_clipboard_read(ClipboardSelection::Clipboard, SECRET);
+    t.respond_clipboard_read(ClipboardSelection::Primary, SECRET);
+
+    let wire = t.take_pty_response();
+    let wire_str = String::from_utf8(wire.clone()).expect("replies are ASCII");
+
+    // Only the three empty-payload refusals reached the PTY.
+    assert_eq!(
+        wire_str, "\x1b]52;c;\x07\x1b]52;p;\x07\x1b]52;c;\x07",
+        "only empty-payload refusals may reach the PTY"
+    );
+    // …and the secret is absent in every representation.
+    assert!(
+        !wire_str.contains(&secret_b64),
+        "base64 of the clipboard secret must never reach the PTY"
+    );
+    assert!(
+        !wire_str.contains(SECRET),
+        "the clipboard secret must never reach the PTY in plaintext either"
+    );
+}
+
+/// The refusal must not be silence: a program blocking on the reply has to be
+/// released. Distinguishes "denied" from "ignored" on the wire.
+#[test]
+fn osc52_denied_read_answers_rather_than_hanging_the_caller() {
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b]52;c;?\x07");
+    let wire = t.take_pty_response();
+    assert!(
+        !wire.is_empty(),
+        "silence would leave the requesting program blocked until its own timeout"
+    );
+    // A well-formed OSC 52 reply the caller can parse: OSC, 52, selection,
+    // empty data field, terminator.
+    assert!(wire.starts_with(b"\x1b]52;"), "must be an OSC 52 reply");
+    assert!(wire.ends_with(b"\x07"), "must be terminated");
+    assert_eq!(wire, b"\x1b]52;c;\x07".to_vec());
+}
+
+/// The refusal echoes the selection the program asked about, so a caller that
+/// queried the primary selection matches the reply to its own request.
+#[test]
+fn osc52_denied_read_echoes_the_requested_selection() {
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b]52;p;?\x07");
+    assert_eq!(t.take_pty_response(), b"\x1b]52;p;\x07".to_vec());
+}
+
+/// When opted in, the request is surfaced to the host with the selection the
+/// program asked for — that is what lets the host read the RIGHT selection.
+#[test]
+fn osc52_opt_in_surfaces_request_with_selection() {
+    let mut t = Terminal::new(4, 20);
+    t.set_clipboard_read_enabled(true);
+    t.advance(b"\x1b]52;p;?\x07");
+    t.advance(b"\x1b]52;c;?\x07");
+    let reqs = t.take_clipboard_reads();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0].selection, ClipboardSelection::Primary);
+    assert_eq!(reqs[1].selection, ClipboardSelection::Clipboard);
+    assert!(
+        t.take_clipboard_reads().is_empty(),
+        "drained once, like the write queue"
+    );
+}
+
+/// A program spamming read queries must not grow the pending queue without
+/// bound (same discipline as every other PTY-driven buffer).
+#[test]
+fn osc52_pending_reads_are_bounded() {
+    let mut t = Terminal::new(4, 20);
+    t.set_clipboard_read_enabled(true);
+    for _ in 0..500 {
+        t.advance(b"\x1b]52;c;?\x07");
+    }
+    let n = t.take_clipboard_reads().len();
+    assert!(
+        n <= 16,
+        "pending read queue must stay bounded, got {n} entries"
+    );
+    assert!(n > 0, "…while still retaining the most recent requests");
+}
+
+/// Turning the setting back OFF while a request is in flight must refuse it,
+/// not silently forget it — otherwise the blocked program never gets an answer.
+#[test]
+fn osc52_disabling_reads_refuses_requests_still_in_flight() {
+    let mut t = Terminal::new(4, 20);
+    t.set_clipboard_read_enabled(true);
+    t.advance(b"\x1b]52;c;?\x07");
+    let _ = t.take_pty_response(); // nothing yet; the request is parked
+
+    t.set_clipboard_read_enabled(false);
+    assert_eq!(
+        t.take_pty_response(),
+        b"\x1b]52;c;\x07".to_vec(),
+        "the in-flight request must be answered with an empty payload on disable"
+    );
+    assert!(
+        t.take_clipboard_reads().is_empty(),
+        "and must no longer be servable"
+    );
+}
+
+/// A hard reset (RIS) must likewise refuse rather than strand a parked request.
+#[test]
+fn hard_reset_refuses_pending_clipboard_reads() {
+    let mut t = Terminal::new(4, 20);
+    t.set_clipboard_read_enabled(true);
+    t.advance(b"\x1b]52;c;?\x07");
+    let _ = t.take_pty_response();
+    t.advance(b"\x1bc"); // RIS
+    assert_eq!(
+        t.take_pty_response(),
+        b"\x1b]52;c;\x07".to_vec(),
+        "RIS must answer, not strand, a pending read"
+    );
+    assert!(t.take_clipboard_reads().is_empty());
 }
 
 // ---- OSC 4 / 10 / 11 / 12 colors ----
@@ -1701,6 +1864,48 @@ fn buffer_text_skips_the_wide_glyph_continuation_spacer() {
         "no stray spacer emitted after the wide glyph"
     );
     assert_eq!(text.matches('世').count(), 1, "the wide glyph appears once");
+}
+
+#[test]
+fn screen_text_skips_the_wide_glyph_continuation_spacer() {
+    // REGRESSION: `screen_text` is what the app presents as "what is on screen"
+    // — it feeds the AccessKit screen-reader node, the in-terminal search
+    // corpus, the command-history echo gate and the headless render fallback.
+    // It used to be the raw `Grid::to_text` per-cell dump, which EMITS the blank
+    // continuation cell after a width-2 glyph, so a CJK line came back as
+    // "\u{65e5} \u{672c} \u{8a9e}": substring search could not find it, CJK
+    // commands were never recorded in history, and a screen reader announced a
+    // phantom space between every wide glyph.
+    let mut t = Terminal::new(2, 8);
+    t.advance("\u{65e5}\u{672c}\u{8a9e}".as_bytes());
+    let text = t.screen_text();
+    assert!(
+        text.contains("\u{65e5}\u{672c}\u{8a9e}"),
+        "the visible screen must read as the drawn glyphs, got {text:?}"
+    );
+    assert!(
+        !text.contains("\u{65e5} "),
+        "no stray continuation spacer after a wide glyph, got {text:?}"
+    );
+    // One line per grid row, each newline-terminated (unchanged from to_text).
+    assert_eq!(
+        text.matches('\n').count(),
+        2,
+        "one trailing newline per grid row"
+    );
+}
+
+#[test]
+fn screen_text_and_to_text_agree_on_pure_ascii() {
+    // The fix must change NOTHING for ASCII: the spacer skip only fires after a
+    // width-2 glyph, so an ASCII screen is byte-identical to the raw dump.
+    let mut t = Terminal::new(2, 8);
+    t.advance(b"hi there");
+    assert_eq!(
+        t.screen_text(),
+        t.grid().to_text(),
+        "ASCII screens are unaffected by the wide-glyph convention"
+    );
 }
 
 #[test]
@@ -2558,6 +2763,392 @@ fn xtgettcap_does_not_disturb_sixel() {
     );
 }
 
+#[test]
+fn xtgettcap_answers_a_non_utf8_capability_name() {
+    // "00ff" is well-formed hex but decodes to bytes that are not valid UTF-8,
+    // so it can never name a capability. It must still be ANSWERED with the
+    // unknown-capability form: a query the terminal drops silently hangs an app
+    // that blocks on the reply.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP+q00ff\x1b\\");
+    // The quoted name is re-encoded from the DECODED bytes (normalised upper
+    // hex), never a byte-for-byte reflection of the request.
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP0+r00FF\x1b\\");
+}
+
+#[test]
+fn xtgettcap_answers_a_malformed_hex_name() {
+    // Odd-length / non-hex tokens name nothing at all, so there is no name to
+    // quote back — but the caller still gets the bare unknown form, not silence.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP+qZZZ\x1b\\");
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP0+r\x1b\\");
+}
+
+#[test]
+fn xtgettcap_advertises_smulx_styled_underline() {
+    let mut t = Terminal::new(4, 20);
+    // "Smulx" hex = 536D756C78.
+    t.advance(b"\x1bP+q536D756C78\x1b\\");
+    let expected = format!(
+        "\x1bP1+r536D756C78={}\x1b\\",
+        hex_encode(SMULX_CAPABILITY.as_bytes())
+    );
+    assert_eq!(t.take_pty_response(), expected.as_bytes());
+}
+
+#[test]
+fn xtgettcap_advertises_setulc_underline_colour() {
+    let mut t = Terminal::new(4, 20);
+    // "Setulc" hex = 536574756C63.
+    t.advance(b"\x1bP+q536574756C63\x1b\\");
+    let expected = format!(
+        "\x1bP1+r536574756C63={}\x1b\\",
+        hex_encode(SETULC_CAPABILITY.as_bytes())
+    );
+    assert_eq!(t.take_pty_response(), expected.as_bytes());
+}
+
+/// The terminal NAME capability, under both spellings that share its arm.
+///
+/// The block above queries `Co`, an unknown name, a non-UTF-8 name, a malformed
+/// hex name, `Smulx` and `Setulc` — but never `TN`, `name` or `RGB`, so those
+/// two arms could be deleted with the whole suite green. That failure is
+/// invisible from INSIDE the terminal: a terminfo-probing app simply reads the
+/// unknown form and downgrades, and nothing anywhere reports an error.
+///
+/// Both spellings are asserted because they SHARE one arm — asserting only
+/// `TN` would leave `name` unpinned if the arm were ever split.
+#[test]
+fn xtgettcap_reports_the_terminal_name_under_both_spellings() {
+    // "TN" hex = 544E.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP+q544E\x1b\\");
+    let expected = format!("\x1bP1+r544E={}\x1b\\", hex_encode(b"xterm-256color"));
+    assert_eq!(t.take_pty_response(), expected.as_bytes());
+
+    // "name" hex = 6E616D65 — the long spelling of the same capability.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP+q6E616D65\x1b\\");
+    let expected = format!("\x1bP1+r6E616D65={}\x1b\\", hex_encode(b"xterm-256color"));
+    assert_eq!(t.take_pty_response(), expected.as_bytes());
+}
+
+/// `RGB` is how an application decides truecolor is available.
+///
+/// It is a BOOLEAN capability, so the reply is the VALID form with NO
+/// `=<value>` — `DCS 1 + r <name> ST`. Dropping the arm yields the UNKNOWN form
+/// (`0+r`), a single-byte difference that silently makes every probing app fall
+/// back to 256 colours, so the reply is asserted byte-for-byte.
+#[test]
+fn xtgettcap_advertises_rgb_truecolor_as_a_boolean_capability() {
+    // "RGB" hex = 524742.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP+q524742\x1b\\");
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1+r524742\x1b\\");
+}
+
+/// The XTGETTCAP payload cap truncates on an EVEN hex boundary, and that parity
+/// is load-bearing.
+///
+/// `put` caps the accumulator at 4096 bytes. Widening `<` to `<=` caps it at
+/// 4097 instead — a one-byte change that flips the parity of a hex string, and
+/// `hex_decode_bytes` rejects an ODD-length name outright. So the off-by-one
+/// decides between two DIFFERENT replies: 4096 bytes decode and the terminal
+/// quotes the normalised name back (`DCS 0 + r <4096 hex> ST`, 4103 bytes),
+/// while 4097 bytes fail to decode and the terminal answers the BARE unknown
+/// form (`DCS 0 + r ST`, 7 bytes).
+///
+/// This is deliberately NOT covered by the `push_decrqss_byte` exclusion in
+/// `.cargo/mutants.toml`. Both this cap and the sixel cap next door generate the
+/// identical mutant description `replace < with <= in <impl Perform for
+/// Screen>::put`, so an exclusion written against `put` could not pardon the
+/// DECRQSS cap without silently pardoning THIS one too — which is why the
+/// DECRQSS cap was extracted into its own named helper. Measured before this
+/// test existed: applying `<=` here left the whole core lib suite green
+/// (931 passed), so the mutant was live, reachable and uncaught.
+#[test]
+fn xtgettcap_payload_cap_truncates_on_an_even_hex_boundary() {
+    // 'A' is a valid hex digit, so an over-long run of it is a WELL-FORMED name
+    // once truncated to an even length — which is what makes the parity, rather
+    // than the hex validity, the thing under test.
+    const OVERLONG: [u8; 5000] = [b'A'; 5000];
+    const CAPPED: [u8; 4096] = [b'A'; 4096];
+
+    let mut t = Terminal::new(4, 20);
+    let mut req = Vec::from(&b"\x1bP+q"[..]);
+    req.extend_from_slice(&OVERLONG);
+    req.extend_from_slice(b"\x1b\\");
+    t.advance(&req);
+
+    // 4096 'A's decode to 2048 x 0xAA, which is not valid UTF-8 and so matches
+    // no capability — the UNKNOWN form, but with the name quoted back.
+    let mut expected = Vec::from(&b"\x1bP0+r"[..]);
+    expected.extend_from_slice(&CAPPED);
+    expected.extend_from_slice(b"\x1b\\");
+
+    let got = t.take_pty_response();
+    assert_eq!(
+        got.len(),
+        4103,
+        "a 4096-byte (even) payload must decode and be quoted back; a 4097-byte \
+         (odd) one would fail to decode and collapse to the 7-byte bare form"
+    );
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn smulx_advertisement_is_backed_by_real_support() {
+    // TRUTHFULNESS: advertising `Smulx` promises that the sequence its template
+    // expands to actually selects an underline style. Instantiate the template
+    // by hand for each `%p1` and assert the parser really honours it — an
+    // advertisement no implementation backs is the lie this test exists to stop.
+    assert!(
+        SMULX_CAPABILITY.starts_with("\x1b[4:") && SMULX_CAPABILITY.ends_with('m'),
+        "Smulx must expand to an SGR 4 colon sub-parameter: {SMULX_CAPABILITY:?}"
+    );
+    let cases = [
+        (b"\x1b[4:0mX".as_slice(), UnderlineStyle::None),
+        (b"\x1b[4:1mX".as_slice(), UnderlineStyle::Single),
+        (b"\x1b[4:2mX".as_slice(), UnderlineStyle::Double),
+        (b"\x1b[4:3mX".as_slice(), UnderlineStyle::Curly),
+        (b"\x1b[4:4mX".as_slice(), UnderlineStyle::Dotted),
+        (b"\x1b[4:5mX".as_slice(), UnderlineStyle::Dashed),
+    ];
+    for (seq, want) in cases {
+        let mut t = Terminal::new(2, 10);
+        t.advance(seq);
+        assert_eq!(
+            t.grid().cell(0, 0).unwrap().flags.underline_style,
+            want,
+            "Smulx claims support for {seq:x?}"
+        );
+    }
+}
+
+#[test]
+fn setulc_advertisement_is_backed_by_real_support() {
+    // TRUTHFULNESS: `Setulc` promises the colon form WITH the empty colorspace
+    // slot (`58:2::r:g:b`) is understood. Assert the template really emits that
+    // shape, and that the shape really sets the underline colour.
+    assert!(
+        SETULC_CAPABILITY.starts_with("\x1b[58:2::") && SETULC_CAPABILITY.ends_with('m'),
+        "Setulc must expand to the colon RGB form: {SETULC_CAPABILITY:?}"
+    );
+    let mut t = Terminal::new(2, 10);
+    // The hand-expansion of the template for %p1 = 0x0A141E (10,20,30).
+    t.advance(b"\x1b[58:2::10:20:30mX");
+    assert_eq!(
+        t.grid().cell(0, 0).unwrap().underline_color,
+        Some(Color::Rgb(10, 20, 30)),
+        "Setulc claims support for the empty-colorspace colon form"
+    );
+}
+
+// ---- XTVERSION (`CSI > 0 q`) ----
+
+#[test]
+fn xtversion_reports_the_crate_version() {
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[>0q");
+    let expected = format!("\x1bP>|c0pl4nd({})\x1b\\", env!("CARGO_PKG_VERSION"));
+    assert_eq!(t.take_pty_response(), expected.as_bytes());
+    // Guard the DERIVATION, not just the shape: a hard-coded literal passes
+    // today and breaks on the next version bump, so pin that the reported
+    // version is the crate's own and is a real dotted version, never a stub.
+    let ver = env!("CARGO_PKG_VERSION");
+    assert!(
+        ver.contains('.') && ver.chars().next().is_some_and(|c| c.is_ascii_digit()),
+        "the crate version must be a real dotted version, got {ver:?}"
+    );
+}
+
+#[test]
+fn xtversion_omitted_parameter_is_treated_as_zero() {
+    // `CSI > q` with no parameter is the same request as `CSI > 0 q`.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[>q");
+    let expected = format!("\x1bP>|c0pl4nd({})\x1b\\", env!("CARGO_PKG_VERSION"));
+    assert_eq!(t.take_pty_response(), expected.as_bytes());
+}
+
+#[test]
+fn xtversion_ignores_a_non_zero_parameter() {
+    // Deliberate narrow exception to "always answer a query": XTVERSION defines
+    // no invalid/negative reply form, so there is nothing truthful to send for
+    // a Ps the protocol assigns no meaning to.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[>1q");
+    assert!(
+        t.take_pty_response().is_empty(),
+        "only Ps 0 requests the version"
+    );
+}
+
+#[test]
+fn xtversion_does_not_disturb_decscusr_or_secondary_da() {
+    // `CSI > Ps q` (XTVERSION), `CSI Ps SP q` (DECSCUSR) and `CSI > Ps c`
+    // (secondary DA) are near neighbours. Pin that adding XTVERSION moved
+    // neither of the other two.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[4 q"); // DECSCUSR: steady underline
+    assert!(
+        t.take_pty_response().is_empty(),
+        "DECSCUSR sets state and emits no reply"
+    );
+    t.advance(b"\x1bP$q q\x1b\\"); // DECRQSS confirms the shape really changed
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1$r4 q\x1b\\");
+
+    t.advance(b"\x1b[>c"); // secondary DA still answers its own reply
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1b[>0;0;0c");
+}
+
+// ---- DECRQSS (`DCS $ q <setting> ST` — report the current setting) ----
+
+#[test]
+fn decrqss_reports_current_sgr() {
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[1;31m"); // bold + red foreground
+    t.advance(b"\x1bP$qm\x1b\\");
+    // Valid form: DCS 1 $ r <sgr params> m ST, led by 0 so the client can
+    // replay it verbatim.
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1$r0;1;31m\x1b\\");
+}
+
+#[test]
+fn decrqss_reports_default_sgr_when_the_pen_is_clean() {
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP$qm\x1b\\");
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1$r0m\x1b\\");
+}
+
+#[test]
+fn decrqss_reports_extended_sgr_colors_and_underline_style() {
+    let mut t = Terminal::new(4, 20);
+    // Curly underline + 24-bit foreground + bright-index background.
+    t.advance(b"\x1b[4:3;38;2;10;20;30;101m");
+    t.advance(b"\x1bP$qm\x1b\\");
+    assert_eq!(
+        t.take_pty_response().as_slice(),
+        b"\x1bP1$r0;4:3;38;2;10;20;30;101m\x1b\\"
+    );
+}
+
+/// The 8 / 16 colour-index BOUNDARIES of the DECRQSS SGR report.
+///
+/// `push_sgr_color` has three arms — `0..=7` (base 30/40), `8..=15` (aixterm
+/// bright 90/100, offset by 8) and `16..` (extended `38;5;n`). The extended-SGR
+/// test above is the only test in the workspace that drives an INDEXED colour
+/// through it, and it picks index 9 — the MIDDLE of the bright arm. Index 9 is
+/// invariant under every boundary mutation: `n < 8` widened to `n <= 8` still
+/// misses it, `n < 16` widened to `n <= 16` still catches it, and replacing the
+/// `n < 16` guard with `true` changes nothing because it already matched. So
+/// both guards went unasserted while looking covered.
+///
+/// The reply is documented as a self-contained sequence a client can replay
+/// verbatim, which is why index 8 matters most: `30 + 8` is `38`, the
+/// EXTENDED-COLOUR INTRODUCER, so a client replaying a mis-reported index 8
+/// mis-parses every parameter after it rather than merely painting one cell in
+/// the wrong colour.
+#[test]
+fn decrqss_sgr_report_pins_the_8_and_16_colour_index_boundaries() {
+    // Index 8 is the FIRST bright colour: aixterm `90`, never `30 + 8 == 38`.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[38;5;8m");
+    t.advance(b"\x1bP$qm\x1b\\");
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1$r0;90m\x1b\\");
+
+    // Index 16 is the FIRST extended colour: `38;5;16`, never `90 + 16 - 8`.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[38;5;16m");
+    t.advance(b"\x1bP$qm\x1b\\");
+    assert_eq!(
+        t.take_pty_response().as_slice(),
+        b"\x1bP1$r0;38;5;16m\x1b\\"
+    );
+
+    // And a high index proves the bright arm is not swallowing the whole range:
+    // with the `n < 16` guard replaced by `true`, 255 reports as `;347`.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[48;5;255m");
+    t.advance(b"\x1bP$qm\x1b\\");
+    assert_eq!(
+        t.take_pty_response().as_slice(),
+        b"\x1bP1$r0;48;5;255m\x1b\\"
+    );
+}
+
+#[test]
+fn decrqss_reports_scroll_region() {
+    let mut t = Terminal::new(10, 20);
+    t.advance(b"\x1b[3;7r"); // DECSTBM rows 3..7 (1-based)
+    t.advance(b"\x1bP$qr\x1b\\");
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1$r3;7r\x1b\\");
+}
+
+#[test]
+fn decrqss_reports_cursor_style() {
+    let mut t = Terminal::new(4, 20);
+    // Default shape is a steady block → DECSCUSR Ps 2.
+    t.advance(b"\x1bP$q q\x1b\\");
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1$r2 q\x1b\\");
+
+    // A steady underline (CSI 4 SP q) round-trips as Ps 4.
+    t.advance(b"\x1b[4 q");
+    t.advance(b"\x1bP$q q\x1b\\");
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1$r4 q\x1b\\");
+}
+
+#[test]
+fn decrqss_unsupported_setting_gets_the_invalid_form() {
+    let mut t = Terminal::new(4, 20);
+    // DECSCA (`" q`) is not a setting this terminal tracks. The DEC answer is
+    // the invalid form — an explicit "no", never silence.
+    t.advance(b"\x1bP$q\"q\x1b\\");
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP0$r\x1b\\");
+}
+
+#[test]
+fn decrqss_never_echoes_request_bytes() {
+    // SECURITY (device-reply echo-to-stdin): the reply is built from internal
+    // state only. A hostile selector must come back as the fixed invalid form
+    // with none of the request's bytes smuggled into it.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP$q\x07evil\x1b\\");
+    let resp = t.take_pty_response();
+    assert_eq!(resp.as_slice(), b"\x1bP0$r\x1b\\");
+    assert!(
+        !resp.windows(4).any(|w| w == b"evil"),
+        "the reply must not carry request bytes: {resp:x?}"
+    );
+}
+
+#[test]
+fn decrqss_does_not_disturb_sixel() {
+    // `DCS $ q` (DECRQSS) and `DCS q` (Sixel) share the final byte and are
+    // told apart ONLY by the `$` intermediate. Regression guard for the hook
+    // disambiguation in BOTH directions.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP$qm\x1b\\");
+    assert!(
+        t.images().is_empty(),
+        "a DECRQSS request must never be decoded as an image"
+    );
+    assert!(
+        !t.take_pty_response().is_empty(),
+        "a DECRQSS request must be answered"
+    );
+
+    // A plain DCS q is still a Sixel image, and still emits no reply.
+    t.advance(b"\x1bPq#0;2;100;0;0~\x1b\\");
+    assert_eq!(t.images().len(), 1, "sixel still decodes");
+    assert_eq!(t.images()[0].image.height, 6);
+    assert!(
+        t.take_pty_response().is_empty(),
+        "sixel emits no device reply"
+    );
+}
+
 // ---- C33: DECRQM ----
 
 #[test]
@@ -3116,13 +3707,13 @@ fn osc52_primary_selection_recognised() {
 }
 
 #[test]
-fn osc52_read_request_dropped_when_disabled() {
+fn osc52_read_request_refused_when_disabled() {
     let mut t = Terminal::new(2, 10);
     assert!(!t.clipboard_read_enabled(), "reads off by default");
     t.advance(b"\x1b]52;c;?\x07");
-    // No write produced, no reply queued.
+    // No write produced; the reply carries an empty payload (refusal).
     assert!(t.take_clipboard_write().is_none());
-    assert!(t.take_pty_response().is_empty());
+    assert_eq!(t.take_pty_response(), b"\x1b]52;c;\x07".to_vec());
 }
 
 #[test]
@@ -3491,6 +4082,84 @@ fn rep_with_no_prior_print_is_noop() {
 }
 
 // ---- SGR attribute combinations + reset arms ----
+
+/// SGR 2/5/6/8/53 previously fell into the parser's catch-all `_ => {}` arm and
+/// were silently dropped. Each must now land on its own flag, and each must have
+/// its own reset arm (22 dim, 25 blink, 28 conceal, 55 overline).
+#[test]
+fn sgr_dim_blink_conceal_overline_are_parsed_and_reset() {
+    let mut t = Terminal::new(2, 40);
+    t.advance(b"\x1b[2;5;6;8;53mX");
+    let c = t.grid().cell(0, 0).unwrap();
+    assert!(c.flags.dim, "SGR 2 -> dim");
+    assert!(c.flags.blink, "SGR 5 -> blink");
+    assert!(c.flags.rapid_blink, "SGR 6 -> rapid blink");
+    assert!(c.flags.conceal, "SGR 8 -> conceal");
+    assert!(c.flags.overline, "SGR 53 -> overline");
+
+    // 25 cancels BOTH blink rates; 28 conceal-off; 55 overline-off.
+    t.advance(b"\x1b[25;28;55mY");
+    let c = t.grid().cell(0, 1).unwrap();
+    assert!(!c.flags.blink, "SGR 25 clears slow blink");
+    assert!(!c.flags.rapid_blink, "SGR 25 also clears rapid blink");
+    assert!(!c.flags.conceal, "SGR 28 clears conceal");
+    assert!(!c.flags.overline, "SGR 55 clears overline");
+    assert!(c.flags.dim, "SGR 25/28/55 must not touch dim");
+}
+
+/// ECMA-48 SGR 22 is "normal intensity": it cancels BOTH bold (1) and faint (2).
+/// There is no separate dim-off code, so a 22 that only cleared bold would leave
+/// text permanently dim.
+#[test]
+fn sgr_22_cancels_both_bold_and_dim() {
+    let mut t = Terminal::new(2, 40);
+    t.advance(b"\x1b[1;2mA");
+    let c = t.grid().cell(0, 0).unwrap();
+    assert!(c.flags.bold && c.flags.dim);
+    t.advance(b"\x1b[22mB");
+    let c = t.grid().cell(0, 1).unwrap();
+    assert!(!c.flags.bold, "SGR 22 clears bold");
+    assert!(!c.flags.dim, "SGR 22 also clears dim");
+}
+
+/// SGR 0 must clear the newly-parsed attributes too — a reset that only knew
+/// about the old flag set would leak dim/blink/conceal/overline forever.
+#[test]
+fn sgr_0_clears_the_extended_attributes() {
+    let mut t = Terminal::new(2, 40);
+    t.advance(b"\x1b[2;5;6;8;53mA\x1b[0mB");
+    let c = t.grid().cell(0, 1).unwrap();
+    assert!(!c.flags.dim && !c.flags.blink && !c.flags.rapid_blink);
+    assert!(!c.flags.conceal && !c.flags.overline);
+}
+
+/// SGR 39/49 must restore the TAGGED `Color::Default` — not palette slot 7/0.
+/// Storing a resolved index here would break live theme switching and would
+/// paint "default" text as ANSI white.
+#[test]
+fn sgr_39_and_49_restore_tagged_default_not_palette_slots() {
+    let mut t = Terminal::new(2, 40);
+    t.advance(b"\x1b[37;40mA"); // explicitly white-on-black from the palette
+    let c = t.grid().cell(0, 0).unwrap();
+    assert_eq!(c.fg, Color::Indexed(7));
+    assert_eq!(c.bg, Color::Indexed(0));
+    t.advance(b"\x1b[39;49mB");
+    let c = t.grid().cell(0, 1).unwrap();
+    assert_eq!(c.fg, Color::Default, "39 must be Default, never Indexed(7)");
+    assert_eq!(c.bg, Color::Default, "49 must be Default, never Indexed(0)");
+}
+
+/// The 256-colour operand must survive the parser as a TAGGED index all the way
+/// into the cell, so the theme (not the parser) owns resolution.
+#[test]
+fn sgr_extended_index_reaches_the_cell_untagged_by_the_parser() {
+    let mut t = Terminal::new(2, 40);
+    t.advance(b"\x1b[38;5;208mO");
+    assert_eq!(t.grid().cell(0, 0).unwrap().fg, Color::Indexed(208));
+    // And it resolves to the canonical xterm orange through the theme.
+    let theme = crate::theme::Theme::builtin_void();
+    assert_eq!(theme.ansi(208), (255, 135, 0));
+}
 
 #[test]
 fn sgr_all_attributes_and_individual_resets() {

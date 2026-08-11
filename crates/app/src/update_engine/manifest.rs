@@ -126,17 +126,19 @@ pub struct Manifest {
 /// Verify a signed manifest and parse it — **signature first, ALWAYS**.
 ///
 /// The minisign signature (`sig_str`, the `latest.json.minisig` contents) is
-/// verified over the RAW `json_bytes` against `pubkey` BEFORE any
+/// verified over the RAW `json_bytes` against `pubkeys` BEFORE any
 /// deserialization. An unverified manifest is never parsed — so a tampered or
 /// forged `latest.json` cannot reach the serde layer (let alone the gates).
 /// Fails closed: any signature OR parse error returns `Err`.
 pub fn parse_and_verify(
     json_bytes: &[u8],
     sig_str: &str,
-    pubkey: &str,
+    pubkeys: &[&str],
 ) -> Result<Manifest, String> {
-    // Cryptographic gate first — verify the signature over the exact bytes.
-    verify::verify_signature(json_bytes, sig_str, pubkey)?;
+    // Cryptographic gate first — verify the signature over the exact bytes
+    // against at least ONE trusted key. Multi-key so a rotated signing key is
+    // still accepted by already-installed clients (see `EMBEDDED_PUBLIC_KEYS`).
+    verify::verify_any_signature(json_bytes, sig_str, pubkeys)?;
     // Only a verified manifest is ever deserialized.
     serde_json::from_slice::<Manifest>(json_bytes)
         .map_err(|e| format!("manifest parse failed after signature verified: {e}"))
@@ -356,7 +358,8 @@ mod tests {
     fn good_manifest_verifies_and_parses() {
         let json = fixture_json("0.4.9", 4009, "2099-01-01T00:00:00Z");
         let (pk, sig) = sign(json.as_bytes());
-        let m = parse_and_verify(json.as_bytes(), &sig, &pk).expect("a valid manifest parses");
+        let m = parse_and_verify(json.as_bytes(), &sig, &[pk.as_str()])
+            .expect("a valid manifest parses");
         assert_eq!(m.schema, "itasha.update.manifest/v1");
         assert_eq!(m.product, "c0pl4nd");
         assert_eq!(m.release_index, 4009);
@@ -379,7 +382,7 @@ mod tests {
         let (pk, _good_sig) = sign(json.as_bytes());
         // A signature over DIFFERENT bytes (same key) must not verify this json.
         let (_pk2, sig_other) = sign(b"a different document entirely");
-        let err = parse_and_verify(json.as_bytes(), &sig_other, &pk)
+        let err = parse_and_verify(json.as_bytes(), &sig_other, &[pk.as_str()])
             .expect_err("a non-matching signature must be rejected");
         assert!(
             err.contains("signature verification failed") || err.contains("bad signature"),
@@ -402,7 +405,7 @@ mod tests {
             .expect("fixture contains release_index 4009");
         tampered[pos] = b'9'; // 4009 -> 9009 (a forged higher index)
         assert!(
-            parse_and_verify(&tampered, &sig, &pk).is_err(),
+            parse_and_verify(&tampered, &sig, &[pk.as_str()]).is_err(),
             "a tampered manifest must fail signature verification"
         );
     }
@@ -467,7 +470,7 @@ mod tests {
     fn archive_for_skips_exe_and_picks_the_matching_archive() {
         let json = fixture_json("0.4.9", 4009, "2099-01-01T00:00:00Z");
         let (pk, sig) = sign(json.as_bytes());
-        let m = parse_and_verify(json.as_bytes(), &sig, &pk).unwrap();
+        let m = parse_and_verify(json.as_bytes(), &sig, &[pk.as_str()]).unwrap();
 
         // Windows: must pick the .zip ARCHIVE, never the setup .exe.
         let win = m
@@ -492,7 +495,7 @@ mod tests {
     fn installer_for_picks_the_setup_exe_on_windows_only() {
         let json = fixture_json("0.4.9", 4009, "2099-01-01T00:00:00Z");
         let (pk, sig) = sign(json.as_bytes());
-        let m = parse_and_verify(json.as_bytes(), &sig, &pk).unwrap();
+        let m = parse_and_verify(json.as_bytes(), &sig, &[pk.as_str()]).unwrap();
 
         // Windows resolves the self-elevating setup.exe (the elevated
         // Program-Files apply path), with its signed sha256 pinning the download.
@@ -548,7 +551,7 @@ mod tests {
     fn archive_for_empty_target_never_matches() {
         let json = fixture_json("0.4.9", 4009, "2099-01-01T00:00:00Z");
         let (pk, sig) = sign(json.as_bytes());
-        let m = parse_and_verify(json.as_bytes(), &sig, &pk).unwrap();
+        let m = parse_and_verify(json.as_bytes(), &sig, &[pk.as_str()]).unwrap();
         assert!(m.archive_for("", ".zip").is_none());
     }
 
@@ -579,8 +582,8 @@ mod tests {
 "published_utc":"2026-06-29T14:17:42Z","valid_until_utc":"2099-01-01T00:00:00Z",
 "assets":[],"future_field":{"nested":true},"another":42}"#;
         let (pk, sig) = sign(json.as_bytes());
-        let m =
-            parse_and_verify(json.as_bytes(), &sig, &pk).expect("unknown fields must be tolerated");
+        let m = parse_and_verify(json.as_bytes(), &sig, &[pk.as_str()])
+            .expect("unknown fields must be tolerated");
         assert_eq!(m.release_index, 5000);
     }
 

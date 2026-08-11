@@ -488,30 +488,35 @@ fn the_tint_strength_slider_changes_the_live_config() {
 }
 
 #[test]
-fn mode_off_disables_the_channel_combo() {
-    // The Updates page renders TWO combos: [0] = update Mode (off/notify/manual/
-    // auto), [1] = release channel. The channel combo is rendered inside
-    // `add_enabled_ui(mode != Off, …)`, so its enabled-ness reflects the LIVE
-    // Mode — no set-then-assert tautology. The default Mode is Notify (networked),
-    // so the channel combo starts ENABLED; switching Mode to "off" (fully offline)
-    // DISABLES it.
+fn mode_off_disables_the_check_for_updates_button() {
+    // The Updates page used to render TWO combos, [0] Mode and [1] release
+    // channel, and this test asserted Mode=off disabled the channel one. That
+    // combo is gone: it wrote `config.update.channel`, which the in-app updater
+    // never read (see settings.rs, "Release channel: DELIBERATELY NOT RENDERED").
+    //
+    // The property is still worth pinning, so it moves to the control that
+    // survives and carries the same `mode != Off` gate -- the "Check for
+    // updates" BUTTON, which is the actual network action. Asserting on it is
+    // strictly better than asserting on a combo that only stored a value:
+    // Mode=off is supposed to mean fully offline, and this is the widget that
+    // would otherwise reach the network.
     let app = RefCell::new(C0pl4ndApp::bootstrap());
     let mut h = harness(&app);
 
     open_settings(&mut h);
     select_category(&mut h, "Updates");
 
-    // Precondition: default Mode = Notify (networked) → channel combo enabled.
+    // Precondition: default Mode = Notify (networked) -> the button is enabled.
+    // Without this the assertion below would pass on a button that was disabled
+    // for some unrelated reason (or always).
     assert!(
-        !h.get_all_by_role(egui::accesskit::Role::ComboBox)
-            .nth(1)
-            .expect("Updates must render the channel combo")
+        !h.get_by_label("Check for updates")
             .accesskit_node()
             .is_disabled(),
-        "precondition: the channel combo is enabled while Mode is notify"
+        "precondition: Check for updates is enabled while Mode is notify"
     );
 
-    // Open the Mode combo (the first one) and pick "off".
+    // Open the Mode combo (now the only one) and pick "off".
     h.get_all_by_role(egui::accesskit::Role::ComboBox)
         .next()
         .expect("Updates must render the Mode combo")
@@ -521,54 +526,13 @@ fn mode_off_disables_the_channel_combo() {
     h.run();
 
     assert!(
-        h.get_all_by_role(egui::accesskit::Role::ComboBox)
-            .nth(1)
-            .expect("the channel combo must still render")
+        h.get_by_label("Check for updates")
             .accesskit_node()
             .is_disabled(),
-        "setting Mode to off makes the app fully offline, disabling the channel combo"
+        "setting Mode to off makes the app fully offline, so the network action \
+         must be disabled"
     );
 }
-
-#[test]
-fn picking_an_update_channel_changes_the_combo_value() {
-    // `update.channel` defaults to "stable"; its combo ([1]) is enabled whenever
-    // Mode != Off (default Mode = Notify, so it is enabled at open). Open the
-    // channel combo, pick "nightly", and assert the combo's accessible VALUE
-    // became "nightly" — its selected_text is `config.update.channel`, so this
-    // observes the live config change, not a test mirror.
-    let app = RefCell::new(C0pl4ndApp::bootstrap());
-    let mut h = harness(&app);
-
-    open_settings(&mut h);
-    select_category(&mut h, "Updates");
-
-    // [1] is the channel combo (after [0] = Mode). Its value is the live channel.
-    let combo = h
-        .get_all_by_role(egui::accesskit::Role::ComboBox)
-        .nth(1)
-        .expect("Updates must render the channel combo");
-    assert_eq!(
-        combo.value().as_deref(),
-        Some("stable"),
-        "precondition: channel defaults to stable"
-    );
-    combo.click();
-    h.run();
-    h.get_by_label("nightly").click(); // the opened menu item
-    h.run();
-
-    assert_eq!(
-        h.get_all_by_role(egui::accesskit::Role::ComboBox)
-            .nth(1)
-            .expect("channel combo")
-            .value()
-            .as_deref(),
-        Some("nightly"),
-        "picking nightly in the combo must update the live config channel"
-    );
-}
-
 #[test]
 fn editing_the_initial_columns_changes_the_drag_value() {
     // `window.cols` defaults to 80 and has no observation accessor. The Initial

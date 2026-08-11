@@ -1,7 +1,7 @@
 # Troubleshooting
 
 Common issues and how to resolve them. If your problem isn't here, please open
-an issue on the [tracker](https://github.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND/issues)
+an issue on the [tracker](https://github.com/46b-ETYKiAL/C0PL4ND/issues)
 and include your OS, the `c0pl4nd --version` output, and (if relevant) the log
 output described under [Diagnostic logging](#diagnostic-logging) below.
 

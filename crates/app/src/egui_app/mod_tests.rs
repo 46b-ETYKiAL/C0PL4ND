@@ -102,31 +102,67 @@ fn quote_path_for_shell_posix_escapes_single_quote() {
 #[test]
 fn glyph_cache_key_is_content_pass_and_style_sensitive() {
     let style = row_style_key(14.0, (200, 200, 200));
-    let base = glyph_cache_key('a', (255, 0, 0), RowPass::Main, style);
+    let base = glyph_cache_key(
+        'a',
+        (255, 0, 0),
+        RowPass::Main,
+        style,
+        glyph_cache::GlyphAttrs::default(),
+    );
     assert_eq!(
         base,
-        glyph_cache_key('a', (255, 0, 0), RowPass::Main, style),
+        glyph_cache_key(
+            'a',
+            (255, 0, 0),
+            RowPass::Main,
+            style,
+            glyph_cache::GlyphAttrs::default()
+        ),
         "identical glyph+colour+pass+style → same key (a cache HIT, reused per cell)"
     );
     assert_ne!(
         base,
-        glyph_cache_key('b', (255, 0, 0), RowPass::Main, style),
+        glyph_cache_key(
+            'b',
+            (255, 0, 0),
+            RowPass::Main,
+            style,
+            glyph_cache::GlyphAttrs::default()
+        ),
         "a different glyph must change the key"
     );
     assert_ne!(
         base,
-        glyph_cache_key('a', (0, 255, 0), RowPass::Main, style),
+        glyph_cache_key(
+            'a',
+            (0, 255, 0),
+            RowPass::Main,
+            style,
+            glyph_cache::GlyphAttrs::default()
+        ),
         "a colour change must change the key"
     );
     assert_ne!(
         base,
-        glyph_cache_key('a', (255, 0, 0), RowPass::GhostRed, style),
+        glyph_cache_key(
+            'a',
+            (255, 0, 0),
+            RowPass::GhostRed,
+            style,
+            glyph_cache::GlyphAttrs::default()
+        ),
         "a different pass (chromatic ghost) must change the key"
     );
     let style2 = row_style_key(18.0, (200, 200, 200));
     assert_ne!(
         base,
-        glyph_cache_key('a', (255, 0, 0), RowPass::Main, style2),
+        glyph_cache_key(
+            'a',
+            (255, 0, 0),
+            RowPass::Main,
+            style2,
+            glyph_cache::GlyphAttrs::default()
+        ),
         "a font-size change must change the key"
     );
 }
@@ -353,6 +389,161 @@ fn cell_at_pos_maps_pointer_to_grid_cell() {
     assert_eq!(cell_at_pos(egui::pos2(36.0, 19.0), origin, cw, ch), None);
     // Degenerate cell size never divides by zero.
     assert_eq!(cell_at_pos(egui::pos2(36.0, 60.0), origin, 0.0, ch), None);
+}
+
+// ---- drag-select autoscroll rate + edge clamping ----------------------------
+//
+// The geometry half of drag-select autoscroll. The behavioural half — that the
+// view actually scrolls AND the selection extends over the newly revealed lines
+// — is driven end-to-end through the real frame loop in
+// `crates/app/tests/egui_drag_autoscroll.rs`.
+
+#[test]
+fn autoscroll_is_silent_while_the_pointer_is_inside_the_grid() {
+    // Grid spans y ∈ [20, 180) (10 rows of 16pt). Anywhere inside — including
+    // exactly on either boundary — must not scroll: autoscroll is an
+    // edge-OVERSHOOT behaviour, not a side effect of dragging.
+    let (top, bottom, ch) = (20.0, 180.0, 16.0);
+    assert_eq!(autoscroll_lines(100.0, top, bottom, ch), 0, "mid-grid");
+    assert_eq!(autoscroll_lines(top, top, bottom, ch), 0, "on the top edge");
+    assert_eq!(
+        autoscroll_lines(bottom, top, bottom, ch),
+        0,
+        "on the bottom edge"
+    );
+}
+
+#[test]
+fn autoscroll_direction_matches_the_edge_the_pointer_left() {
+    // Positive == back into history (`scroll_view(+n)`), so dragging ABOVE the
+    // top must be positive and BELOW the bottom negative. A swapped sign would
+    // scroll the view AWAY from the content the user is reaching for.
+    let (top, bottom, ch) = (20.0, 180.0, 16.0);
+    assert!(
+        autoscroll_lines(top - 1.0, top, bottom, ch) > 0,
+        "above the top scrolls BACK into history"
+    );
+    assert!(
+        autoscroll_lines(bottom + 1.0, top, bottom, ch) < 0,
+        "below the bottom scrolls FORWARD toward the live bottom"
+    );
+}
+
+#[test]
+fn autoscroll_rate_scales_with_the_overshoot_and_is_capped() {
+    // One row past → 1 line; three rows past → 3; a flung pointer saturates at
+    // the cap instead of teleporting across the whole history.
+    let (top, bottom, ch) = (20.0, 180.0, 16.0);
+    assert_eq!(
+        autoscroll_lines(bottom + 1.0, top, bottom, ch),
+        -1,
+        "a single pixel of overshoot still moves one line"
+    );
+    assert_eq!(autoscroll_lines(bottom + ch, top, bottom, ch), -1);
+    assert_eq!(
+        autoscroll_lines(bottom + 3.0 * ch, top, bottom, ch),
+        -3,
+        "three rows of overshoot must move three lines, not one"
+    );
+    assert_eq!(
+        autoscroll_lines(top - 3.0 * ch, top, bottom, ch),
+        3,
+        "the same scaling applies above the top edge"
+    );
+    assert_eq!(
+        autoscroll_lines(bottom + 10_000.0, top, bottom, ch),
+        -AUTOSCROLL_MAX_LINES,
+        "a far-flung pointer clamps to the per-frame cap"
+    );
+    assert_eq!(
+        autoscroll_lines(top - 10_000.0, top, bottom, ch),
+        AUTOSCROLL_MAX_LINES
+    );
+}
+
+#[test]
+fn autoscroll_never_divides_by_zero_or_wraps_on_degenerate_input() {
+    // Degenerate cell height / inverted span / non-finite pointer are all
+    // "no scroll", never a panic and never a saturated negative from a bad cast.
+    assert_eq!(
+        autoscroll_lines(0.0, 20.0, 180.0, 0.0),
+        0,
+        "zero cell height"
+    );
+    assert_eq!(
+        autoscroll_lines(0.0, 20.0, 180.0, -4.0),
+        0,
+        "negative height"
+    );
+    assert_eq!(autoscroll_lines(0.0, 180.0, 20.0, 16.0), 0, "inverted span");
+    assert_eq!(autoscroll_lines(f32::NAN, 20.0, 180.0, 16.0), 0);
+    assert_eq!(
+        autoscroll_lines(f32::NEG_INFINITY, 20.0, 180.0, 16.0),
+        0,
+        "an infinite pointer is not a scroll request"
+    );
+}
+
+#[test]
+fn clamping_maps_an_off_grid_pointer_to_the_nearest_edge_cell() {
+    // Origin (10,20), 8×16 cells, a 4-col × 10-row grid. Inside, the clamped
+    // mapping agrees with `cell_at_pos`; outside, it pins to the edge cell
+    // instead of returning None (above/left) or a row that does not exist
+    // (below/right) — the latter would place the selection head off the grid.
+    let origin = egui::pos2(10.0, 20.0);
+    let (cw, ch) = (8.0, 16.0);
+    let (cols, rows) = (4, 10);
+    assert_eq!(
+        clamp_pos_to_grid_cell(egui::pos2(36.0, 60.0), origin, cw, ch, cols, rows),
+        Some((2, 3)),
+        "inside the grid it agrees with the unclamped hit test"
+    );
+    assert_eq!(
+        cell_at_pos(egui::pos2(36.0, 60.0), origin, cw, ch),
+        Some((2, 3))
+    );
+    // Above / left of the origin — `cell_at_pos` gives up here, which is exactly
+    // why a drag past the TOP edge used to freeze the selection head.
+    assert_eq!(
+        cell_at_pos(egui::pos2(-900.0, -900.0), origin, cw, ch),
+        None
+    );
+    assert_eq!(
+        clamp_pos_to_grid_cell(egui::pos2(-900.0, -900.0), origin, cw, ch, cols, rows),
+        Some((0, 0)),
+        "off the top-left pins to the first cell"
+    );
+    // Below / right of the last cell pins to the LAST cell, never past it.
+    assert_eq!(
+        clamp_pos_to_grid_cell(egui::pos2(9_000.0, 9_000.0), origin, cw, ch, cols, rows),
+        Some((rows - 1, cols - 1)),
+        "off the bottom-right pins to the last cell"
+    );
+    // A non-finite coordinate must not saturate into a bogus index.
+    assert_eq!(
+        clamp_pos_to_grid_cell(
+            egui::pos2(f32::NAN, f32::INFINITY),
+            origin,
+            cw,
+            ch,
+            cols,
+            rows
+        ),
+        Some((0, 0))
+    );
+    // Degenerate grids yield no cell at all rather than underflowing `count - 1`.
+    assert_eq!(
+        clamp_pos_to_grid_cell(egui::pos2(36.0, 60.0), origin, cw, ch, 0, rows),
+        None
+    );
+    assert_eq!(
+        clamp_pos_to_grid_cell(egui::pos2(36.0, 60.0), origin, cw, ch, cols, 0),
+        None
+    );
+    assert_eq!(
+        clamp_pos_to_grid_cell(egui::pos2(36.0, 60.0), origin, 0.0, ch, cols, rows),
+        None
+    );
 }
 
 #[test]
@@ -974,6 +1165,7 @@ fn theme_candidate_paths_prioritizes_the_config_dir() {
 
 use crate::egui_app::grid as grid_mod;
 use crate::egui_app::layout_state::LayoutSnapshot;
+use crate::egui_app::pty_gate::expect_live_pty;
 
 /// Build a snapshot over a default horizontal grid of the given pane ids.
 fn snapshot_for(panes: &[PaneId], focused: PaneId, next_id: u64) -> LayoutSnapshot {
@@ -1372,5 +1564,222 @@ fn follow_os_theme_toggle_off_forgets_tracked_appearance() {
     assert_eq!(
         app.last_os_theme, None,
         "toggle off forgets the tracked appearance"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// OSC 9;4 taskbar-progress WIRING (pump -> taskbar seam)
+// ---------------------------------------------------------------------------
+// These drive the REAL `pump_pane_effects` and observe the taskbar seam through
+// `taskbar::test_spy`. A test that called `map_progress_state` / `apply_progress`
+// directly would pass forever even if the pump never called them — which is
+// exactly the dormant state this feature was in before the wiring landed (the
+// parsers surfaced `HostEffects::progress` and the app dropped it on the floor).
+
+/// Feed a pane two `OSC 9 ; 4` reports, pump ONE frame, and assert the taskbar
+/// seam received the LAST one, mapped. Fails if the pump stops draining
+/// `fx.progress`, stops calling `latest_progress` (it would apply 30% instead of
+/// 42%), or stops calling `map_progress_state`/`apply_progress` at all.
+#[test]
+fn pump_drives_taskbar_progress_from_osc_9_4() {
+    let _guard = taskbar::test_spy::serial();
+    taskbar::test_spy::reset();
+
+    let mut app = C0pl4ndApp::bootstrap();
+    let pane = PaneTerm::spawn(app.theme.clone(), 80, 24);
+    let term = expect_live_pty(&pane);
+    {
+        let mut t = term.lock().unwrap();
+        // Two reports in ONE frame: only the LAST is visible on a single button.
+        t.advance(b"\x1b]9;4;1;30\x07"); // Normal 30%
+        t.advance(b"\x1b]9;4;1;42\x07"); // Normal 42%  <- latest wins
+    }
+    app.terms.insert(PaneId(0), pane);
+
+    let ctx = egui::Context::default();
+    app.pump_pane_effects(&ctx);
+
+    assert_eq!(
+        taskbar::test_spy::take(),
+        Some((taskbar::TaskbarProgress::Normal, 42)),
+        "pump must map the LATEST drained OSC 9;4 report onto the taskbar seam"
+    );
+}
+
+/// The WARNING state must reach the taskbar as `Paused` (yellow) through the
+/// real pump — the arm most likely to be silently folded into `Normal`.
+#[test]
+fn pump_maps_warning_progress_to_paused() {
+    let _guard = taskbar::test_spy::serial();
+    taskbar::test_spy::reset();
+
+    let mut app = C0pl4ndApp::bootstrap();
+    let pane = PaneTerm::spawn(app.theme.clone(), 80, 24);
+    let term = expect_live_pty(&pane);
+    term.lock().unwrap().advance(b"\x1b]9;4;4;61\x07"); // state 4 = Warning
+    app.terms.insert(PaneId(0), pane);
+
+    app.pump_pane_effects(&egui::Context::default());
+
+    assert_eq!(
+        taskbar::test_spy::take(),
+        Some((taskbar::TaskbarProgress::Paused, 61)),
+        "OSC 9;4 state 4 (warning) must surface as Paused/yellow, not Normal"
+    );
+}
+
+/// A frame with NO progress reports must leave the taskbar button untouched —
+/// the pump must not spam a `None`/clear every frame (which would wipe a
+/// progress segment set by a previous frame and cost a COM call per frame).
+#[test]
+fn pump_leaves_taskbar_untouched_when_no_progress_drained() {
+    let _guard = taskbar::test_spy::serial();
+    taskbar::test_spy::reset();
+
+    let mut app = C0pl4ndApp::bootstrap();
+    let pane = PaneTerm::spawn(app.theme.clone(), 80, 24);
+    let term = expect_live_pty(&pane);
+    // Plain output + an unrelated OSC: no progress reports at all.
+    term.lock().unwrap().advance(b"hello\r\n\x1b]0;title\x07");
+    app.terms.insert(PaneId(0), pane);
+
+    app.pump_pane_effects(&egui::Context::default());
+
+    assert_eq!(
+        taskbar::test_spy::take(),
+        None,
+        "an empty progress drain must not touch the taskbar button"
+    );
+}
+
+/// The last link of the OSC 52 clipboard-READ chain: real frames must push
+/// `config.clipboard_read_allow` down onto EVERY live pane's emulator, in BOTH
+/// directions. Without this the Settings checkbox would persist a value that
+/// changed nothing (a dead setting), and — worse — turning it back OFF would
+/// leave the hole open for the rest of the session.
+///
+/// Drives the REAL `frame_tick` and observes the REAL emulator gate, re-reading
+/// the live panes after each frame, so it cannot pass on a stale handle or a
+/// test-only mirror of the propagation.
+///
+/// Note the ordering the assertions pin: a pane spawned DURING a frame is
+/// created after the propagation loop has already run, so it picks the setting
+/// up on the following frame. That lag is fail-closed by construction — a fresh
+/// emulator denies reads on its own — so the opt-IN is what is delayed, never
+/// the opt-OUT.
+#[test]
+fn frame_tick_propagates_the_clipboard_read_gate_to_every_pane() {
+    /// Every live pane's gate state, as the emulator itself reports it.
+    fn gates(app: &C0pl4ndApp) -> Vec<bool> {
+        app.terms
+            .values()
+            .filter_map(|p| p.terminal_for_test())
+            .map(|t| t.lock().unwrap().clipboard_read_enabled())
+            .collect()
+    }
+    fn frame(ctx: &egui::Context, app: &mut C0pl4ndApp) {
+        ctx.begin_pass(egui::RawInput::default());
+        app.frame_tick(ctx);
+        let _ = ctx.end_pass();
+    }
+
+    let ctx = egui::Context::default();
+    let mut app = C0pl4ndApp::bootstrap();
+    assert!(
+        !app.config.clipboard_read_allow,
+        "precondition: the shipping default denies clipboard reads"
+    );
+
+    // Opt in. The first frame spawns the pane; the pane must NOT come up already
+    // opened — it starts denied and is opened by the propagation, never before.
+    app.config.clipboard_read_allow = true;
+    frame(&ctx, &mut app);
+    let born = gates(&app);
+    assert!(
+        !born.is_empty(),
+        "the app must have at least one live pane to assert on"
+    );
+    assert!(
+        born.iter().all(|&g| !g),
+        "a newly spawned pane must start DENIED regardless of config, got {born:?}"
+    );
+
+    frame(&ctx, &mut app);
+    let on = gates(&app);
+    assert_eq!(on.len(), born.len(), "same panes still live");
+    assert!(
+        on.iter().all(|&g| g),
+        "a frame must push the opt-in down to every live pane's emulator, got {on:?}"
+    );
+
+    // Opt back out: the hole must close on the very next frame.
+    app.config.clipboard_read_allow = false;
+    frame(&ctx, &mut app);
+    let off = gates(&app);
+    assert_eq!(off.len(), on.len(), "same panes still live");
+    assert!(
+        off.iter().all(|&g| !g),
+        "turning the setting OFF must close the gate again, not leave it open, got {off:?}"
+    );
+}
+
+/// The Settings checkbox must be bound to the real field: clicking
+/// "Allow programs to read the clipboard (OSC 52)" has to flip
+/// `config.clipboard_read_allow` — and nothing else in the Clipboard group.
+///
+/// Drives the REAL widget by its accessible label through the REAL frame loop
+/// (open the gear → pick Terminal → click the row), so a checkbox wired to the
+/// wrong field, or rendered but inert, fails here rather than shipping as a
+/// security setting that does nothing.
+#[test]
+fn clicking_the_clipboard_read_checkbox_flips_the_live_config() {
+    use egui_kittest::kittest::Queryable;
+
+    let app = std::cell::RefCell::new(C0pl4ndApp::bootstrap());
+    assert!(
+        !app.borrow().config.clipboard_read_allow,
+        "precondition: clipboard reads default to DENIED"
+    );
+    // Neighbours in the same Clipboard group, to prove the click is targeted.
+    let copy_on_select_before = app.borrow().config.copy_on_select;
+    let paste_warn_before = app.borrow().config.paste_warn_multiline;
+
+    #[allow(deprecated)]
+    let mut h = egui_kittest::Harness::new(|ctx| app.borrow_mut().frame_tick(ctx));
+    h.set_size(egui::vec2(1200.0, 800.0));
+    h.run();
+
+    h.get_by_label("settings").click();
+    h.run();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Terminal")
+        .click();
+    h.run();
+
+    h.get_by_label("Allow programs to read the clipboard (OSC 52)")
+        .click();
+    h.run();
+
+    assert!(
+        app.borrow().config.clipboard_read_allow,
+        "clicking the OSC 52 row must opt the live config IN"
+    );
+    assert_eq!(
+        app.borrow().config.copy_on_select,
+        copy_on_select_before,
+        "the click must not disturb its neighbour rows"
+    );
+    assert_eq!(
+        app.borrow().config.paste_warn_multiline,
+        paste_warn_before,
+        "the click must not disturb its neighbour rows"
+    );
+
+    // And it must toggle back OFF — a one-way security switch would be a trap.
+    h.get_by_label("Allow programs to read the clipboard (OSC 52)")
+        .click();
+    h.run();
+    assert!(
+        !app.borrow().config.clipboard_read_allow,
+        "clicking again must opt back OUT"
     );
 }

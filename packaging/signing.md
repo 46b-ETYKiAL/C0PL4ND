@@ -21,9 +21,15 @@ rsign generate -W -p c0pl4nd.pub -s c0pl4nd.key   # rsign2 (cargo install rsign2
 - `c0pl4nd.pub` — the public key. Copy its base64 line into
   `crates/app/src/update_engine/verify.rs` → `EMBEDDED_PUBLIC_KEY`.
 
-The current release keypair was generated 2026-06-04; its public half is already
-committed in `verify.rs` and the matching passwordless secret was written to
-`.s4f3-data/c0pl4nd-minisign-secret.key` (outside the repo, git-ignored).
+The current release keypair's public half is committed in `verify.rs`. The
+matching secret half is held offline by the maintainer.
+
+**Where it is held is deliberately not recorded in this repository.** A public
+document that names the file and the directory of a *passwordless* signing key
+hands an attacker who gains any read access to the maintainer's machine the exact
+path to the artifact that authorises every in-app update — the one secret that
+turns the updater from a defence into a delivery channel. Keep the location in a
+password manager, not in a tracked file.
 
 ## Signing in CI (`.github/workflows/release.yml`)
 
@@ -60,8 +66,8 @@ Release. The updater downloads all three, verifies checksum + signature
 
 ## Activation (one-time, repo owner)
 
-1. Add the contents of `.s4f3-data/c0pl4nd-minisign-secret.key` as the
-   `MINISIGN_SECRET_KEY` repository **secret**.
+1. Add the contents of the offline secret-key file as the `MINISIGN_SECRET_KEY`
+   repository **secret**.
 2. Cut a tagged release (`v*`). The release job signs every asset; the shipped
    binary's in-app updater verifies and installs them.
 

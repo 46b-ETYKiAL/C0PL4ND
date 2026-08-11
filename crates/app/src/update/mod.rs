@@ -34,9 +34,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-/// Canonical public release repository. (The prior value `itasha-corp/c0pl4nd`
-/// 404'd — there is no such repo — so every check silently failed.)
-const REPO: &str = "46b-ETYKiAL/Itasha.Corp_C0PL4ND";
+/// Canonical public release repository. (An early value `itasha-corp/c0pl4nd`
+/// 404'd — there is no such owner — so every check silently failed. It was then
+/// `46b-ETYKiAL/Itasha.Corp_C0PL4ND` until the repository was renamed to
+/// `C0PL4ND`; that former name resolves only via GitHub's rename redirect, which
+/// this constant must never depend on.)
+const REPO: &str = "46b-ETYKiAL/C0PL4ND";
 
 /// `User-Agent` for the one API call. App name + version ONLY — no PII. The
 /// GitHub API rejects requests without a User-Agent, so this is mandatory.
@@ -381,7 +384,7 @@ mod tests {
     fn release_page_url_points_at_the_real_repo() {
         let url = release_page_url();
         assert!(
-            url.contains("46b-ETYKiAL/Itasha.Corp_C0PL4ND"),
+            url.contains("46b-ETYKiAL/C0PL4ND"),
             "release URL must target the real repo, not the old 404 path: {url}"
         );
         assert!(
@@ -396,6 +399,32 @@ mod tests {
         assert_eq!(parse_tag(body).as_deref(), Some("0.4.1"));
         // No tag_name → None (drives the offline-graceful path).
         assert_eq!(parse_tag(r#"{"message":"Not Found"}"#), None);
+    }
+
+    /// The SHIPPED default channel must be the one that takes the
+    /// prerelease-excluding endpoint.
+    ///
+    /// This lives here, beside `latest_version` — the only surviving consumer of
+    /// `config.update.channel` — rather than in the Settings UI, where it used to
+    /// assert that a dropdown offered the default value. That dropdown is gone:
+    /// it wrote a field the in-app updater never read, so the property worth
+    /// pinning is not "the combo lists it" but "the default routes to the stable
+    /// endpoint".
+    ///
+    /// `latest_version` branches on `eq_ignore_ascii_case("stable")`: that arm
+    /// reads `releases/latest`, which EXCLUDES prereleases. Any other value falls
+    /// through to scanning the full release list, where a prerelease can match —
+    /// and `update_engine::net` then refuses it as a channel-pin violation. So a
+    /// default of anything but `stable` would ship an updater that finds
+    /// candidates its own security gate rejects.
+    #[test]
+    fn the_default_channel_takes_the_prerelease_excluding_endpoint() {
+        let default_channel = c0pl4nd_core::Config::default().update.channel;
+        assert!(
+            default_channel.eq_ignore_ascii_case("stable"),
+            "the shipped default update channel must be `stable` so checks read \
+             the prerelease-excluding releases/latest endpoint; got {default_channel:?}"
+        );
     }
 
     #[test]

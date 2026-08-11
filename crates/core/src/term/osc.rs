@@ -66,6 +66,47 @@ impl Drop for ClipboardWrite {
 // sensitive state — it lets the type compose into other zeroizing containers.
 impl zeroize::ZeroizeOnDrop for ClipboardWrite {}
 
+/// A pending OSC 52 clipboard READ request (`OSC 52 ; <sel> ; ? ST`) drained by
+/// the application, which supplies the clipboard text via
+/// [`crate::term::Terminal::respond_clipboard_read`].
+///
+/// A request is ONLY ever queued when clipboard reads have been explicitly
+/// opted into (`clipboard_read_allow`, default OFF). While reads are denied —
+/// the default — the terminal answers the query itself with an EMPTY payload
+/// (see [`format_clipboard_reply`]) and queues NOTHING here, so a denied read
+/// can never reach the host clipboard.
+///
+/// Unlike [`ClipboardWrite`] this carries no text, so there is nothing to
+/// zeroize — it is a plain `Copy` request record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipboardReadRequest {
+    /// The selection the program asked to read.
+    pub selection: ClipboardSelection,
+}
+
+/// The OSC 52 wire character for a selection (`c` clipboard / `p` primary).
+pub fn selection_char(selection: ClipboardSelection) -> char {
+    match selection {
+        ClipboardSelection::Clipboard => 'c',
+        ClipboardSelection::Primary => 'p',
+    }
+}
+
+/// Builds the `ESC ] 52 ; <sel> ; <base64> BEL` reply to an OSC 52 read query.
+///
+/// `payload` is the ALREADY-base64-encoded clipboard data. Passing an EMPTY
+/// `payload` produces the **deny / no-data** reply — a structurally valid OSC 52
+/// response that carries zero clipboard bytes.
+///
+/// The deny reply matters: a program that issues `OSC 52 ; c ; ?` typically
+/// BLOCKS on the answer, so a terminal that stays silent leaves it hung until
+/// its own timeout expires (the neovim `getreg('+')` stall, neovim#32699). The
+/// empty-data-field response is the convention terminals use to refuse without
+/// hanging the caller, and it leaks nothing: base64 of nothing is nothing.
+pub fn format_clipboard_reply(selection: ClipboardSelection, payload: &str) -> String {
+    format!("\x1b]52;{};{}\x07", selection_char(selection), payload)
+}
+
 // ============================================================================
 // Dynamic colors / notifications
 // ============================================================================

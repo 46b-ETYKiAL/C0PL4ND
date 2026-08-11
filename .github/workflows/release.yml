@@ -32,9 +32,46 @@ env:
 
 jobs:
   # --------------------------------------------------------------------------
+  # License-delivery gate. Runs BEFORE anything is built so a release can never
+  # publish an artifact that omits the license texts it is legally required to
+  # carry. The shipped binary embeds ~22 OFL-1.1 / Apache-2.0 typefaces via
+  # include_bytes!, and OFL-1.1 s2 requires the license to accompany every copy.
+  #
+  # This asserts over the packaging manifest (this workflow + the packaging
+  # scripts) and the repo tree -- it builds nothing, so it is seconds, not
+  # minutes. Every other job gates on it via `needs:`.
+  # --------------------------------------------------------------------------
+  license-delivery:
+    name: License delivery (fonts must ship their licenses)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        # actions/checkout@v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install PyYAML
+        run: python3 -m pip install --user --disable-pip-version-check pyyaml
+      - name: Verify every artifact path stages its license texts
+        run: python3 packaging/verify_license_delivery.py
+      - name: Verify the collector itself produces a complete license set
+        run: |
+          set -euo pipefail
+          sh packaging/collect-licenses.sh "${PWD}" /tmp/license-probe
+          echo "--- staged tree ---"
+          find /tmp/license-probe -type f | sort
+          # A tree with no font licenses means the collector silently no-op'd.
+          n=$(find /tmp/license-probe/licenses/fonts -type f | wc -l)
+          [ "$n" -gt 0 ] || { echo "::error::no font licenses staged"; exit 1; }
+          echo "font license files staged: $n"
+
+  # --------------------------------------------------------------------------
   # Build a release binary per OS/arch + per-binary SLSA provenance attestation.
   # --------------------------------------------------------------------------
   build:
+    needs: license-delivery
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     permissions:
@@ -175,7 +212,15 @@ jobs:
           stage="${BIN_NAME}-${tag}-${target}"
           mkdir -p "dist/${stage}"
           cp "target/${target}/release/${BIN_NAME}" "dist/${stage}/"
-          cp LICENSE-MIT LICENSE-APACHE README.md "dist/${stage}/" 2>/dev/null || true
+          cp README.md "dist/${stage}/"
+          # License delivery is MANDATORY, not best-effort. The binary embeds
+          # ~21 OFL-1.1 / Apache-2.0 typefaces via include_bytes!, and OFL-1.1
+          # s2 requires the license text to accompany every copy. This staging
+          # step fails the build if any bundled font's license is missing, so an
+          # artifact can never ship without it. (Previously this was
+          # `cp LICENSE-* README.md … 2>/dev/null || true` — best-effort, no
+          # font licenses at all, and silent on failure.)
+          sh packaging/collect-licenses.sh "${PWD}" "dist/${stage}"
           ( cd dist && tar -czf "${stage}.tar.gz" "${stage}" )
           ( cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256" )
           echo "artifact=dist/${stage}.tar.gz" >> "$GITHUB_ENV"
@@ -195,12 +240,27 @@ jobs:
           $stage = "$env:BIN_NAME-$tag-$target"
           New-Item -ItemType Directory -Force -Path "dist/$stage" | Out-Null
           Copy-Item "target/$target/release/$env:BIN_NAME.exe" "dist/$stage/"
-          foreach ($f in @("LICENSE-MIT","LICENSE-APACHE","README.md")) {
-            if (Test-Path $f) { Copy-Item $f "dist/$stage/" }
-          }
+          Copy-Item "README.md" "dist/$stage/"
+          # License delivery is MANDATORY (see the Unix packaging step). The
+          # collector is POSIX sh; the windows-latest runner ships Git Bash, so
+          # invoke it via `bash`. A non-zero exit MUST fail the job -- an
+          # artifact that ships embedded OFL-1.1 fonts without their license
+          # text is a license breach.
+          bash packaging/collect-licenses.sh "$(Get-Location)" "dist/$stage"
+          if ($LASTEXITCODE -ne 0) { throw "license collection failed" }
           Compress-Archive -Path "dist/$stage/*" -DestinationPath "dist/$stage.zip" -Force
           $hash = (Get-FileHash "dist/$stage.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $stage.zip" | Out-File -Encoding ascii "dist/$stage.zip.sha256"
+          # NOT `Out-File`: it terminates the line with CRLF, so the filename
+          # field in the published SHA256SUMS ends with a stray CR. Verified in
+          # the shipped v0.4.25 SHA256SUMS - both Windows .zip lines read
+          # `...-pc-windows-msvc.zip\r` while every Unix line is clean. That
+          # breaks any exact-name lookup (`awk '$2 == name'`, `grep -E 'name$'`)
+          # and makes `sha256sum -c SHA256SUMS` look for a file whose name
+          # contains a carriage return.
+          # `-NoNewline` suppresses Set-Content's own CRLF terminator; the
+          # backtick-n inside the string is the single LF we do want.
+          Set-Content -Path "dist/$stage.zip.sha256" -Encoding ascii -NoNewline `
+            -Value "$hash  $stage.zip`n"
           "artifact=dist/$stage.zip" | Out-File -Encoding ascii -Append $env:GITHUB_ENV
 
       - name: Attest build provenance (SLSA)
@@ -401,9 +461,41 @@ jobs:
           [ -n "$exe" ] || { echo "c0pl4nd.exe not found"; exit 1; }
           mkdir -p payload
           cp "$exe" payload/
+          # NOTE: `app/assets` is the repo-ROOT assets dir — icons and media
+          # only. C0PL4ND's bundled typefaces live under
+          # `app/crates/app/assets/fonts/`, so this copy picks up ZERO font
+          # licenses. (The sibling SCR1B3 repo has the identical line and it
+          # *does* catch its fonts purely because its fonts sit at the repo
+          # root — the same line is load-bearing there and inert here.)
+          # The collector below is what actually satisfies OFL-1.1 s2.
           if [ -d app/assets ]; then cp -r app/assets payload/assets; fi
-          for f in LICENSE-MIT LICENSE-APACHE README.md; do [ -f "app/$f" ] && cp "app/$f" payload/ || true; done
+          [ -f app/README.md ] && cp app/README.md payload/
+          sh app/packaging/collect-licenses.sh "app" payload
           echo "payload contents:"; find payload -maxdepth 2 | head -40
+          # ASSERT, don't just print. This line used to be a bare `echo … $(find
+          # … | wc -l)`: it reported the count and accepted every value including
+          # zero, so an installer with no font licence at all published green.
+          # The sibling windows-msi job stages the identical tree and DOES assert
+          # `-gt 0`; the two are now symmetric. OFL-1.1 s2 requires the licence to
+          # accompany every copy of the font software, and ~22 typefaces are
+          # include_bytes!-embedded in the shipped exe, so zero here is a
+          # distribution breach, not a cosmetic gap.
+          #
+          # `2>/dev/null` is gone with it: it hid a missing payload/licenses/fonts
+          # directory — precisely the failure this now has to catch — behind the
+          # same `0` a present-but-empty directory produces.
+          # The directory is checked SEPARATELY and BEFORE the count. Folding the
+          # two together as `n=$(find … 2>/dev/null | wc -l)` looks equivalent
+          # and is not: with the directory absent, `find` exits non-zero, and
+          # under `set -euo pipefail` the failing command substitution kills the
+          # step ON THE ASSIGNMENT — before the explicit error below ever runs.
+          # The diagnostic would be unreachable code and the operator would get a
+          # bare `find: No such file or directory`. Measured, not assumed: the
+          # folded form was written first and falsify_release_gates.py caught it.
+          [ -d payload/licenses/fonts ] || { echo "::error::payload/licenses/fonts does not exist — collect-licenses.sh staged no font licenses at all. OFL-1.1 s2 requires the license text to accompany every copy of the embedded typefaces."; exit 1; }
+          n=$(find payload/licenses/fonts -type f | wc -l)
+          echo "font licenses in payload: $n"
+          [ "$n" -gt 0 ] || { echo "::error::payload/licenses/fonts is empty — no font licenses in the installer payload. OFL-1.1 s2 requires the license text to accompany every copy of the embedded typefaces."; exit 1; }
       - name: Build native installer
         shell: bash
         env:
@@ -438,6 +530,29 @@ jobs:
           github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
           wait-for-completion: true
           output-artifact-directory: dist-out
+      - name: Assert the installer signing state (fail-closed on a stable tag)
+        # BOTH SignPath steps above are gated on `vars.SIGNPATH_ORG_ID != ''`.
+        # That variable has never been set on this repository, so both have been
+        # permanently SKIPPED since the day they were added — including on stable
+        # tags, where (unlike the minisign step) there was no guard at all. A
+        # skipped step renders as a neutral grey tick, so v0.4.25 shipped
+        # `c0pl4nd-v0.4.25-x86_64-setup.exe` unsigned and the release was green
+        # with nothing in the log saying so.
+        #
+        # This step is deliberately NOT `if:`-gated on the same variable — a gate
+        # that disappears under the exact condition it exists to detect is the
+        # bug, not the fix. It always runs, always announces the real state, and
+        # fails the job on a stable tag unless an owner has recorded an explicit
+        # acknowledgement. Posture and escape hatch: see the script header.
+        shell: bash
+        env:
+          SIGNPATH_ORG_ID: ${{ vars.SIGNPATH_ORG_ID }}
+          UNSIGNED_WINDOWS_INSTALLER_ACK: ${{ vars.UNSIGNED_WINDOWS_INSTALLER_ACK }}
+        # `app/` prefix: this job checks out C0PL4ND with `path: app` and sets no
+        # working-directory, so $PWD is $GITHUB_WORKSPACE. `sh` on a missing file
+        # exits 127 under bash's -e, which would fail every prerelease too — the
+        # path is asserted by falsify_release_gates.py.
+        run: sh app/packaging/require-installer-signing.sh
       - name: Checksum installer (final, signed-or-unsigned)
         shell: bash
         run: |
@@ -456,9 +571,571 @@ jobs:
           path: dist-out/
           if-no-files-found: error
 
+  windows-msi:
+    # The MSI. Before this job there was NO WiX or cargo-wix anywhere in the
+    # repo: `packaging/windows/c0pl4nd.wxs` had never been compiled by CI or
+    # locally, and its own header comment claimed a release.yml "msi" job built
+    # it — a job that did not exist. So the file was never validated by anything
+    # except the notify_tests, which parse it as TEXT.
+    #
+    # That comment is now corrected and the file is WiX v3 schema (it was
+    # authored against the WiX v4/v6 schema, which candle/light cannot read at
+    # all). This is deliberately the SAME toolchain and the SAME job shape the
+    # sibling SCR1B3 repo already runs on a real runner — pinned + checksummed
+    # WiX 3.14.1, candle, light with ICE validation left ON, then a dark
+    # decompile that reads the built package back out — rather than a second,
+    # divergent installer toolchain in the fleet.
+    #
+    # Like SCR1B3's, it CONSUMES the `build` job's artifact instead of
+    # rebuilding, so the .exe inside the MSI is byte-identical to the one in the
+    # published .zip: same cargo-auditable SBOM, same hardening, one build.
+    name: Windows installer (.msi)
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      # WiX 3.x, pinned to a release asset + SHA-256 rather than relying on
+      # whatever the runner image preinstalls, so a runner image change cannot
+      # silently swap the compiler under the gate. Kept byte-identical to
+      # SCR1B3's job — if one moves, move both.
+      WIX_URL: "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip"
+      WIX_SHA256: "6ac824e1642d6f7277d0ed7ea09411a508f6116ba6fae0aa5f2c7daa2ff43d31"
+    steps:
+      - name: Harden the runner (egress audit)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920
+        with:
+          egress-policy: audit
+      - name: Checkout C0PL4ND (installer source + icon + license)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Download Windows binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: c0pl4nd-x86_64-pc-windows-msvc
+          path: winbin
+      - name: Assemble payload (binary + licenses)
+        shell: bash
+        # License delivery is MANDATORY here for the same reason it is in
+        # the native-CRT installer job. C0PL4ND include_bytes!-embeds 22
+        # typefaces; OFL-1.1 s2 requires the license text to accompany EVERY
+        # copy, and a font compiled into the .exe cannot serve its own
+        # license. This package previously carried ONE file - c0pl4nd.exe -
+        # so an MSI install put 22 fonts on disk with the license text
+        # nowhere on the machine.
+        #
+        # The collector exits non-zero (failing the job) when any bundled
+        # font has no license text, so an unlicensed MSI cannot be produced.
+        # It stages into its OWN directory rather than payload/ so `heat` can
+        # harvest the license tree without re-harvesting c0pl4nd.exe, which
+        # c0pl4nd.wxs already declares.
+        run: |
+          set -euo pipefail
+          zip="$(find winbin -name '*.zip' | head -1)"
+          [ -n "$zip" ] || { echo "::error::no windows binary zip under winbin/"; exit 1; }
+          python -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall('winbin/x')" "$zip"
+          exe="$(find winbin/x -name 'c0pl4nd.exe' | head -1)"
+          [ -n "$exe" ] || { echo "::error::c0pl4nd.exe not found in the release zip"; exit 1; }
+          mkdir -p payload
+          cp "$exe" payload/
+          ls -la payload/c0pl4nd.exe
+          sh packaging/collect-licenses.sh "${PWD}" licstage
+          n=$(find licstage/licenses/fonts -type f | wc -l)
+          echo "font license files staged: $n"
+          [ "$n" -gt 0 ] || { echo "::error::no font licenses staged"; exit 1; }
+      - name: Install WiX 3.14 (pinned + checksum-verified)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSLf -o wix314-binaries.zip "$WIX_URL"
+          # Verify BEFORE extracting: an unverified archive is never unpacked.
+          echo "${WIX_SHA256}  wix314-binaries.zip" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/wix"
+          if command -v unzip >/dev/null 2>&1; then
+            unzip -q -o wix314-binaries.zip -d "$RUNNER_TEMP/wix"
+          elif command -v 7z >/dev/null 2>&1; then
+            7z x -y -o"$RUNNER_TEMP/wix" wix314-binaries.zip > /dev/null
+          else
+            echo "::error::no archive extractor available (tried unzip, 7z)"
+            exit 1
+          fi
+          for t in candle.exe light.exe dark.exe heat.exe; do
+            [ -f "$RUNNER_TEMP/wix/$t" ] || { echo "::error::WiX archive did not contain $t"; exit 1; }
+          done
+      - name: Compile the installer source (candle)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # No Rust toolchain in this job (it builds nothing). The workspace root
+          # carries the real version; the c0pl4nd crate inherits it via
+          # `version.workspace = true`.
+          VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          # WiX requires x.x.x.x with each field <= 65534, so a non-numeric or
+          # empty version must stop here rather than reach candle as garbage.
+          echo "$VER" | grep -qE '^[0-9]+(\.[0-9]+){1,3}$' \
+            || { echo "::error::could not resolve a numeric version (got '$VER')"; exit 1; }
+          echo "installer version = $VER"
+          # candle runs from the repo root, which is what the .wxs's
+          # packaging\windows\... SourceFile/Value paths are relative to.
+          BIN_DIR="$(pwd -W)/payload"
+          LIC_DIR="$(pwd -W)/licstage"
+          # Harvest the staged license tree into a WiX fragment. Generated,
+          # not hand-authored: a hand-written list of 22 font directories
+          # rots the moment a font is added or dropped, and the whole point
+          # of the collector is that the set is dynamic. The XSL adds the
+          # RemoveFolder rows heat never emits, so an uninstall does not
+          # leave the licenses tree behind as empty directories under
+          # Program Files.
+          "$RUNNER_TEMP/wix/heat.exe" dir "$LIC_DIR" -nologo \
+            -cg LicenseComponents -dr INSTALLFOLDER \
+            -ag -srd -sfrag -var var.LicenseStageDir \
+            -t packaging/windows/license-harvest.xsl \
+            -out licenses.wxs
+          # Non-vacuity: a harvest that produced nothing would compile and
+          # link perfectly and ship an MSI with no license texts at all --
+          # the exact silent under-delivery this step exists to prevent.
+          harvested=$(grep -c '<File ' licenses.wxs || true)
+          echo "harvested license files: $harvested"
+          [ "$harvested" -ge 23 ] || { echo "::error::heat harvested only $harvested license file(s); expected >= 23 (22 fonts + top-level docs)"; exit 1; }
+          "$RUNNER_TEMP/wix/candle.exe" -nologo -arch x64 \
+            -dVersion="$VER" -dCargoTargetBinDir="$BIN_DIR" \
+            -out c0pl4nd.wixobj packaging/windows/c0pl4nd.wxs
+          [ -s c0pl4nd.wixobj ] || { echo "::error::candle reported success but produced no .wixobj"; exit 1; }
+          "$RUNNER_TEMP/wix/candle.exe" -nologo -arch x64 \
+            -dLicenseStageDir="$LIC_DIR" \
+            -out licenses.wixobj licenses.wxs
+          [ -s licenses.wixobj ] || { echo "::error::candle produced no .wixobj for the license fragment"; exit 1; }
+      - name: Link the installer (light, with ICE validation)
+        shell: bash
+        # ICE validation is ON and NOTHING is suppressed. Unlike SCR1B3 — which
+        # is a strictly perUser package and therefore needs -sice:ICE38 — this
+        # package is perMachine and links clean with zero -sice flags. Keep it
+        # that way: an ICE here is a real defect in the .wxs, not a flag to add.
+        #
+        # The one thing that had to be got right for that: ApplicationShortcut's
+        # KeyPath must be HKCU. ICE57 classifies a ProgramMenuFolder shortcut as
+        # per-user data, so an HKMU KeyPath fails with LGHT0204/ICE57 "has both
+        # per-user data and a keypath that can be either per-user or
+        # per-machine". The genuinely per-machine rows (the exe + PATH, and the
+        # HKLM shell verbs) live in their own Win64 components for the same
+        # reason.
+        #
+        # ICE61 is emitted as warning LGHT1076 (MajorUpgrade
+        # AllowSameVersionUpgrades="yes" makes Maximum == current). light exits
+        # 0, so it is not suppressed — same treatment SCR1B3 gives ICE91.
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/wix/light.exe" -nologo \
+            -ext WixUIExtension -ext WixUtilExtension \
+            -out c0pl4nd-installer.msi c0pl4nd.wixobj licenses.wixobj
+          [ -f c0pl4nd-installer.msi ] || { echo "::error::light reported success but produced no .msi"; exit 1; }
+          # light writes the .msi BEFORE ICE validation runs, so "the file
+          # exists" is not by itself proof the link succeeded -- `set -e` on
+          # light's exit status is what enforces that. This size floor is the
+          # separate check that the package is not a degenerate stub.
+          sz=$(wc -c < c0pl4nd-installer.msi)
+          echo "MSI size = $sz bytes"
+          [ "$sz" -gt 100000 ] || { echo "::error::MSI is implausibly small ($sz bytes)"; exit 1; }
+      - name: Assert the compiled MSI carries the AUMID and the shell verbs
+        shell: bash
+        # Reads the tables back out of the BUILT package (via WiX's own
+        # decompiler) instead of trusting the source text. This is what upgrades
+        # the notify_tests' premise from assumed to verified: those tests prove
+        # c0pl4nd.wxs's TEXT carries System.AppUserModel.ID == notify::AUMID;
+        # this proves the package that would actually ship carries it. Without
+        # the AUMID in the shipped MSI, every toast the app raises is accepted by
+        # the shell and silently never displayed.
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/wix/dark.exe" -nologo c0pl4nd-installer.msi -out decompiled.wxs
+          [ -s decompiled.wxs ] || { echo "::error::dark produced no output"; exit 1; }
+          src=$(grep -oE 'pub const AUMID: &str = "[^"]+"' crates/app/src/notify.rs \
+                | sed -E 's/.*"([^"]+)"/\1/')
+          built=$(grep -oE 'Key="System.AppUserModel.ID" Value="[^"]+"' decompiled.wxs \
+                | sed -E 's/.*Value="([^"]+)"/\1/')
+          echo "AUMID: source='$src' compiled='$built'"
+          # Both must be non-empty: two empty strings would compare equal and
+          # make this assertion vacuously true.
+          [ -n "$src" ] || { echo "::error::could not read notify::AUMID from notify.rs"; exit 1; }
+          [ -n "$built" ] || { echo "::error::the compiled MSI carries NO System.AppUserModel.ID -- every toast would be silently swallowed."; exit 1; }
+          [ "$src" = "$built" ] || { echo "::error::AUMID mismatch: notify.rs '$src' != compiled MSI '$built'"; exit 1; }
+          verbs=$(grep -c 'C0pl4ndOpenHere' decompiled.wxs || true)
+          echo "shell-verb registry rows in the compiled MSI: $verbs"
+          [ "$verbs" -ge 8 ] || { echo "::error::the 'Open C0PL4ND here' shell verb did not make it into the package (found $verbs rows)"; exit 1; }
+          # License delivery, asserted against the BUILT package rather than
+          # the staging directory. A staged tree only proves the collector
+          # ran; the File table is what proves the texts actually SHIP. This
+          # package carried exactly one File row (c0pl4nd.exe) before the
+          # license components existed, so this is the check that would have
+          # caught it.
+          licfiles=$(grep -cE '<File [^>]*Name="(OFL|LICENSE|UFL)[^"]*"' decompiled.wxs || true)
+          echo "license files in the compiled MSI: $licfiles"
+          [ "$licfiles" -ge 22 ] || { echo "::error::the compiled MSI carries only $licfiles font license file(s) (expected >= 22) -- OFL-1.1 s2 requires the text to accompany every copy."; exit 1; }
+          for doc in LICENSE-MIT THIRD-PARTY-LICENSES.md; do
+            grep -q "Name=\"$doc\"" decompiled.wxs || { echo "::error::the compiled MSI does not carry $doc"; exit 1; }
+          done
+      - name: Name + checksum the release asset
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist-msi
+          T="${TAG//\//-}"
+          mv c0pl4nd-installer.msi "dist-msi/c0pl4nd-${T}-x86_64-pc-windows-msvc.msi"
+          cd dist-msi
+          # Unconditional, exactly like the native-CRT installer job above. This
+          # deliberately does NOT copy the `build` job's
+          # `if command -v sha256sum ... || true` form, which silently skips the
+          # checksum on any runner that lacks sha256sum. This job only runs on
+          # windows-latest, where Git-Bash always provides it, so a failure here
+          # is a real failure.
+          for m in *.msi; do sha256sum "$m" > "$m.sha256"; done
+          ls -la; cat *.sha256
+      - name: Attest MSI provenance (SLSA)
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
+        with:
+          subject-path: dist-msi/*.msi
+      - name: Upload MSI
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-msi
+          path: dist-msi/
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Brand rasters. C0PL4ND commits only SVG sources (assets/svg/) plus a single
+  # 256px PNG + .ico under packaging/windows — there is NO hicolor PNG tree and
+  # no .icns, which is why the .deb / AppImage / .dmg first-install artifacts
+  # could not be built. `packaging/gen-icons.sh` renders the whole size ladder
+  # (16..1024) from the SVG masters; it is run ONCE here on Linux (clean librsvg
+  # rasterization, the same rationale the Windows-installer job already states)
+  # and handed to the packaging jobs as an artifact, so macOS does not need a
+  # brew librsvg install and both platforms rasterize identically.
+  # --------------------------------------------------------------------------
+  brand-icons:
+    name: Brand rasters (librsvg)
+    needs: license-delivery
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden the runner (egress audit)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920
+        with:
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install librsvg
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y librsvg2-bin
+      - name: Render icon ladder
+        run: |
+          set -euo pipefail
+          sh packaging/gen-icons.sh
+          ls -la packaging/icons
+          # gen-icons.sh warns-and-skips .ico/.icns when ImageMagick/iconutil are
+          # absent (both are absent on this runner), which is fine — the PNG
+          # ladder is what the packaging jobs consume. But a MISSING ladder would
+          # silently produce an icon-less .deb/.dmg, so assert it.
+          for s in 16 32 48 64 128 256 512 1024; do
+            [ -s "packaging/icons/c0pl4nd-${s}.png" ] \
+              || { echo "::error::packaging/icons/c0pl4nd-${s}.png was not rendered"; exit 1; }
+          done
+      - name: Upload brand rasters
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: brand-icons
+          path: packaging/icons/*.png
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Linux first-install artifacts (.deb + AppImage) built from the SAME compiled
+  # x86_64 binary the `build` job produced. C0PL4ND previously shipped only raw
+  # .tar.gz archives on Linux while the sibling SCR1B3 shipped both installers;
+  # this closes that gap. These are NOT auto-update targets — the in-app updater
+  # swaps the binary in place via the signed latest.json, which lists only the
+  # archives/installers. `packaging/linux/build-deb.sh` and `build-appimage.sh`
+  # are deliberately NOT used: they are maintainer's-machine skeletons that read
+  # `packaging/icons/c0pl4nd.png` (previously absent) and auto-download an
+  # UNPINNED linuxdeploy. This job instead mirrors SCR1B3's proven, shipping
+  # release path, including the pinned + sha256-verified appimagetool.
+  # --------------------------------------------------------------------------
+  linux-installers:
+    name: Linux installers (.deb + AppImage)
+    needs: [build, brand-icons]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Harden the runner (egress audit)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920
+        with:
+          egress-policy: audit
+      - name: Checkout C0PL4ND (packaging + assets)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: app
+          persist-credentials: false
+      - name: Download Linux binary artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: c0pl4nd-x86_64-unknown-linux-gnu
+          path: linbin
+      - name: Download brand rasters
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: brand-icons
+          path: icons
+      - name: Build .deb (dpkg-deb) + AppImage (appimagetool, pinned)
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Asset-name tag: the release tag on a tag push; the dispatch input
+          # otherwise. The .deb Version field needs a clean semver, so derive
+          # that from the workspace Cargo.toml — valid for both trigger types.
+          TAG="${TAG//\//-}"
+          VER="$(grep -m1 '^version' app/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          tgz="$(find linbin -name '*x86_64-unknown-linux-gnu.tar.gz' | head -1)"
+          [ -n "$tgz" ] || { echo "::error::no linux tarball under linbin/"; exit 1; }
+          mkdir -p dist stage-bin
+          # C0PL4ND's tarball wraps its payload in a `c0pl4nd-<tag>-<target>/`
+          # directory (SCR1B3's does not), so strip that level.
+          tar -xzf "$tgz" -C stage-bin --strip-components=1
+          [ -f stage-bin/c0pl4nd ] || { echo "::error::c0pl4nd not found in tarball"; exit 1; }
+          chmod 0755 stage-bin/c0pl4nd
+
+          # Stage the hicolor icon tree once; both artifacts consume it.
+          hic=stage-icons/hicolor
+          rm -rf stage-icons
+          for s in 16 32 48 64 128 256 512; do
+            mkdir -p "${hic}/${s}x${s}/apps"
+            cp "icons/c0pl4nd-${s}.png" "${hic}/${s}x${s}/apps/c0pl4nd.png"
+          done
+
+          # ---- .deb (dpkg-deb, preinstalled on ubuntu-latest) ----------------
+          deb=stage-deb
+          rm -rf "$deb"
+          mkdir -p "$deb/usr/bin" "$deb/usr/share/applications" \
+                   "$deb/usr/share/icons/hicolor" "$deb/usr/share/man/man1" "$deb/DEBIAN"
+          install -m0755 stage-bin/c0pl4nd "$deb/usr/bin/c0pl4nd"
+          # License texts at the Debian-standard location. Mandatory: the
+          # collector fails the job if any bundled font's license is missing
+          # (OFL-1.1 s2 — the license must accompany every copy).
+          mkdir -p "$deb/usr/share/doc/c0pl4nd"
+          sh app/packaging/collect-licenses.sh app "$deb/usr/share/doc/c0pl4nd"
+          install -m0644 app/packaging/linux/c0pl4nd.desktop "$deb/usr/share/applications/c0pl4nd.desktop"
+          cp -r "${hic}/." "$deb/usr/share/icons/hicolor/"
+          gzip -9nc app/man/c0pl4nd.1 > "$deb/usr/share/man/man1/c0pl4nd.1.gz"
+          # Control file: reuse the committed BINARY control template. NOTE the
+          # repo also has `packaging/linux/debian/control`, which is a SOURCE
+          # control carrying `${shlibs:Depends}, ${misc:Depends}` — debhelper
+          # substvars that dpkg-deb does NOT expand, so using it directly would
+          # emit a package whose Depends field contains literal `${...}` and is
+          # uninstallable. `debian-control` is the binary template.
+          size_kb="$(du -ks "$deb/usr" | cut -f1)"
+          sed -E "s/^Version: .*/Version: ${VER}/" app/packaging/linux/debian-control > "$deb/DEBIAN/control"
+          printf 'Installed-Size: %s\n' "$size_kb" >> "$deb/DEBIAN/control"
+          if grep -q '[$]{' "$deb/DEBIAN/control"; then
+            echo "::error::unexpanded substvar in DEBIAN/control"; exit 1
+          fi
+          dpkg-deb --build --root-owner-group "$deb" "dist/c0pl4nd-${TAG}-amd64.deb"
+          echo "----- .deb info -----";     dpkg-deb --info     "dist/c0pl4nd-${TAG}-amd64.deb"
+          echo "----- .deb contents -----"; dpkg-deb --contents "dist/c0pl4nd-${TAG}-amd64.deb"
+          command -v desktop-file-validate >/dev/null && \
+            desktop-file-validate "$deb/usr/share/applications/c0pl4nd.desktop" || true
+
+          # ---- AppImage (appimagetool 1.9.1, pinned + sha256-verified) -------
+          appdir=AppDir
+          rm -rf "$appdir"
+          mkdir -p "$appdir/usr/bin" "$appdir/usr/share/applications" "$appdir/usr/share/icons/hicolor"
+          install -m0755 stage-bin/c0pl4nd "$appdir/usr/bin/c0pl4nd"
+          mkdir -p "$appdir/usr/share/doc/c0pl4nd"
+          sh app/packaging/collect-licenses.sh app "$appdir/usr/share/doc/c0pl4nd"
+          install -m0644 app/packaging/linux/c0pl4nd.desktop "$appdir/usr/share/applications/c0pl4nd.desktop"
+          install -m0644 app/packaging/linux/c0pl4nd.desktop "$appdir/c0pl4nd.desktop"   # top-level (required)
+          cp -r "${hic}/." "$appdir/usr/share/icons/hicolor/"
+          install -m0644 "icons/c0pl4nd-256.png" "$appdir/c0pl4nd.png"                   # top-level icon
+          # AppRun via printf (NOT a heredoc — a YAML-indented heredoc would inject
+          # leading spaces into the `#!` shebang line and break it).
+          printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/bin/c0pl4nd" "$@"\n' > "$appdir/AppRun"
+          chmod 0755 "$appdir/AppRun"
+          # Pinned, immutable appimagetool release + digest (supply-chain: no
+          # rolling `continuous` tag; sha256 verified before exec). Same pin the
+          # sibling SCR1B3 release already uses.
+          AIT_URL="https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
+          AIT_SHA="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+          curl -fsSL --retry 3 -o appimagetool "$AIT_URL"
+          echo "${AIT_SHA}  appimagetool" | sha256sum -c -
+          chmod +x appimagetool
+          # `--appimage-extract-and-run` avoids needing FUSE on the CI runner.
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run "$appdir" "dist/C0PL4ND-${TAG}-x86_64.AppImage"
+
+          # ---- checksums (the release job aggregates these into SHA256SUMS) --
+          cd dist
+          for f in *.deb *.AppImage; do
+            [ -f "$f" ] || { echo "::error::expected artifact $f was not produced"; exit 1; }
+            sha256sum "$f" > "$f.sha256"
+          done
+          ls -la; cat *.sha256
+      - name: Attest Linux installer provenance (SLSA)
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
+        with:
+          subject-path: |
+            dist/*.deb
+            dist/*.AppImage
+      - name: Upload Linux installers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: linux-installers
+          path: dist/*
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # macOS first-install artifact (.dmg) built from the compiled binary, one per
+  # arch. C0PL4ND previously shipped raw .tar.gz on macOS only, so a Mac user got
+  # no drag-to-Applications install at all. `packaging/macos/build-dmg.sh` is not
+  # used: it requires a committed `packaging/macos/c0pl4nd.icns` that does not
+  # exist in the repo. The .icns is generated here from the rendered PNG ladder
+  # via iconutil (preinstalled on macOS runners).
+  # --------------------------------------------------------------------------
+  macos-installer:
+    name: macOS installer (.app + .dmg, ${{ matrix.arch }})
+    needs: [build, brand-icons]
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            target: x86_64-apple-darwin
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Harden the runner (egress audit)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920
+        with:
+          egress-policy: audit
+      - name: Checkout C0PL4ND (packaging + assets)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: app
+          persist-credentials: false
+      - name: Download macOS binary artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: c0pl4nd-${{ matrix.target }}
+          path: macbin
+      - name: Download brand rasters
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: brand-icons
+          path: icons
+      - name: Build .app bundle + .dmg
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG="${TAG//\//-}"
+          VER="$(grep -m1 '^version' app/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          tgz="$(find macbin -name '*.tar.gz' | head -1)"
+          [ -n "$tgz" ] || { echo "::error::no macOS tarball under macbin/"; exit 1; }
+          mkdir -p dist stage-bin
+          tar -xzf "$tgz" -C stage-bin --strip-components=1
+          [ -f stage-bin/c0pl4nd ] || { echo "::error::c0pl4nd not found in tarball"; exit 1; }
+
+          # ---- C0PL4ND.app bundle --------------------------------------------
+          appbundle="C0PL4ND.app"
+          rm -rf "$appbundle"
+          mkdir -p "$appbundle/Contents/MacOS" "$appbundle/Contents/Resources"
+          install -m0755 stage-bin/c0pl4nd "$appbundle/Contents/MacOS/c0pl4nd"
+          # License texts inside the bundle (OFL-1.1 s2). Mandatory: the
+          # collector fails the job rather than shipping a breach.
+          sh app/packaging/collect-licenses.sh app "$appbundle/Contents/Resources/licenses"
+          # Info.plist: reuse the committed template, substituting the real
+          # version into the two 0.1.0 placeholders (CFBundleVersion +
+          # CFBundleShortVersionString).
+          sed -E "s|<string>0\.1\.0</string>|<string>${VER}</string>|g" \
+            app/packaging/macos/Info.plist > "$appbundle/Contents/Info.plist"
+          # .icns from the rendered ladder (iconutil is preinstalled). The plist
+          # declares CFBundleIconFile c0pl4nd.icns, so the name must match.
+          iconset="c0pl4nd.iconset"
+          rm -rf "$iconset"; mkdir -p "$iconset"
+          cp icons/c0pl4nd-16.png   "$iconset/icon_16x16.png"
+          cp icons/c0pl4nd-32.png   "$iconset/icon_16x16@2x.png"
+          cp icons/c0pl4nd-32.png   "$iconset/icon_32x32.png"
+          cp icons/c0pl4nd-64.png   "$iconset/icon_32x32@2x.png"
+          cp icons/c0pl4nd-128.png  "$iconset/icon_128x128.png"
+          cp icons/c0pl4nd-256.png  "$iconset/icon_128x128@2x.png"
+          cp icons/c0pl4nd-256.png  "$iconset/icon_256x256.png"
+          cp icons/c0pl4nd-512.png  "$iconset/icon_256x256@2x.png"
+          cp icons/c0pl4nd-512.png  "$iconset/icon_512x512.png"
+          cp icons/c0pl4nd-1024.png "$iconset/icon_512x512@2x.png"
+          iconutil -c icns "$iconset" -o "$appbundle/Contents/Resources/c0pl4nd.icns"
+
+          # ---- .dmg (hdiutil, preinstalled) — drag-to-Applications layout ----
+          stage="dmg-stage"
+          rm -rf "$stage"; mkdir -p "$stage"
+          cp -R "$appbundle" "$stage/"
+          ln -s /Applications "$stage/Applications"
+          dmg="dist/c0pl4nd-${TAG}-${{ matrix.arch }}.dmg"
+          hdiutil create -volname "C0PL4ND" -srcfolder "$stage" -ov -format UDZO "$dmg"
+
+          # ---- checksum. macOS ships `shasum`, NOT `sha256sum`; using the
+          # latter unguarded would fail the step, and using it GUARDED
+          # (`if command -v sha256sum`) would silently skip the checksum, drop
+          # this artifact's line from SHA256SUMS, and leave the .dmg with no
+          # integrity record at all.
+          cd dist
+          for f in *.dmg; do shasum -a 256 "$f" > "$f.sha256"; done
+          ls -la; cat *.sha256
+      - name: Assert the macOS signing state (fail-closed on a stable tag)
+        # This job contains no codesign, no notarytool, no stapler and no spctl —
+        # not a disabled step, not a gated step, nothing. So the .dmg is unsigned
+        # and unnotarized, macOS attaches com.apple.quarantine on download, and
+        # Gatekeeper refuses the app on first launch — while the release reports
+        # success and says nothing about any of it.
+        #
+        # The script READS the state off the built bundle with codesign/spctl
+        # rather than asserting it in a comment, so the documented "unsigned,
+        # quarantine expected" state is evidence on every run and cannot rot into
+        # a falsehood the day something changes it. It fails the job on a stable
+        # tag unless an owner has recorded an explicit acknowledgement. Posture
+        # and escape hatch: see the script header.
+        shell: bash
+        env:
+          UNSIGNED_MACOS_APP_ACK: ${{ vars.UNSIGNED_MACOS_APP_ACK }}
+        run: sh app/packaging/require-macos-signing.sh C0PL4ND.app
+      - name: Attest macOS installer provenance (SLSA)
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
+        with:
+          subject-path: dist/*.dmg
+      - name: Upload macOS installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: macos-installer-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
   release:
     name: Publish Release
-    needs: [build, sbom, windows-installer]
+    needs: [build, sbom, windows-installer, windows-msi, brand-icons, linux-installers, macos-installer]
     runs-on: ubuntu-latest
     permissions:
       # The only job that needs write to create the release + upload assets.
@@ -467,7 +1144,15 @@ jobs:
       # set (not just the per-job artifacts) needs OIDC + attestations write.
       id-token: write
       attestations: write
-    if: always() && needs.build.result == 'success' && startsWith(github.ref, 'refs/tags/v')
+    # NO `always()`. With it, this job ran whenever `build` succeeded and the
+    # other three entries in `needs:` were decorative — a failed `sbom`,
+    # `windows-installer` or `windows-msi` still published the release, silently
+    # missing the asset that job produces. Without it, GitHub's default applies:
+    # the job runs only when EVERY `needs:` entry succeeded, which is what
+    # listing them was for. (`needs.build.result == 'success'` is then implied,
+    # so it is gone too — a redundant condition invites re-adding `always()` to
+    # "make it work".)
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Harden the runner (egress audit)
         # step-security/harden-runner@v2.19.4
@@ -498,9 +1183,72 @@ jobs:
           set -euo pipefail
           mkdir -p release
           find artifacts -type f \
-            \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.sha256' -o -name '*.cdx.json' -o -name 'BUILD-PROVENANCE.txt' \) \
+            \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.msi' \
+               -o -name '*.deb' -o -name '*.AppImage' -o -name '*.dmg' \
+               -o -name '*.sha256' -o -name '*.cdx.json' -o -name 'BUILD-PROVENANCE.txt' \) \
             -exec cp {} release/ \;
-          ( cd release && cat *.sha256 > SHA256SUMS 2>/dev/null || true )
+          # NOT `cat *.sha256 > SHA256SUMS 2>/dev/null || true`. That form
+          # publishes an EMPTY SHA256SUMS when the glob misses - and an empty
+          # SHA256SUMS still satisfies the `[ -f ]` keep-guard in the prune step
+          # while making every consumer's digest lookup fail. Since the prune
+          # deletes the per-binary sidecars, SHA256SUMS is the ONLY checksum
+          # record that ships; producing it silently empty is the worst
+          # available outcome. Fail loudly instead.
+          mapfile -t shas < <(find release -maxdepth 1 -type f -name '*.sha256' | sort)
+          if [ "${#shas[@]}" -eq 0 ]; then
+            echo "::error::no .sha256 sidecars staged - refusing to publish a release with no checksum manifest"
+            exit 1
+          fi
+          # `tr -d '\r'` is defence-in-depth for the CRLF a Windows producer can
+          # introduce (see the `Package (Windows)` step). A single stray CR in a
+          # filename field silently breaks every exact-name lookup downstream.
+          #
+          # Report on the SOURCE, before stripping. This used to be asserted
+          # AFTER the strip -- `grep -q $'\r' release/SHA256SUMS` on the very
+          # file `tr -d '\r'` had just produced -- which no input could ever make
+          # fire. It read like a guard on the CRLF hazard and was a tautology.
+          # Whether a producer emitted CRLF is a real, observable fact, so state
+          # it; it is NOT a failure, because stripping it is exactly what this
+          # line is for and a Windows producer doing so is expected.
+          # Measured as a byte-count delta across the strip, NOT with
+          # `grep -q $'\r'`: a text-mode grep (MSYS/Git-Bash, where this gate is
+          # falsified) silently translates CRLF away and never matches, so a
+          # grep-based probe would report "no CRLF" on a file full of it. The
+          # delta is the strip's own effect and is true on every platform.
+          raw_bytes=$(cat "${shas[@]}" | wc -c)
+          lf_bytes=$(cat "${shas[@]}" | tr -d '\r' | wc -c)
+          if [ "$raw_bytes" -ne "$lf_bytes" ]; then
+            echo "::notice::stripped $((raw_bytes - lf_bytes)) carriage return(s) from the source .sha256 sidecars (a Windows producer emitted CRLF); normalising to LF."
+          fi
+          cat "${shas[@]}" | tr -d '\r' | sort -u > release/SHA256SUMS
+          [ -s release/SHA256SUMS ] || { echo "::error::SHA256SUMS is empty"; exit 1; }
+          # Assert the SHAPE of every line instead. This is the check the CR one
+          # was reaching for, and unlike it this one can fail: `tr -d '\r'` only
+          # removes carriage returns, so it does NOT catch a UTF-8 BOM (a
+          # PowerShell-produced sidecar carries one, and EF BB BF glued to the
+          # first digest breaks exact-name and hex lookups in precisely the same
+          # way a CR does), a truncated or empty sidecar, a `release/`-prefixed
+          # filename field, or a stray blank line. SHA256SUMS is the ONLY
+          # integrity record that survives the prune, so a malformed line is a
+          # consumer-visible break, not cosmetic.
+          bad=0
+          # `|| [ -n "$line" ]` belongs in the CONDITION, not after `done`: a
+          # final line with no trailing newline makes `read` return non-zero, and
+          # a plain loop would skip it -- a malformed LAST entry would pass
+          # unchecked. (After `done` it would test the loop body's status, not
+          # read's, and check nothing.) `sort -u` terminates its output, so this
+          # is insurance against a future producer change rather than a live
+          # hole, but a gate with a known unchecked row is not a gate.
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              *[!\ -~]*) echo "::error::SHA256SUMS line has a non-printable byte (BOM/CR/control char): $(printf '%s' "$line" | od -c | head -2)"; bad=1; continue ;;
+            esac
+            if ! printf '%s' "$line" | LC_ALL=C grep -qE '^[0-9a-f]{64} [ *][^/\\]+$'; then
+              echo "::error::malformed SHA256SUMS line (want '<64 hex> <sp|*><bare filename>'): $line"; bad=1
+            fi
+          done < release/SHA256SUMS
+          [ "$bad" -eq 0 ] || { echo "::error::SHA256SUMS is malformed - refusing to publish it as the release's only integrity record"; exit 1; }
+          echo "----- release/SHA256SUMS -----"; cat release/SHA256SUMS
           ls -la release
 
       - name: Generate update manifest (latest.json, Tier 1)
@@ -608,11 +1356,11 @@ jobs:
         # `<asset>.minisig` sibling (the `.sha256` siblings already exist from the
         # build job) and `files: release/*` below uploads them.
         #
-        # ACTIVATION (one-time, repo owner): a passwordless rsign2 keypair was
-        # generated (`rsign generate -W`); the public half is embedded in
-        # `update_engine/verify.rs` and the secret half written to
-        # `.s4f3-data/c0pl4nd-minisign-secret.key` (OUTSIDE the repo). Add that
-        # secret-key file's CONTENTS as the `MINISIGN_SECRET_KEY` Actions secret.
+        # ACTIVATION (one-time, repo owner): generate an rsign2 keypair, embed
+        # the public half in `update_engine/verify.rs`, and add the secret half's
+        # CONTENTS as the `MINISIGN_SECRET_KEY` Actions secret. Where the secret
+        # half is kept offline is deliberately not recorded here — see
+        # `packaging/signing.md`.
         # Absent → this step is a NO-OP (artifacts ship checksummed but UNSIGNED;
         # the updater then rejects them — fail-closed). The in-script guard avoids
         # the secrets-in-`if` evaluation gotcha and fails safe.
@@ -621,22 +1369,28 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
-            # A stable (non-prerelease) tag has no '-' in its name (e.g. v0.4.6);
-            # an rc/pre tag does (v0.4.6-rc.2). Shipping a STABLE release UNSIGNED
-            # is a release-readiness landmine: the fail-closed in-app updater
-            # rejects unsigned artifacts, so existing users could not auto-update
-            # to it — a release that looks successful yet is un-updatable. Fail
-            # loudly for stable tags; allow the unsigned path only for prereleases.
-            case "${GITHUB_REF_NAME:-}" in
-              *-*)
-                echo "::warning::MINISIGN_SECRET_KEY not set — shipping checksummed but UNSIGNED prerelease artifacts (auto-update will reject them; acceptable for an rc/pre tag)."
-                exit 0
-                ;;
-              *)
-                echo "::error::MINISIGN_SECRET_KEY not set on a STABLE tag (${GITHUB_REF_NAME:-?}). A stable release MUST be signed — the fail-closed in-app updater rejects unsigned artifacts, so existing users could not auto-update to it. Provision the signing key (see this step's comment) or cut a prerelease (-rc/-pre) tag instead. Failing the release."
-                exit 1
-                ;;
-            esac
+            # Shipping a STABLE release UNSIGNED is a release-readiness landmine:
+            # the fail-closed in-app updater rejects unsigned artifacts, so
+            # existing users could not auto-update to it — a release that looks
+            # successful yet is un-updatable. `require-signing-key.sh` fails
+            # loudly for stable tags and allows the unsigned path only for a real
+            # SemVer prerelease or a non-tag ref.
+            #
+            # This WAS `case "${GITHUB_REF_NAME:-}" in *-*)` — "contains a hyphen
+            # anywhere" — which classified `v2026-08-10`, `v1.0-final` and
+            # `v0.5-hotfix` as prereleases and let each publish UNSIGNED and
+            # green. The rule now lives in `release-ref-class.sh`, one home
+            # shared with the Windows/macOS gates and the publish step, and is
+            # pinned in both directions by falsify_release_gates.py.
+            #
+            # NOTE the `src/` prefix: the release job checks out with
+            # `path: src` and sets no working-directory, so $PWD is
+            # $GITHUB_WORKSPACE and the script is one level down. `sh` on a
+            # missing file exits 127 under `set -e`, which would hard-fail a
+            # PRERELEASE that this gate is meant to wave through — so the path
+            # is asserted by falsify_release_gates.py too.
+            sh src/packaging/require-signing-key.sh
+            exit 0
           fi
           cargo install rsign2 --locked --version "^0.6"
           umask 077
@@ -748,9 +1502,19 @@ jobs:
         run: |
           set -euo pipefail
           before=$(find release -type f | wc -l | tr -d ' ')
+          # `.msi` entries added alongside `.exe`: the MSI job publishes an
+          # installer whose `.msi.sha256` and `.msi.minisig` are redundant with
+          # the signed SHA256SUMS + latest.json in exactly the same way as every
+          # other binary's. Without them in this list a new MSI silently
+          # re-introduces the per-binary sidecar clutter this step exists to
+          # remove - the prune list must be extended for every new artifact KIND.
           find release -type f \( \
               -name '*.tar.gz.minisig' -o -name '*.zip.minisig' -o -name '*.exe.minisig' \
+              -o -name '*.msi.minisig' -o -name '*.deb.minisig' \
+              -o -name '*.AppImage.minisig' -o -name '*.dmg.minisig' \
               -o -name '*.tar.gz.sha256' -o -name '*.zip.sha256' -o -name '*.exe.sha256' \
+              -o -name '*.msi.sha256' -o -name '*.deb.sha256' \
+              -o -name '*.AppImage.sha256' -o -name '*.dmg.sha256' \
               -o -name '*.sha256.minisig' -o -name '*.cdx.json.minisig' \
               -o -name 'BUILD-PROVENANCE.txt.minisig' \
             \) -delete
@@ -760,6 +1524,20 @@ jobs:
           for keep in latest.json latest.json.minisig SHA256SUMS SHA256SUMS.minisig; do
             [ -f "release/$keep" ] || { echo "::error::prune removed required $keep"; exit 1; }
           done
+          # Guard: after the prune, SHA256SUMS is the ONLY integrity record any
+          # consumer has for a binary (packaging/linux/install.sh reads it, and
+          # the in-app updater cross-checks the signed manifest). Every published
+          # artifact MUST therefore have a line in it. A missing line is a
+          # silently-skipped checksum upstream, not a cosmetic gap.
+          missing=0
+          for a in release/*.tar.gz release/*.zip release/*.exe release/*.msi \
+                   release/*.deb release/*.AppImage release/*.dmg; do
+            [ -f "$a" ] || continue
+            base=$(basename "$a")
+            grep -qE "[ *]${base}\$" release/SHA256SUMS \
+              || { echo "::error::no SHA256SUMS entry for $base"; missing=1; }
+          done
+          [ "$missing" -eq 0 ] || exit 1
           ls -la release
 
       - name: Attest published release assets (SLSA provenance, Tier 2)
@@ -779,9 +1557,36 @@ jobs:
             release/*.zip
             release/*.tar.gz
             release/*.exe
+            release/*.msi
+            release/*.deb
+            release/*.AppImage
+            release/*.dmg
             release/latest.json
             release/*.cdx.json
             release/SHA256SUMS
+
+      - name: Classify the tag (stable vs SemVer prerelease)
+        # The publish step below read `contains(github.ref_name, '-')`, the same
+        # "hyphen anywhere" rule the signing step used — so `v2026-08-10`,
+        # `v1.0-final` and `v0.5-hotfix` would each have been published as a
+        # GitHub PRERELEASE, hidden from the "Latest release" slot and from
+        # `gh release view` / the `/releases/latest` API that installers and the
+        # in-app updater resolve against. Left unfixed here, the signing gate and
+        # the publish step would also DISAGREE about what a stable tag is, which
+        # is how one silently drifts back.
+        #
+        # `release-ref-class.sh` is the single home of the SemVer rule; this step
+        # just lifts its verdict into a step output the action can read.
+        id: refclass
+        run: |
+          set -euo pipefail
+          class="$(sh src/packaging/release-ref-class.sh)"
+          echo "tag ${GITHUB_REF_NAME:-?} classified as: ${class}"
+          if [ "$class" = "prerelease" ]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Create GitHub Release
         # softprops/action-gh-release@v3.0.2
@@ -796,6 +1601,6 @@ jobs:
           name: ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ steps.refclass.outputs.prerelease }}
           generate_release_notes: true
           files: release/*

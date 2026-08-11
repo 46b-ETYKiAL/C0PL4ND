@@ -9,7 +9,7 @@
 //! `User-Agent` (app name + version). A Tier-1 client installs ONLY through the
 //! verified signed manifest — the archive is verified (its bytes pinned to the
 //! manifest's SIGNED SHA-256, then minisign against
-//! [`super::verify::EMBEDDED_PUBLIC_KEY`]) before the extracted binary is ever
+//! [`super::verify::EMBEDDED_PUBLIC_KEYS`]) before the extracted binary is ever
 //! returned. A verify failure deletes the staging area and the binary is NEVER
 //! returned unverified. There is no install path that skips the manifest.
 //!
@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::verify::{verify_artifact_bound_optional_sig, EMBEDDED_PUBLIC_KEY};
+use super::verify::{verify_artifact_bound_optional_sig, EMBEDDED_PUBLIC_KEYS};
 use super::{manifest, update_state};
 
 /// Decompression-bomb guard: hard cap on the TOTAL number of uncompressed bytes
@@ -279,7 +279,7 @@ pub fn check_for_update(
     // manifest. An absent/unverifiable manifest is a hard refusal here.
     let outcome = (|| {
         let (raw, json, sig_str) = fetch_manifest(owner, repo)?;
-        let manifest = manifest::parse_and_verify(&json, &sig_str, EMBEDDED_PUBLIC_KEY)?;
+        let manifest = manifest::parse_and_verify(&json, &sig_str, EMBEDDED_PUBLIC_KEYS)?;
         resolve_tier1_update(
             &raw,
             &manifest,
@@ -1081,7 +1081,7 @@ fn download_verify_extract_inner(
         &asset_bytes,
         expected_sha,
         sig_str.as_deref(),
-        EMBEDDED_PUBLIC_KEY,
+        EMBEDDED_PUBLIC_KEYS,
         &info.asset_name,
     )?;
 
@@ -1153,7 +1153,7 @@ fn download_verify_installer_inner(
         &exe_bytes,
         expected_sha,
         sig_str.as_deref(),
-        EMBEDDED_PUBLIC_KEY,
+        EMBEDDED_PUBLIC_KEYS,
         &installer.asset_name,
     )?;
 
@@ -2464,13 +2464,18 @@ mod tests {
         let real_sha = sha256_hex(data);
 
         // The genuine (manifest-matching) sha → accepted.
-        assert!(
-            verify_artifact_bound_optional_sig(data, &real_sha, Some(&sig), &pk_box, asset).is_ok()
-        );
+        assert!(verify_artifact_bound_optional_sig(
+            data,
+            &real_sha,
+            Some(&sig),
+            &[pk_box.as_str()],
+            asset
+        )
+        .is_ok());
         // A WRONG pinned sha (attacker swapped the asset under the same key) → rejected.
         let wrong = "0".repeat(64);
         assert_eq!(
-            verify_artifact_bound_optional_sig(data, &wrong, Some(&sig), &pk_box, asset)
+            verify_artifact_bound_optional_sig(data, &wrong, Some(&sig), &[pk_box.as_str()], asset)
                 .unwrap_err(),
             "checksum mismatch"
         );

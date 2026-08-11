@@ -8,6 +8,18 @@
 use super::theme;
 
 impl super::C0pl4ndApp {
+    /// The live toast text, if one is currently showing.
+    ///
+    /// `self.toast` is `pub(crate)`, so the in-crate unit tests can read it
+    /// directly — but `crates/app/tests/` is a SEPARATE crate and cannot. The
+    /// config-hot-reload test asserts on the user-visible reload notice, which
+    /// is the only observable proof the reload actually applied, so it needs a
+    /// public accessor rather than a `pub(crate)` field.
+    #[allow(dead_code)]
+    pub fn toast_text(&self) -> Option<&str> {
+        self.toast.as_deref()
+    }
+
     /// The current font size (pt) from the live config. Used by the settings
     /// slider interaction test.
     #[allow(dead_code)]

@@ -1,9 +1,8 @@
-//! Milestone 1 of the C0PL4ND egui chrome modernization (recon dossier
-//! `.s4f3-data/recon-c0pl4nd-egui-modernization.md`, steps 1–4).
+//! The C0PL4ND egui chrome shell.
 //!
-//! This module is the modern `eframe`/`egui` application shell, shipped as a
-//! SEPARATE binary (`c0pl4nd-egui`) so the existing winit-driven `c0pl4nd`
-//! binary keeps building and shipping unchanged. The chrome (frameless
+//! This module is the modern `eframe`/`egui` application shell and the
+//! CANONICAL `c0pl4nd` binary; the original winit-driven terminal is preserved
+//! beside it as `c0pl4nd-legacy` (see `crates/app/Cargo.toml`). The chrome (frameless
 //! titlebar, two-tone wordmark, tab strip, caption buttons, status bar) and the
 //! `egui_tiles` pane grid are real and clickable; each pane body hosts a live
 //! PTY whose visible grid is drawn with egui's NATIVE coloured-text painter (see
@@ -46,18 +45,28 @@ mod theme;
 pub(crate) use crt::*;
 pub(crate) use motion_fx::*;
 mod grid_interaction;
+mod scrollbar;
+// `pub(crate)` (not private) so `crate::notify::plan` can reach the ONE
+// focused-suppression predicate rather than reimplementing it. The toast and the
+// taskbar flash are two escalations of the same decision; two copies of it would
+// drift.
+pub(crate) mod taskbar;
 pub(crate) use grid_interaction::*;
 mod config_load;
 pub(crate) use config_load::*;
+mod config_watch;
 mod window_effects;
 pub(crate) use window_effects::*;
 mod caption_close;
 mod font_setup;
 mod win_foreground;
 pub(crate) use font_setup::*;
+mod actions;
 mod app_config;
 mod app_report_ui;
 mod app_search;
+
+pub use actions::{Action, PaletteEntry};
 
 use std::collections::{HashMap, HashSet};
 
@@ -90,6 +99,73 @@ pub enum WindowCmd {
     Close,
 }
 
+/// What a close request actually did — the resolved product of BOTH window-close
+/// decisions, in the order the close path applies them:
+/// `WindowConfig::close_guard` (is a shell command still running?) then
+/// `WindowConfig::close_action` (exit, or hide to the tray?).
+///
+/// Recorded in [`C0pl4ndApp::last_close_outcome`] because the real effects are
+/// invisible to a headless harness: `Exit` calls `process::exit`, `HideToTray`
+/// issues an OS viewport command. The outcome is what a test can assert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseOutcome {
+    /// Run the shutdown side effects and exit the process.
+    Exit,
+    /// Hold the close and show the running-command confirmation instead.
+    Confirm {
+        /// How many panes report a command still in flight (always `>= 1`).
+        busy_panes: usize,
+    },
+    /// Keep the process alive and hide the window to the tray.
+    HideToTray,
+}
+
+/// A pinned terminal-cursor blink phase, for deterministic visual-QA capture.
+///
+/// The caret's phase is normally a function of the frame clock, so a snapshot
+/// scene captures it wherever the clock happens to land — the same scene showed
+/// the caret painted on one run and gone the next, which makes "cursor
+/// placement" un-eyeball-able from the PNGs. [`C0pl4ndApp::set_cursor_blink_phase`]
+/// pins it for the frames a test is capturing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorBlinkPhase {
+    /// The caret is painted this frame, whatever the clock says.
+    On,
+    /// The caret is not painted this frame, whatever the clock says.
+    Off,
+}
+
+/// Set when a real "quit" affordance asked the app to close — today the tray
+/// menu's own Quit item.
+///
+/// A process-wide flag rather than a field on [`C0pl4ndApp`] for exactly the
+/// reason [`FORWARDED_LAUNCHES`] is: the producer is the tray's global
+/// `MenuEvent` handler in the binary-local `tray` module, which runs on the
+/// event-loop thread with no `&mut App` to write into, and which signals the
+/// close by posting `WM_CLOSE` — i.e. it arrives at the SAME `close_requested`
+/// path an ordinary caption-✕ takes and is otherwise indistinguishable from it.
+///
+/// That indistinguishability is the whole point: without this flag,
+/// close-to-tray would swallow the tray's own Quit and the app could never be
+/// closed at all (see `WindowConfig::close_action`'s `explicit_quit`).
+static EXPLICIT_QUIT_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record that the NEXT close request is a real quit, and must exit rather than
+/// hide to the tray. Called from the tray menu's Quit handler immediately before
+/// it posts `WM_CLOSE`.
+pub fn request_explicit_quit() {
+    EXPLICIT_QUIT_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// CONSUME the explicit-quit flag: `true` once per [`request_explicit_quit`].
+///
+/// Consuming (rather than peeking) is what stops one tray Quit from making every
+/// later close in the session bypass close-to-tray.
+pub fn take_explicit_quit() -> bool {
+    EXPLICIT_QUIT_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The modern egui chrome application. Holds the tiling grid, the focused pane,
 /// a settings-window toggle, and a transient status-bar toast.
 pub struct C0pl4ndApp {
@@ -117,7 +193,7 @@ pub struct C0pl4ndApp {
     /// would reflow cmd's grid and snap its cursor back to (0,0), so typing
     /// overwrites the banner. Instead [`render_pane_body`] spawns each pending
     /// pane at the MEASURED `(cols, rows)` on the first frame its rect is known —
-    /// exactly how a manually-opened terminal (`spawn_term`) already behaves —
+    /// exactly how a manually-opened terminal (`spawn_term_in`) already behaves —
     /// after which the debounced resize is a no-op and the cursor stays put.
     pub(crate) pending_spawn: HashSet<PaneId>,
     /// Working directories captured from a previous run's persisted layout
@@ -127,6 +203,29 @@ pub struct C0pl4ndApp {
     /// on a fresh launch and after every entry is consumed — so a pane the user
     /// later splits never inherits a stale restored cwd.
     pub(crate) restored_cwds: HashMap<PaneId, String>,
+    /// The working directories of recently CLOSED panes, most-recent LAST — the
+    /// undo stack behind [`C0pl4ndApp::reopen_closed_tab`].
+    ///
+    /// Each entry is the pane's OSC-7-reported cwd at the moment it was closed,
+    /// or `None` for a pane whose shell never reported one (a failed spawn, or a
+    /// shell with no OSC 7 integration). `None` is DELIBERATELY recorded rather
+    /// than dropped: the user closed a pane and asked for it back, so the pane
+    /// must return either way — we simply cannot say where it was, and it opens
+    /// in the default dir. Recording only the panes we happen to know the cwd of
+    /// would make the chord silently do nothing on `cmd.exe`.
+    ///
+    /// Captured in [`C0pl4ndApp::close_pane`] — the ONE function every close path
+    /// (tab ×, egui_tiles close button, context menu, the `close_tab` chord)
+    /// routes through — so no close path can bypass it. Bounded to
+    /// [`MAX_CLOSED_TAB_HISTORY`]; the oldest entry is dropped past the cap so a
+    /// long session cannot grow this without limit.
+    pub(crate) closed_tab_cwds: Vec<Option<String>>,
+    /// The directory the most recent pane spawn was asked to start the shell in,
+    /// or `None` when it was asked for the shell's default. Written by
+    /// [`C0pl4ndApp::spawn_term_in`] at the branch that actually passes the
+    /// directory to the PTY. An observation field in the same family as
+    /// [`last_window_cmd`](Self::last_window_cmd).
+    pub(crate) last_spawn_cwd: Option<String>,
     /// Monotonic pane-id allocator.
     pub(crate) pane_alloc: PaneIdAllocator,
     /// The currently-focused pane (drives tab highlight + input routing).
@@ -177,13 +276,19 @@ pub struct C0pl4ndApp {
     /// Committed to `cmd_history` on Enter, reset on focus change. Best-effort:
     /// it models printable text + Backspace, not full shell line-editing.
     pub(crate) input_line: String,
-    /// A multi-line paste deferred for confirmation (paste-safety). When
-    /// `config.paste_warn_multiline` is on and a paste contains a newline, it is
-    /// parked here and a confirm overlay is shown instead of executing it
-    /// immediately (the embedded newline would otherwise run a command on land).
-    /// Enter in the overlay sends it (through the paste-injection guard); Esc
-    /// discards it.
+    /// A paste deferred for confirmation (paste-safety). Two gates park a paste
+    /// here instead of executing it immediately — a MULTI-LINE paste (whose
+    /// embedded newline would run a command the moment it lands) and an
+    /// oversized SINGLE-line paste (`config.paste_warn_bytes`, the flood /
+    /// hidden-tail half of the same footgun). The decision is
+    /// [`c0pl4nd_core::paste_guard::paste_confirm_reason`] so both halves share
+    /// one policy. Enter in the overlay sends it (through the paste-injection
+    /// guard); Esc discards it.
     pub(crate) pending_paste: Option<String>,
+    /// Which gate deferred [`Self::pending_paste`], so the confirm overlay can
+    /// explain the actual hazard rather than always claiming "multiple lines".
+    /// Set and cleared in lockstep with `pending_paste`.
+    pub(crate) pending_paste_reason: Option<c0pl4nd_core::paste_guard::PasteConfirmReason>,
     /// Incognito session: when `true`, NO typed commands are recorded into
     /// command history (regardless of `config.history_capture_enabled`). Runtime
     /// only — never persisted, so it always starts off and resets each launch.
@@ -207,6 +312,13 @@ pub struct C0pl4ndApp {
     /// pattern as [`Self::last_window_cmd`] (the PTY write itself is not
     /// observable in the headless harness).
     pub(crate) last_palette_run: Option<String>,
+    /// The [`Action`] most recently dispatched FROM the command palette (Enter or
+    /// click). Set in [`Self::run_palette_selection`] so an interaction test can
+    /// assert that driving the REAL palette routed through the shared dispatch
+    /// path — the action's own effect (pane count, `settings_open`, font size …)
+    /// is asserted separately, so this is a routing witness, never the only
+    /// evidence.
+    pub(crate) last_palette_action: Option<Action>,
     /// The most recent URL a Ctrl-click opened (most-recent-wins), or `None` if
     /// none this session. Observable so an interaction test can assert that a
     /// Ctrl-click on a URL in the grid opened it — the OS-opener side effect
@@ -238,6 +350,11 @@ pub struct C0pl4ndApp {
     pub(crate) search_test_corpus: Option<String>,
     /// A transient status-bar message (e.g. "max 6 panes").
     pub(crate) toast: Option<String>,
+    /// Watches the on-disk `config.toml` so an external edit takes effect LIVE
+    /// (see [`Self::config_hot_reload_tick`]). Points at
+    /// [`c0pl4nd_core::Config::default_path`] by default; a test repoints it
+    /// with [`Self::watch_config_at`].
+    pub(crate) config_watch: config_watch::ConfigWatcher,
     /// The `(font-family-key, size-bits, pixels-per-point-bits)` the grid glyph
     /// atlas was last PRE-WARMED for. When this differs from the live font stack
     /// (first frame, a system-font swap, a zoom, OR a DPI/`pixels_per_point`
@@ -283,6 +400,42 @@ pub struct C0pl4ndApp {
     /// tests can assert that clicking a caption button had its real effect (the
     /// OS command itself is not observable in a headless harness).
     pub(crate) last_window_cmd: Option<WindowCmd>,
+    /// Whether a system-tray icon actually EXISTS for this process.
+    ///
+    /// The tray is a binary-local module of the shipping `c0pl4nd` binary (it
+    /// needs the real HWND + the winit message loop), so the lib cannot ask it
+    /// directly; the binary reports in via [`Self::set_tray_available`]. It
+    /// starts `false` and that default is load-bearing rather than lazy: a
+    /// close-to-tray hide with NO icon would strand the window invisible with no
+    /// way back, so the whole feature degrades to a real exit until something
+    /// proves a tray exists (see `WindowConfig::close_action`).
+    pub(crate) tray_available: bool,
+    /// `Some(busy_panes)` while the running-command close confirmation is on
+    /// screen — the count `WindowConfig::close_guard` reported. `None` when no
+    /// confirmation is pending.
+    pub(crate) close_confirm: Option<usize>,
+    /// The user's answer to that confirmation ("Close anyway"). Fed straight
+    /// into `close_guard`'s `already_confirmed`, which short-circuits to
+    /// `Proceed` so the second pass through the close path cannot re-prompt (the
+    /// commands are still running when the user says yes). Reset whenever a
+    /// close does NOT end in an exit, so a later close prompts again.
+    pub(crate) close_confirmed: bool,
+    /// The most recent close DECISION ([`Self::close_decision`]). Observable for
+    /// the same reason as [`last_window_cmd`](Self::last_window_cmd): the real
+    /// effects (`process::exit`, hiding the OS window) are invisible to a
+    /// headless harness, so this is what a test asserts the config decision
+    /// actually reached.
+    pub(crate) last_close_outcome: Option<CloseOutcome>,
+    /// How many close requests reached the real exit branch. In a live window
+    /// the process is gone before this is read; in the headless harness it is
+    /// the observable proof that a close was NOT swallowed by the guard or by
+    /// close-to-tray.
+    pub(crate) exit_requests: u32,
+    /// Deterministic override for the terminal cursor's blink phase, for visual
+    /// QA capture. `None` (the default, and the only state the shipping app ever
+    /// runs in) leaves the phase free-running off the frame clock. See
+    /// [`Self::set_cursor_blink_phase`].
+    pub(crate) cursor_blink_phase: Option<CursorBlinkPhase>,
     /// Last known UN-maximized inner size (logical points). Updated every frame
     /// the window is not maximized, and used to drive an EXPLICIT restore size
     /// when the user un-maximizes: eframe's persisted window state can leave
@@ -315,6 +468,16 @@ pub struct C0pl4ndApp {
     /// MANUAL theme pick sticks between OS-appearance changes (SCR1B3 parity).
     /// `None` when follow-OS is off / never observed. Never persisted.
     pub(crate) last_os_theme: Option<egui::Theme>,
+    /// Whether the OS reports forced-colors / high-contrast mode, sampled ONCE
+    /// at real-window construction (`c0pl4nd_core::forced_colors::forced_colors`).
+    ///
+    /// Held as state rather than re-queried per frame for two reasons: the OS
+    /// answer is process-cached anyway, and — more importantly — it makes the
+    /// accessibility precedence in [`Self::follow_os_theme_tick`] deterministic
+    /// under test. The headless `bootstrap_with` path leaves it `false`, so no
+    /// existing test's behaviour depends on the host machine's real
+    /// accessibility settings. Never persisted.
+    pub(crate) forced_colors: bool,
     /// True on the first frame the Settings window opens (a closed→open edge),
     /// so `settings::show` FORCES the window to its saved-or-centered position
     /// that frame instead of trusting egui's `default_pos` (which read a
@@ -329,6 +492,16 @@ pub struct C0pl4ndApp {
     /// event — but NOT in headless tests, where an unconditional repaint would
     /// make `Harness::run` loop until `max_steps`.
     pub(crate) live_window: bool,
+    /// A config file EXISTED at startup but could not be read/parsed, so
+    /// `self.config` is `Config::default()` and every field the user had set is
+    /// absent from memory. Any save would therefore overwrite their file with
+    /// defaults — and unlike the forward-version case, a document merge cannot
+    /// recover the lost values because they are not in this process at all. The
+    /// FIRST save of such a session therefore renames the original aside to
+    /// `config.toml.bak` before writing (and clears this), so the loss is always
+    /// recoverable and always announced. Cleared early if a hot reload later
+    /// parses the file successfully — the premise no longer holds then.
+    pub(crate) config_unreadable: bool,
     /// Frameless terminal-only fullscreen (#36), toggled by F11 (and exited by
     /// F11 or Esc). TRANSIENT — never persisted to `Config`: F11 is a per-session
     /// view toggle, not a saved preference, so a relaunch is always windowed.
@@ -407,6 +580,52 @@ pub struct C0pl4ndApp {
 
 /// The PTY grid size used to spawn a pane before its real pixel rect is known.
 /// The first `resize_to_px` corrects it to fit the allocated rect.
+/// Launches that a SECOND `c0pl4nd.exe` handed to this already-running instance
+/// instead of opening a rival window (see the binary-local `single_instance`
+/// module). Each entry is that launch's `--cwd`, or `None` for a plain launch.
+///
+/// A process-wide queue rather than a field on [`C0pl4ndApp`] because the
+/// producer is a bare Win32 window procedure: it is an `extern "system"` fn that
+/// cannot capture, runs on the event-loop thread the instant the message is
+/// dispatched, and has no `&mut App` to write into. `frame_tick` drains it.
+///
+/// Bounded at [`MAX_PENDING_FORWARDED_LAUNCHES`]: a script hammering the exe
+/// while the app is busy must not grow this without limit, and opening more
+/// panes than the grid can hold is pointless anyway.
+static FORWARDED_LAUNCHES: std::sync::Mutex<Vec<Option<String>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The cap on [`FORWARDED_LAUNCHES`]. Comfortably above the 6-pane grid cap, so
+/// a realistic burst is never dropped, while still bounded.
+const MAX_PENDING_FORWARDED_LAUNCHES: usize = 32;
+
+/// Hand a forwarded launch to the running instance. Called from the
+/// single-instance window procedure; the next frame opens a pane for it.
+///
+/// Never panics and never blocks meaningfully: a poisoned lock is ignored (the
+/// forwarded launch is dropped rather than taking down the OS callback that a
+/// second process is synchronously waiting on).
+pub fn push_forwarded_launch(cwd: Option<String>) {
+    if let Ok(mut q) = FORWARDED_LAUNCHES.lock() {
+        if q.len() < MAX_PENDING_FORWARDED_LAUNCHES {
+            q.push(cwd);
+        }
+    }
+}
+
+/// Drain the forwarded launches queued since the last call.
+pub fn take_forwarded_launches() -> Vec<Option<String>> {
+    FORWARDED_LAUNCHES
+        .lock()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default()
+}
+
+/// How many closed panes [`C0pl4ndApp::closed_tab_cwds`] remembers. Deep enough
+/// that "I closed the wrong one" is always recoverable several steps back,
+/// shallow enough that a day-long session cannot grow the stack without bound.
+const MAX_CLOSED_TAB_HISTORY: usize = 16;
+
 const SPAWN_COLS: u16 = 80;
 /// See [`SPAWN_COLS`].
 const SPAWN_ROWS: u16 = 24;
@@ -420,6 +639,17 @@ const SPAWN_ROWS: u16 = 24;
 /// proportionally, lowering it tightens them — without breaking the existing
 /// absolute-px config field or its settings slider.
 const LINE_HEIGHT_ANCHOR_PX: f32 = 20.0;
+
+/// Most PROMPT (and most FAILED-COMMAND) ticks the scrollbar paints per pane.
+///
+/// Core retains up to 4096 prompt and 8192 command marks, and a program that
+/// emits OSC 133 in a tight loop can fill both. Painting every one of them would
+/// cost thousands of rects per frame AND collapse into an unreadable smear on a
+/// track only a few hundred points tall, so the bar shows the most RECENT
+/// [`MAX_SEMANTIC_SCROLL_MARKS`] of each kind — the ones a user is scrolling
+/// back toward. Search hits are NOT capped: they are already bounded by the
+/// visible grid.
+const MAX_SEMANTIC_SCROLL_MARKS: usize = 256;
 
 /// Convert the configured `config.font.line_height` (absolute px, default 20.0)
 /// into a row-pitch MULTIPLIER relative to the natural galley height. Pure +
@@ -450,6 +680,62 @@ fn effective_row_pitch(natural_line_h: f32, line_height_px: f32) -> f32 {
     (natural_line_h * line_height_multiplier(line_height_px)).max(1.0)
 }
 
+/// The active shell profile, as a deferred first-spawn needs it: the program to
+/// launch (`None` = the platform default shell) and its arguments.
+///
+/// A borrowed bundle rather than two more loose parameters because it is
+/// threaded into [`C0pl4ndApp::render_pane_body`], which is a FREE function (so
+/// the egui_tiles closure can borrow `terms`/`theme` disjointly from
+/// `grid_tree`) and already carries a long argument list.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SpawnProfile<'a> {
+    /// The program to launch; `None` means the platform default shell.
+    pub(crate) program: Option<&'a str>,
+    /// Arguments passed to `program` (empty for a bare interactive shell).
+    pub(crate) args: &'a [String],
+}
+
+/// THE ONE PANE-SPAWN FUNNEL: turn a shell profile (`program` + `args`, where
+/// `None` is the platform default shell) plus an optional working directory into
+/// a live [`PaneTerm`].
+///
+/// Both spawn paths route through here — [`C0pl4ndApp::spawn_term_in`] (split /
+/// new tab / reopen-closed-pane) and the DEFERRED first-spawn in
+/// [`C0pl4ndApp::render_pane_body`] (the initial pane and every restored one).
+/// That is the point of the funnel: the two used to make the profile-vs-cwd
+/// choice independently, and they disagreed. `spawn_term_in`'s named-profile arm
+/// dropped the cwd (it called the directory-less `PaneTerm::spawn_program`), and
+/// the deferred arm ignored the profile entirely and always spawned the default
+/// shell — so a restored layout under PowerShell/WSL came back as the default
+/// shell, in the default directory. One funnel, one answer.
+///
+/// `cwd = None` keeps the pre-existing cwd-less spawn EXACTLY as it was (the
+/// shell's own default directory); a `cwd` that no longer exists falls back to
+/// home inside the core spawn, and a failed spawn degrades to an error pane —
+/// never a panic.
+fn spawn_pane_term(
+    theme: c0pl4nd_core::Theme,
+    program: Option<&str>,
+    args: &[String],
+    cols: u16,
+    rows: u16,
+    term: Option<&str>,
+    cwd: Option<&str>,
+) -> PaneTerm {
+    match program {
+        // A NAMED profile: its program wins, and the cwd now travels with it.
+        Some(program) => {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            PaneTerm::spawn_program_in(theme, program, &arg_refs, cols, rows, cwd)
+        }
+        // The platform default shell.
+        None => match cwd {
+            Some(dir) => PaneTerm::spawn_in_with_term(theme, cols, rows, term, Some(dir)),
+            None => PaneTerm::spawn_with_term(theme, cols, rows, term),
+        },
+    }
+}
+
 impl C0pl4ndApp {
     /// Build the app inside eframe, applying the brand Visuals + window effect,
     /// and computing the terminal cell metrics from egui's monospace font (the
@@ -462,10 +748,35 @@ impl C0pl4ndApp {
         // F5-2: load config AND capture any parse error, so a broken config file
         // surfaces as a visible toast instead of the silent fallback-to-defaults
         // that previously only `eprintln`'d (invisible to a GUI-launched user).
-        let (cfg, config_error) = load_config_with_status();
+        let (mut cfg, config_error) = load_config_with_status();
+        // A `Some` error means a config file EXISTED and failed to read/parse
+        // (an absent file is `None`), so `cfg` is defaults and every value the
+        // user had set is gone from memory. Remember that: the first save of
+        // this session must set their file aside instead of overwriting it.
+        let unreadable = config_error.is_some();
+        // Accessibility: if the OS is in forced-colors / high-contrast mode and
+        // the user never picked a theme, start on the accessible one. An explicit
+        // theme choice always wins — see `apply_forced_colors_auto_theme`.
+        //
+        // This reads the theme out of `cfg` AFTER the load above, so the two
+        // fixes compose rather than race: an unreadable config leaves `cfg` at
+        // defaults, i.e. with no explicit theme, so high contrast correctly wins
+        // that case — while `unreadable` is already captured, so the set-aside
+        // on first save is unaffected by the theme we auto-pick here.
+        let forced_colors = c0pl4nd_core::forced_colors::forced_colors();
+        let auto_high_contrast = apply_forced_colors_auto_theme_with(&mut cfg, forced_colors);
         let mut app = Self::bootstrap_with(cfg);
+        app.config_unreadable = unreadable;
+        app.forced_colors = forced_colors;
         if let Some(err) = config_error {
             app.toast = Some(err);
+        }
+        if auto_high_contrast && app.toast.is_none() {
+            app.toast = Some(
+                "High contrast is on in your OS settings — C0PL4ND started on the \
+                 accessible theme. Pick any theme in Settings to override it."
+                    .to_string(),
+            );
         }
         // Restore the persisted split-pane layout + per-pane cwd from a previous
         // run (eframe `persistence` storage). A missing, unreadable, or
@@ -537,6 +848,9 @@ impl C0pl4ndApp {
                     // Prime the first-launch foreground raise with the SAME main
                     // window handle; `frame_tick` fires it once on frame 1.
                     win_foreground::set_main_hwnd(w.hwnd.get());
+                    // Prime the taskbar-progress consumer (OSC 9;4) with the SAME
+                    // handle so `ITaskbarList3` drives THIS window's button.
+                    taskbar::set_main_hwnd(w.hwnd.get());
                 }
             }
         }
@@ -648,6 +962,8 @@ impl C0pl4ndApp {
             terms,
             pending_spawn,
             restored_cwds: HashMap::new(),
+            closed_tab_cwds: Vec::new(),
+            last_spawn_cwd: None,
             pane_alloc,
             focused_pane,
             pinned: HashSet::new(),
@@ -662,6 +978,7 @@ impl C0pl4ndApp {
             cmd_history: c0pl4nd_core::command_history::CommandHistory::default(),
             input_line: String::new(),
             pending_paste: None,
+            pending_paste_reason: None,
             incognito: false,
             palette_open: false,
             history_open: false,
@@ -669,6 +986,7 @@ impl C0pl4ndApp {
             palette_query: String::new(),
             palette_sel: 0,
             last_palette_run: None,
+            last_palette_action: None,
             last_opened_url: None,
             search_open: false,
             search_query: String::new(),
@@ -678,6 +996,14 @@ impl C0pl4ndApp {
             search_sel: 0,
             search_test_corpus: None,
             toast: theme_notice,
+            // Watch the file this config came from, stamped as ALREADY-loaded so
+            // the first frame never reloads what we just read. Both constructors
+            // (`bootstrap` for tests, `new` for the shipping binary) route
+            // through here, so the hot-reload wire exists in exactly one place.
+            config_watch: match c0pl4nd_core::Config::default_path() {
+                Some(p) => config_watch::ConfigWatcher::watching(p),
+                None => config_watch::ConfigWatcher::default(),
+            },
             warmed_atlas: None,
             warmup_frames_left: 0,
             font_wait_frames: 0,
@@ -685,14 +1011,26 @@ impl C0pl4ndApp {
             update_rx: None,
             last_update_notice: None,
             last_window_cmd: None,
+            // Fail-safe default: no tray until the shipping binary proves one
+            // exists, so a hide can never strand the window (see the field doc).
+            tray_available: false,
+            close_confirm: None,
+            close_confirmed: false,
+            last_close_outcome: None,
+            exit_requests: 0,
+            cursor_blink_phase: None,
             restore_size: None,
             cursor_trail: std::collections::VecDeque::new(),
             first_frame_time: None,
             foreground_done: false,
             last_os_theme: None,
+            // Headless/default: no OS accessibility request. The real-window
+            // constructor samples the OS and overwrites this.
+            forced_colors: false,
             settings_place_pending: false,
             settings_was_open: false,
             live_window: false,
+            config_unreadable: false,
             fullscreen: false,
             was_focused: true,
             selection: None,
@@ -765,23 +1103,83 @@ impl C0pl4ndApp {
         }
     }
 
-    fn spawn_term(&mut self, pid: PaneId) {
+    /// Spawn a fresh live terminal for `pid`, starting the shell in `cwd` when
+    /// one is given (`None` = the shell's own default directory, which is what
+    /// every path except reopen-closed-pane wants).
+    ///
+    /// Deliberately ONE function with an `Option` rather than a plain
+    /// `spawn_term` plus an `_in` variant: the wrapper had exactly zero callers
+    /// once `split_in` landed, and a dead pass-through is how a second spawn path
+    /// starts drifting from the first.
+    ///
+    /// **The cwd now applies to a NAMED profile too.** It used to apply to the
+    /// DEFAULT shell only: this branch called `PaneTerm::spawn_program`, which
+    /// had no directory parameter at all, so reopening a closed pane (or
+    /// restoring a layout) while a named profile was active silently landed in
+    /// the default directory. `PaneTerm::spawn_program_in` closed that gap; the
+    /// shared [`spawn_pane_term`] funnel below is where both arms consume it, so
+    /// the immediate and deferred spawn paths cannot drift apart again.
+    fn spawn_term_in(&mut self, pid: PaneId, cwd: Option<&str>) {
         let theme = self.theme.clone();
+        let term_name = self.config.term.clone();
         let profile = self.shell_profiles.get(self.active_shell);
-        let term = match profile.and_then(|p| p.program.clone()) {
-            Some(program) => {
-                let args: Vec<String> = profile.map(|p| p.args.clone()).unwrap_or_default();
-                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                PaneTerm::spawn_program(theme, &program, &arg_refs, SPAWN_COLS, SPAWN_ROWS)
-            }
-            None => PaneTerm::spawn_with_term(
-                theme,
-                SPAWN_COLS,
-                SPAWN_ROWS,
-                Some(self.config.term.as_str()),
-            ),
-        };
+        let program = profile.and_then(|p| p.program.clone());
+        let args: Vec<String> = profile.map(|p| p.args.clone()).unwrap_or_default();
+        // Record the directory the shell was ACTUALLY asked to start in, at the
+        // exact branch that asks for it. Mirrors `last_window_cmd`: it makes an
+        // otherwise-invisible spawn argument observable, so the reopen wiring
+        // test asserts the cwd reached the spawn rather than merely that a pane
+        // appeared (which a pane opened in the wrong directory would also
+        // satisfy). Set for BOTH profile arms now that both honour it.
+        self.last_spawn_cwd = cwd.map(str::to_string);
+        let term = spawn_pane_term(
+            theme,
+            program.as_deref(),
+            &args,
+            SPAWN_COLS,
+            SPAWN_ROWS,
+            Some(term_name.as_str()),
+            cwd,
+        );
         self.terms.insert(pid, term);
+    }
+
+    /// Open one pane per launch that a second process forwarded to us, each in
+    /// the directory that launch asked for (`None` = the shell default).
+    ///
+    /// Reuses the ordinary new-pane path, so a forwarded launch is subject to
+    /// exactly the same pane cap and toast as pressing "+" — a script running
+    /// the exe in a loop can never grow the grid past its limit.
+    pub(crate) fn drain_forwarded_launches(&mut self, ctx: &egui::Context) {
+        for cwd in take_forwarded_launches() {
+            self.new_terminal_in(cwd.as_deref());
+            ctx.request_repaint();
+        }
+    }
+
+    /// Remember a closed pane's cwd on the reopen stack, dropping the oldest
+    /// entry past [`MAX_CLOSED_TAB_HISTORY`].
+    fn push_closed_tab_cwd(&mut self, cwd: Option<String>) {
+        self.closed_tab_cwds.push(cwd);
+        if self.closed_tab_cwds.len() > MAX_CLOSED_TAB_HISTORY {
+            self.closed_tab_cwds.remove(0);
+        }
+    }
+
+    /// Re-open the most recently closed pane, in the directory it was closed in.
+    /// A no-op with an empty stack.
+    ///
+    /// The stack entry is PEEKED and only popped once the pane actually exists:
+    /// at the 6-pane cap `new_terminal_in` refuses (with a toast), and popping
+    /// regardless would silently consume the user's undo step for a pane they
+    /// never got back.
+    pub(crate) fn reopen_closed_tab(&mut self) {
+        let Some(cwd) = self.closed_tab_cwds.last().cloned() else {
+            return;
+        };
+        if self.new_terminal_in(cwd.as_deref()) {
+            self.closed_tab_cwds.pop();
+        }
     }
 
     // ---- public observation surface (production accessors, NOT test-only) ----
@@ -931,6 +1329,15 @@ impl C0pl4ndApp {
         self.terms.get(&pane_id).map(PaneTerm::size)
     }
 
+    /// A pane's BODY rect (screen points) as of the last rendered frame, or
+    /// `None` before the first frame has laid the grid out. The scrollbar is an
+    /// overlay on the right edge of this rect, so the scrollbar-mark test uses it
+    /// to locate the bar's painted shapes in the frame output.
+    #[allow(dead_code)]
+    pub fn pane_body_rect(&self, pane_id: PaneId) -> Option<egui::Rect> {
+        self.pane_rects.get(&pane_id).copied()
+    }
+
     /// The ids of every pane with a live terminal, in unspecified order. Used by
     /// tests to enumerate panes for focus routing assertions.
     #[allow(dead_code)]
@@ -991,19 +1398,29 @@ impl C0pl4ndApp {
     /// Split the focused pane, allocating a fresh placeholder pane. Refused (with
     /// a toast) at the 6-pane cap.
     fn split(&mut self, dir: egui_tiles::LinearDir) {
+        self.split_in(dir, None);
+    }
+
+    /// [`split`](Self::split), but starting the new pane's shell in `cwd`.
+    /// Returns whether a pane was actually created — `false` at the pane cap or
+    /// when the tree refuses the split. The reopen path needs that answer so it
+    /// does not consume an undo step for a pane it never got.
+    fn split_in(&mut self, dir: egui_tiles::LinearDir, cwd: Option<&str>) -> bool {
         if count_panes(&self.grid_tree) >= grid::MAX_PANES {
             self.toast = Some(format!(
                 "You've reached the maximum of {} panes. Close one to open another.",
                 grid::MAX_PANES
             ));
-            return;
+            return false;
         }
         let new_pane = self.pane_alloc.alloc();
         if grid::split_focused(&mut self.grid_tree, self.focused_pane, new_pane, dir) {
-            self.spawn_term(new_pane);
+            self.spawn_term_in(new_pane, cwd);
             self.focused_pane = new_pane;
             self.toast = None;
+            return true;
         }
+        false
     }
 
     /// Open a new terminal (the single "+" button). Splits the focused pane
@@ -1015,13 +1432,19 @@ impl C0pl4ndApp {
     /// (the same path the "+" button triggers) — the blank-pane-on-split
     /// regression test exercises this.
     pub fn new_terminal(&mut self) {
+        self.new_terminal_in(None);
+    }
+
+    /// [`new_terminal`](Self::new_terminal), but starting the new pane's shell in
+    /// `cwd`. Returns whether a pane was created (see [`split_in`](Self::split_in)).
+    fn new_terminal_in(&mut self, cwd: Option<&str>) -> bool {
         let (w, h) = self.last_focused_size.unwrap_or((16.0, 9.0));
         let dir = if w >= h {
             egui_tiles::LinearDir::Horizontal // wide → side-by-side
         } else {
             egui_tiles::LinearDir::Vertical // tall → stacked
         };
-        self.split(dir);
+        self.split_in(dir, cwd)
     }
 
     /// Make shell profile `idx` active and open a new terminal running it (the
@@ -1081,9 +1504,16 @@ impl C0pl4ndApp {
         // The configured `TERM` advertised to a deferred-first-spawn pane, so the
         // initial pane's child PTY sees the same `TERM` as every later pane.
         term: &str,
+        // The ACTIVE shell profile, so a deferred first-spawn runs the same shell
+        // the immediate `spawn_term_in` path would (it used to always spawn the
+        // platform default, ignoring the profile entirely).
+        spawn_profile: SpawnProfile<'_>,
         font_size: f32,
         line_height_px: f32,
         cursor_cfg: c0pl4nd_core::config::CursorConfig,
+        // Deterministic cursor-blink phase override for visual-QA capture; `None`
+        // leaves the caret's phase free-running off the frame clock.
+        cursor_blink_phase: Option<CursorBlinkPhase>,
         effects: c0pl4nd_core::config::EffectsConfig,
         padding: f32,
         bg_alpha: u8,
@@ -1215,15 +1645,29 @@ impl C0pl4ndApp {
         // is a no-op, so cmd's banner/prompt cursor never snaps home to (0,0).
         if pending_spawn.remove(&pane_id) {
             let (cols, rows) = cell_metrics.cols_rows(px_w, px_h);
-            // A restored pane opens in its saved cwd; a fresh pane (no restore
-            // entry) opens in the default dir. `remove` consumes the entry so a
-            // later re-use of the id never inherits a stale cwd.
-            let pane_term = match restored_cwds.remove(&pane_id) {
-                Some(cwd) => {
-                    PaneTerm::spawn_in_with_term(theme.clone(), cols, rows, Some(term), Some(&cwd))
-                }
-                None => PaneTerm::spawn_with_term(theme.clone(), cols, rows, Some(term)),
-            };
+            // A restored pane opens in its saved cwd; otherwise the one-shot
+            // `--cwd` / `-d` startup directory (the "Open C0PL4ND here" shell
+            // verb) applies to the FIRST pane spawned; a fresh pane with neither
+            // opens in the default dir. Both `remove` and `take_startup_cwd`
+            // CONSUME their entry, so a later re-use of the id can never inherit
+            // a stale cwd and later tabs/splits never inherit the CLI flag.
+            //
+            // Routed through the SHARED `spawn_pane_term` funnel so this arm
+            // honours the active shell profile exactly like the immediate path.
+            // It used to call the default-shell spawns directly, so a deferred
+            // pane under a named profile came back running the WRONG shell.
+            let cwd = restored_cwds
+                .remove(&pane_id)
+                .or_else(crate::cli_cwd::take_startup_cwd);
+            let pane_term = spawn_pane_term(
+                theme.clone(),
+                spawn_profile.program,
+                spawn_profile.args,
+                cols,
+                rows,
+                Some(term),
+                cwd.as_deref(),
+            );
             terms.insert(pane_id, pane_term);
         }
 
@@ -1306,6 +1750,7 @@ impl C0pl4ndApp {
                         theme,
                         focused,
                         cursor_cfg,
+                        cursor_blink_phase,
                         effects,
                         pad,
                     );
@@ -1321,6 +1766,13 @@ impl C0pl4ndApp {
                         line_height_px,
                         pad,
                         &pane_colors,
+                        // The current match takes the theme's CURSOR colour — the
+                        // one palette entry that already means "where you are" —
+                        // so it is hue-distinct from the accent tint the other
+                        // matches share, in every theme.
+                        c0pl4nd_core::theme::parse_hex(&theme.cursor)
+                            .map(|(r, g, b)| egui::Color32::from_rgb(r, g, b))
+                            .unwrap_or(pane_colors.accent),
                         hl,
                     );
                 }
@@ -1436,7 +1888,18 @@ impl C0pl4ndApp {
                 alt: m.alt,
                 control: m.ctrl,
             };
-            let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+            // BOTH axes. egui folds a wheel notch into a SINGLE axis before the
+            // app sees it: with the horizontal-scroll modifier (Shift by default)
+            // held it rewrites the delta as `vec2(x + y, 0.0)`, leaving `.y` at
+            // ZERO. The mouse-REPORT branch below can keep reading `.y` alone
+            // (Shift forces LOCAL handling, so a reported wheel is never folded),
+            // but the local scrollback branch must consume whichever axis the
+            // notch landed on — see `wheel_scroll_lines`.
+            let scroll = ui.input(|i| i.smooth_scroll_delta);
+            let scroll_y = scroll.y;
+            // egui's own points-per-wheel-line, so a notch count can be recovered
+            // from the points it hands us.
+            let points_per_notch = ui.ctx().options(|o| o.input_options.line_scroll_speed);
             let mode = terms
                 .get(&pane_id)
                 .map(PaneTerm::mouse_mode)
@@ -1525,15 +1988,30 @@ impl C0pl4ndApp {
                 // release; a plain click clears any selection; the wheel scrolls
                 // this pane's scrollback. This is the mouse text-selection the egui
                 // shell lacked entirely (the legacy shell had it).
-                let pos = resp
-                    .interact_pointer_pos()
-                    .or(resp.hover_pos())
-                    .or_else(|| ui.input(|i| i.pointer.latest_pos()));
+                // NOTE (selection lifetime): this path deliberately does NOT fall
+                // back to the global `pointer.latest_pos()` the mouse-REPORTING
+                // branch above uses. That fallback made a primary press ANYWHERE —
+                // including inside the floating right-click context menu, which
+                // always drops down-RIGHT over the pane and so maps to a real grid
+                // cell — reset `selection` to an empty `anchor == head`. Since the
+                // menu's "Copy" item is gated on `anchor != head` and `clicked()`
+                // fires on RELEASE, the press that reached for Copy disabled Copy.
+                // `interact_pointer_pos()` still tracks a drag that leaves the pane,
+                // so nothing is lost.
+                let pos = resp.interact_pointer_pos().or(resp.hover_pos());
                 // Hit cell as an ABSOLUTE (line, col): display row + window_start.
                 let cell0 = pos
                     .and_then(|p| cell_at_pos(p, origin, cw, ch))
                     .map(|(r, c)| (window_start + r, c));
-                if ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary)) {
+                // ...and the press itself is gated on the pointer being over THIS
+                // pane's body with nothing floating above it. `contains_pointer`
+                // resolves through the layer stack, so an open context menu / popup
+                // / modal over the pane makes it false — a click on a menu item can
+                // no longer clobber the selection that item is about to copy.
+                let press_over_body = resp.contains_pointer();
+                if press_over_body
+                    && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
+                {
                     if let Some((line, c)) = cell0 {
                         // Alt-drag selects a rectangular BLOCK; a plain drag is
                         // line-wise. The mode is fixed at press and carried for the
@@ -1585,9 +2063,58 @@ impl C0pl4ndApp {
                     }
                 }
                 if resp.dragged() {
-                    if let (Some(sel), Some((line, c))) = (selection.as_mut(), cell0) {
+                    if let Some(sel) = selection.as_mut() {
                         if sel.pane == pane_id {
-                            sel.head = (line, c);
+                            // AUTOSCROLL: dragging past the top/bottom edge scrolls
+                            // this pane's view AND keeps extending the selection over
+                            // the lines that scroll into view — without it a selection
+                            // could never exceed one screenful (the pointer simply left
+                            // the grid, `cell_at_pos` returned `None` above the top, and
+                            // the head froze). Both edges, both directions, and the rate
+                            // scales with how far past the edge the pointer is;
+                            // `scroll_view` clamps at the scrollback ends so neither
+                            // direction can run past the history.
+                            let mut extended = false;
+                            if let (Some(p), Some((cols, prows))) = (pos, pane_size) {
+                                let rows = prows as usize;
+                                let grid_bottom = origin.y + rows as f32 * ch;
+                                let lines = autoscroll_lines(p.y, origin.y, grid_bottom, ch);
+                                if lines != 0 {
+                                    if let Some(term) = terms.get_mut(&pane_id) {
+                                        term.scroll_view(lines);
+                                    }
+                                    // The pointer can sit STILL outside the grid while the
+                                    // view keeps scrolling, and a held-still pointer emits
+                                    // no input event — so ask for the next frame explicitly
+                                    // or the autoscroll would stall after one step.
+                                    ui.ctx().request_repaint();
+                                }
+                                // Re-read the window top AFTER the scroll (`scroll_view`
+                                // clamps, so the move may be shorter than asked) and map
+                                // the pointer — clamped to the grid's edges — into an
+                                // ABSOLUTE line. Clamping is what lets the head follow a
+                                // pointer that is outside the pane instead of freezing,
+                                // and it keeps an off-grid pointer from naming a row that
+                                // does not exist.
+                                let ws = terms
+                                    .get(&pane_id)
+                                    .and_then(PaneTerm::window_start)
+                                    .unwrap_or(window_start);
+                                if let Some((r, c)) =
+                                    clamp_pos_to_grid_cell(p, origin, cw, ch, cols as usize, rows)
+                                {
+                                    sel.head = (ws + r, c);
+                                    extended = true;
+                                }
+                            }
+                            // Degenerate pane (no size / no pointer): fall back to the
+                            // plain unclamped hit test, so a pane whose size is not yet
+                            // known still drags exactly as it did before.
+                            if !extended {
+                                if let Some((line, c)) = cell0 {
+                                    sel.head = (line, c);
+                                }
+                            }
                             mouse_captured = true;
                         }
                     }
@@ -1615,15 +2142,33 @@ impl C0pl4ndApp {
                         }
                     }
                 }
-                // Local scrollback: wheel up (positive y) goes BACK into history.
+                // Local scrollback: wheel up (positive) goes BACK into history.
                 // A Ctrl/Cmd-held wheel is reserved for font zoom (frame_tick):
                 // egui reroutes it into `zoom_delta` and zeroes `smooth_scroll_delta`
-                // (so `scroll_y` is already 0 here during a zoom), and this `command`
-                // guard is a belt-and-suspenders skip regardless.
-                if scroll_y.abs() > f32::EPSILON && resp.hovered() && !m.command {
-                    if let Some(term) = terms.get_mut(&pane_id) {
-                        let lines = (scroll_y / ch.max(1.0)).round() as i32;
-                        if lines != 0 {
+                // (so `scroll` is already zero here during a zoom), and this
+                // `command` guard is a belt-and-suspenders skip regardless.
+                //
+                // SHIFT is handled here too, and it MUST be: egui moves a
+                // Shift-held notch onto the x-axis and zeroes y, so the old
+                // `scroll_y`-only read made Shift+wheel a complete no-op — which
+                // silently broke the documented "hold Shift to force LOCAL
+                // scrolling" escape (the ONLY route into the scrollback while
+                // vim/tmux/htop has grabbed the mouse). The magnitude comes from
+                // the OS wheel setting rather than a font-size-derived constant.
+                if scroll != egui::Vec2::ZERO && resp.hovered() && !m.command {
+                    let rows = terms
+                        .get(&pane_id)
+                        .map(|t| t.size().1 as usize)
+                        .unwrap_or(0);
+                    let lines = wheel_scroll_lines(
+                        scroll,
+                        m.shift,
+                        points_per_notch,
+                        os_wheel_scroll_lines(),
+                        rows,
+                    );
+                    if lines != 0 {
+                        if let Some(term) = terms.get_mut(&pane_id) {
                             term.scroll_view(lines);
                         }
                     }
@@ -1701,7 +2246,22 @@ impl C0pl4ndApp {
                     .and_then(PaneTerm::window_start)
                     .unwrap_or(0);
                 if let Some((start, end)) = selection_visible_rows(sel.anchor, sel.head, ws, rows) {
-                    let wash = egui::Color32::from_rgba_unmultiplied(0x60, 0x80, 0xc0, 0x60);
+                    // The selection wash comes from the ACTIVE THEME
+                    // (`selection_background`), not a hard-coded steel blue: a
+                    // fixed `#6080c0` ignored every theme the user picked and
+                    // clashed with any palette that was not blue-ish. The theme's
+                    // own colour is opaque, so it is applied at the wash alpha
+                    // that keeps the glyphs beneath legible; the builtin fallback
+                    // preserves the previous look for a theme with no selection
+                    // colour set.
+                    let sel_bg = c0pl4nd_core::theme::parse_hex(&theme.selection_background)
+                        .unwrap_or((0x60, 0x80, 0xc0));
+                    let wash = egui::Color32::from_rgba_unmultiplied(
+                        sel_bg.0,
+                        sel_bg.1,
+                        sel_bg.2,
+                        SELECTION_WASH_ALPHA,
+                    );
                     let block = sel.mode == SelectionMode::Block;
                     // Block mode: every row shares the same column range; the wash
                     // must paint the SAME rectangle each row so it matches the
@@ -1737,6 +2297,41 @@ impl C0pl4ndApp {
                         let sel_rect =
                             egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y0 + ch));
                         painter.rect_filled(sel_rect, 0.0, wash);
+                        // Honour `selection_foreground` too: re-draw the selected
+                        // glyphs in the theme's selection text colour ON TOP of
+                        // the wash. Without this the wash alone tints whatever
+                        // colour the text already had, so a dark-on-dark or
+                        // low-contrast pairing stayed unreadable while selected —
+                        // the theme declares a selection foreground precisely to
+                        // guarantee contrast, and it was being ignored.
+                        // `parse_hex` returns Result, not Option — a malformed
+                        // selection_foreground simply leaves the wash to tint the
+                        // existing glyphs rather than failing the frame.
+                        if let Ok(sel_fg) =
+                            c0pl4nd_core::theme::parse_hex(&theme.selection_foreground)
+                        {
+                            let fg32 = egui::Color32::from_rgb(sel_fg.0, sel_fg.1, sel_fg.2);
+                            let font = egui::FontId::monospace(font_size);
+                            if let Some(rows) = terms.get(&pane_id).and_then(PaneTerm::grid_rows) {
+                                if let Some(runs) = rows.get(r) {
+                                    for (c, _, col_cells) in pane_term::row_glyph_cells(runs) {
+                                        if col_cells < lo || col_cells > hi {
+                                            continue;
+                                        }
+                                        painter.text(
+                                            egui::pos2(
+                                                origin.x + col_cells as f32 * cw,
+                                                origin.y + r as f32 * ch,
+                                            ),
+                                            egui::Align2::LEFT_TOP,
+                                            c,
+                                            font.clone(),
+                                            fg32,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1798,11 +2393,144 @@ impl C0pl4ndApp {
             }
         }
 
+        // --- right-side scrollbar (overlay; auto-hides when everything fits) ---
+        // The terminal grid is custom-painted (no `egui::ScrollArea`), so the bar
+        // owns its rect + hit-testing. It reflects the scrollback position and
+        // viewport size, is draggable to scrub, click-in-trough pages, and marks
+        // the focused pane's search hits. Painted LAST so it sits over the grid.
+        let mut scrollbar_grabbed = false;
+        {
+            let (scrollback_len, view_offset, rows) = terms
+                .get(&pane_id)
+                .map(|t| (t.scrollback_len(), t.view_offset(), t.size().1 as usize))
+                .unwrap_or((0, 0, 0));
+            let metrics = scrollbar::ScrollMetrics {
+                scrollback_len,
+                view_offset,
+                rows,
+            };
+            if metrics.scrollable() {
+                let track = scrollbar::track_rect(rect);
+                let sb_resp = ui.interact(
+                    track,
+                    egui::Id::new(("c0pl4nd_scrollbar", pane_id.raw())),
+                    egui::Sense::click_and_drag(),
+                );
+                // Grabbing the bar must NOT also start an egui_tiles pane-rearrange.
+                scrollbar_grabbed = sb_resp.dragged() || sb_resp.drag_started();
+                let thumb = scrollbar::thumb_rect(&metrics, track);
+                // A drag scrubs (thumb centres on the pointer); a trough click
+                // above/below the thumb pages by a viewport.
+                let mut target: Option<usize> = None;
+                if sb_resp.dragged() {
+                    if let Some(p) = sb_resp.interact_pointer_pos() {
+                        target = Some(scrollbar::view_offset_for_pointer_y(&metrics, track, p.y));
+                    }
+                } else if sb_resp.clicked() {
+                    if let Some(p) = sb_resp.interact_pointer_pos() {
+                        if p.y < thumb.top() {
+                            target = Some((view_offset + rows).min(scrollback_len));
+                        } else if p.y > thumb.bottom() {
+                            target = Some(view_offset.saturating_sub(rows));
+                        }
+                    }
+                }
+                if let Some(off) = target {
+                    if let Some(t) = terms.get_mut(&pane_id) {
+                        // `scroll_view(+n)` goes BACK into history (more offset).
+                        let delta = off as i32 - view_offset as i32;
+                        if delta != 0 {
+                            t.scroll_view(delta);
+                        }
+                    }
+                    // The mutated view repaints next frame — request it so a click
+                    // (which does not hold the pointer) still redraws immediately.
+                    ui.ctx().request_repaint();
+                }
+                // Marks: three SEMANTIC kinds, each already tracked by core and
+                // each drawn in its own colour + its own slice of the track (see
+                // `scrollbar::mark_rect`) so they stay distinguishable:
+                //
+                // - PROMPTS — the OSC 133 `;A`/`;B` marks core already captures and
+                //   the Ctrl+Shift+Up/Down jump-to-prompt chord already walks. They
+                //   turn the bar into a map of "where did each command start",
+                //   which is the whole point of shell prompt-integration.
+                // - FAILURES — the OSC 133 `;D` command-end marks whose reported
+                //   exit code was non-zero (the same marks the status bar's
+                //   exit-code indicator reads), so a failure deep in history is
+                //   findable without scrolling for it.
+                // - SEARCH HITS — as before: the focused pane's find matches,
+                //   mapped from their visible display row to an absolute content
+                //   line via `window_start`.
+                //
+                // Prompt/failure marks are ALREADY absolute content lines (core
+                // anchors them to `history.len() + row`, the same space
+                // `window_start` lives in), so they need no display-row mapping.
+                let mut marks: Vec<scrollbar::ScrollMark> = Vec::new();
+                let last = metrics.total().saturating_sub(1);
+                if let Some(t) = terms.get(&pane_id) {
+                    // Newest-first + capped: a hostile program may hold thousands of
+                    // marks (core caps prompts at 4096, commands at 8192) and painting
+                    // them all would be both slow and visual mush on a ~700pt track.
+                    // The most RECENT marks are the ones a user is looking for.
+                    let mut push_capped = |lines: Vec<usize>, kind: scrollbar::ScrollMarkKind| {
+                        for abs in lines.into_iter().rev().take(MAX_SEMANTIC_SCROLL_MARKS) {
+                            marks.push(scrollbar::ScrollMark {
+                                abs_line: abs.min(last),
+                                kind,
+                                selected: false,
+                            });
+                        }
+                    };
+                    push_capped(t.prompt_mark_lines(), scrollbar::ScrollMarkKind::Prompt);
+                    push_capped(t.failed_command_lines(), scrollbar::ScrollMarkKind::Error);
+                }
+                if let Some(hl) = search {
+                    let ws = metrics.window_start();
+                    for (i, span) in hl.spans.iter().enumerate() {
+                        marks.push(scrollbar::ScrollMark {
+                            abs_line: (ws + span.line).min(last),
+                            kind: scrollbar::ScrollMarkKind::SearchHit,
+                            selected: i == hl.selected,
+                        });
+                    }
+                }
+                let theme_color = |hex: &str, fallback: egui::Color32| {
+                    c0pl4nd_core::theme::parse_hex(hex)
+                        .map(|(r, g, b)| egui::Color32::from_rgb(r, g, b))
+                        .unwrap_or(fallback)
+                };
+                let mark_colors = scrollbar::MarkColors {
+                    search: pane_colors.fg,
+                    // The selected hit takes the cursor colour — hue-distinct from
+                    // the accent thumb, as before.
+                    selected: theme_color(&theme.cursor, pane_colors.accent),
+                    // Prompts take the theme's bright blue and failures its bright
+                    // red: hue-distinct from each other, from the fg search ticks,
+                    // and from the accent thumb. (Brand Akira-red `#ff0040` stays
+                    // reserved for alarms — a non-zero exit is routine.)
+                    prompt: theme_color(&theme.bright.blue, pane_colors.muted),
+                    error: theme_color(&theme.bright.red, pane_colors.fg),
+                };
+                let active = sb_resp.hovered() || sb_resp.dragged();
+                scrollbar::paint(
+                    &painter,
+                    track,
+                    &metrics,
+                    &pane_colors,
+                    &mark_colors,
+                    active,
+                    &marks,
+                );
+            }
+        }
+
         PaneBodyOutcome {
             // A body-drag normally tells egui_tiles to REARRANGE the pane. When a
             // program grabbed the mouse and we reported the drag to its PTY, the
             // gesture belongs to the program — never rearrange panes underneath it.
-            drag_started: resp.drag_started() && !mouse_captured,
+            // A scrollbar grab is likewise NOT a pane-rearrange.
+            drag_started: resp.drag_started() && !mouse_captured && !scrollbar_grabbed,
             clicked: resp.clicked(),
             size: rect.size(),
             opened_url,
@@ -1998,14 +2726,18 @@ impl C0pl4ndApp {
 
         // Paste handling — SECURITY: every paste goes through the core paste-
         // injection guard (`PaneTerm::write_paste` → `Terminal::frame_paste`),
-        // NEVER raw `write_bytes`. A multi-line paste can execute the instant its
-        // embedded newline lands, so when `paste_warn_multiline` is on we DEFER a
-        // multi-line paste to a confirm overlay (`pending_paste`) instead of
-        // pasting immediately. The config read / `pending_paste` set / `terms`
-        // borrow are sequential statements so they never alias `self`.
+        // NEVER raw `write_bytes`. Two hazards DEFER a paste to the confirm
+        // overlay (`pending_paste`) instead of pasting immediately: a MULTI-LINE
+        // paste (it executes the instant its embedded newline lands) and an
+        // oversized SINGLE-line paste (`paste_warn_bytes` — a hidden-tail
+        // command or an accidental whole-file flood, which the newline gate
+        // cannot see). Both are decided by ONE core policy function so the two
+        // halves can never drift apart. The config read / `pending_paste` set /
+        // `terms` borrow are sequential statements so they never alias `self`.
         for s in &pastes {
-            if self.config.paste_warn_multiline && (s.contains('\n') || s.contains('\r')) {
+            if let Some(reason) = c0pl4nd_core::paste_guard::paste_confirm_reason(&self.config, s) {
                 self.pending_paste = Some(s.clone());
+                self.pending_paste_reason = Some(reason);
             } else if let Some(term) = self.terms.get_mut(&self.focused_pane) {
                 term.write_paste(s);
             }
@@ -2159,6 +2891,20 @@ impl C0pl4ndApp {
             // The configured TERM, read alongside the other LIVE config reads so a
             // deferred-first-spawn pane advertises the same `TERM` as later panes.
             let term = self.config.term.as_str();
+            // The ACTIVE shell profile, borrowed disjointly (separate fields from
+            // `terms` / `grid_tree`) so a DEFERRED first-spawn runs the SAME shell
+            // the immediate `spawn_term_in` path would. It used to always spawn the
+            // platform default, so a restored layout captured under a named profile
+            // came back running the wrong shell.
+            let active_profile = self.shell_profiles.get(self.active_shell);
+            let spawn_profile = SpawnProfile {
+                program: active_profile.and_then(|p| p.program.as_deref()),
+                args: active_profile.map_or(&[][..], |p| p.args.as_slice()),
+            };
+            // Deterministic cursor-blink phase for visual-QA capture. `None` in the
+            // shipping app (and by default in every test), which leaves the phase
+            // free-running off the frame clock exactly as before.
+            let cursor_blink_phase = self.cursor_blink_phase;
             let font_size = self.config.font.size;
             // Read the line-height LIVE from the config so a Settings change
             // reflows the row pitch (and the PTY rows/cursor/highlight) without a
@@ -2219,9 +2965,11 @@ impl C0pl4ndApp {
                     image_textures,
                     theme,
                     term,
+                    spawn_profile,
                     font_size,
                     line_height_px,
                     cursor_cfg,
+                    cursor_blink_phase,
                     effects,
                     padding,
                     bg_alpha,
@@ -2465,6 +3213,14 @@ impl C0pl4ndApp {
             self.grid_tree.root.unwrap_or(tile),
             &egui_tiles::SimplificationOptions::default(),
         );
+        // Record where this pane was BEFORE its terminal is dropped — after this
+        // line the `PaneTerm` (and with it the OSC 7 cwd) is gone for good. This
+        // sits in `close_pane` rather than in the `close_tab` action precisely
+        // because the action is only ONE of four close paths: the tab-bar ×, the
+        // egui_tiles close button, and the right-click Close Pane item all reach
+        // the pane's end here and nowhere else, so capturing at the action would
+        // silently forget every pane closed by mouse.
+        self.push_closed_tab_cwd(self.terms.get(&pid).and_then(PaneTerm::cwd));
         self.terms.remove(&pid);
         self.pinned.remove(&pid);
         // A selection holds grid coordinates of a now-removed pane; drop it so it
@@ -2517,6 +3273,20 @@ impl C0pl4ndApp {
     /// observation still applies. Toggling the switch OFF forgets the tracked
     /// appearance so re-enabling re-applies on the next observed frame.
     fn follow_os_theme_tick(&mut self, ctx: &egui::Context) {
+        // Accessibility beats aesthetics: while the OS is in forced-colors /
+        // high-contrast mode, the dark/light follow must not swap the theme back
+        // to `itasha-corp`/`ghost-paper` and undo the high-contrast selection
+        // made at startup. Same precedence as SCR1B3's reduced-motion seam, where
+        // the accessibility preference wins over the user's own toggle.
+        //
+        // `last_os_theme` is deliberately left untouched here rather than
+        // cleared: if this returned via the `follow_os_theme == false` branch it
+        // would forget the tracked appearance, and turning high contrast off
+        // mid-session would then re-apply on the next observation. Returning
+        // early keeps the tracked value intact.
+        if self.forced_colors {
+            return;
+        }
         if !self.config.follow_os_theme {
             // Forget the tracked OS appearance so a later re-enable re-applies the
             // OS theme on its next observation instead of being suppressed by a
@@ -2587,43 +3357,12 @@ impl C0pl4ndApp {
         }
 
         if outcome.changed {
-            // Reload the terminal grid's color theme so a theme change shows in
-            // the live PTY panes immediately (the chrome Visuals are re-applied
-            // below; the grid glyph colours come from this `Theme`, not Visuals).
-            if outcome.theme_changed {
-                let (theme, theme_notice) = load_terminal_theme(&self.config);
-                self.theme = theme;
-                if let Some(notice) = theme_notice {
-                    // A user-authored theme file existed but failed to parse —
-                    // surface it instead of silently showing fallback colours.
-                    self.toast = Some(notice);
-                }
-                // Propagate to the LIVE panes: each PaneTerm holds its own theme
-                // clone (glyph + background colours resolve from it), so without
-                // this the picker would change `self.theme` but no visible pane.
-                for term in self.terms.values_mut() {
-                    term.set_theme(self.theme.clone());
-                }
-            }
-            // Re-apply the chrome Visuals DERIVED FROM the (possibly changed)
-            // terminal theme so the WHOLE app UI — titlebar, tabs, status bar,
-            // settings window, panel fills — follows the picked theme (a light
-            // theme flips the chrome light, a dark one dark) without waiting for
-            // a relaunch. `self.theme` was reloaded just above on a theme change.
-            let mut visuals = theme::visuals_from_theme(&self.theme);
-            window_effects::apply_window_opacity(&mut visuals, self.config.opacity);
-            ctx.set_visuals(visuals);
-            // Live-apply the always-on-top window level so flipping the toggle
-            // takes effect without a relaunch (mirrors the opacity live-apply
-            // just above). Setting the level to its current value is idempotent,
-            // so re-sending it on any settings change is harmless.
-            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                if self.config.always_on_top {
-                    egui::WindowLevel::AlwaysOnTop
-                } else {
-                    egui::WindowLevel::Normal
-                },
-            ));
+            // Live-apply the (possibly changed) config: reload + propagate the
+            // terminal theme, re-derive the chrome Visuals, re-assert the
+            // always-on-top level. Shared verbatim with the config HOT RELOAD
+            // path (`config_hot_reload_tick`) so an external `config.toml` edit
+            // and a Settings edit can never apply DIFFERENT subsets of a change.
+            self.apply_config_live(ctx, outcome.theme_changed);
             // Persist to the platform config file so the change survives a
             // relaunch — but ONLY in a real window. The headless `egui_kittest`
             // harness sets `live_window == false`; persisting there would write
@@ -2639,13 +3378,115 @@ impl C0pl4ndApp {
                     // settings change — mirrors the legacy shell (window.rs). A
                     // GUI user never sees stderr, so a visible toast (the same
                     // channel the config-LOAD error uses) is the real surface.
-                    if let Err(e) = self.config.save_to(&path) {
-                        self.toast = Some(crate::user_error::config_save_failed(
-                            e,
-                            "Your settings change",
-                        ));
-                    }
+                    self.save_config_guarded(&path, "Your settings change");
+                    // Re-stamp the watcher so OUR write is not read back as an
+                    // external edit on the next poll (which would re-apply the
+                    // theme + visuals on every slider nudge).
+                    self.config_watch.mark_self_written();
                 }
+            }
+        }
+    }
+
+    /// Apply the LIVE `self.config` to everything that can change without a
+    /// relaunch. The single apply path shared by the Settings window and the
+    /// config hot reload, so the two can never diverge:
+    ///
+    /// 1. **Terminal theme** (only when `theme_changed`) — reloaded from disk /
+    ///    the built-in set and propagated to every live pane, because each
+    ///    `PaneTerm` holds its own `Theme` clone and the grid's glyph colours
+    ///    resolve from it, not from egui Visuals.
+    /// 2. **Chrome Visuals** — re-derived from the (possibly new) terminal theme
+    ///    plus the window opacity, so titlebar/tabs/status bar follow the theme.
+    /// 3. **Always-on-top** — re-asserted as a viewport command. Idempotent, so
+    ///    re-sending it on any change is harmless.
+    fn apply_config_live(&mut self, ctx: &egui::Context, theme_changed: bool) {
+        if theme_changed {
+            let (theme, theme_notice) = load_terminal_theme(&self.config);
+            self.theme = theme;
+            if let Some(notice) = theme_notice {
+                // A user-authored theme file existed but failed to parse —
+                // surface it instead of silently showing fallback colours.
+                self.toast = Some(notice);
+            }
+            for term in self.terms.values_mut() {
+                term.set_theme(self.theme.clone());
+            }
+        }
+        let mut visuals = theme::visuals_from_theme(&self.theme);
+        window_effects::apply_window_opacity(&mut visuals, self.config.opacity);
+        ctx.set_visuals(visuals);
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            if self.config.always_on_top {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            },
+        ));
+    }
+
+    /// Point the config watcher at `path` and treat that file's CURRENT contents
+    /// as already-loaded, so only edits made from now on hot-reload.
+    ///
+    /// The shipping binary watches [`c0pl4nd_core::Config::default_path`] (set
+    /// in `bootstrap_with`); this repoints the watcher, which is how the
+    /// hot-reload wiring test drives a temp config file instead of the user's
+    /// real one.
+    pub fn watch_config_at(&mut self, path: std::path::PathBuf) {
+        self.config_watch = config_watch::ConfigWatcher::watching(path);
+    }
+
+    /// One per-frame tick of config HOT RELOAD: when `config.toml` changed on
+    /// disk since we last read it, re-parse it and apply it live — no relaunch.
+    ///
+    /// Called from [`Self::frame_tick`]. The watcher throttles the actual
+    /// filesystem `stat` to one per [`config_watch::POLL_INTERVAL`], so the
+    /// per-frame cost of this call in the common (unchanged) case is a clock
+    /// comparison.
+    ///
+    /// A file that fails to PARSE never clobbers the running config: the app
+    /// keeps the settings it has and surfaces the error as a toast, exactly like
+    /// a bad config at launch. Reverting a user's whole live setup because they
+    /// saved a half-typed TOML line would be strictly worse than ignoring it.
+    /// The bad file's stamp is already recorded, so the app waits quietly for
+    /// the next save rather than re-toasting every 400 ms.
+    fn config_hot_reload_tick(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.config_watch.poll(std::time::Instant::now()) else {
+            return;
+        };
+        let src = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            // Vanished/locked between the stat and the read — nothing to apply.
+            Err(_) => return,
+        };
+        match c0pl4nd_core::Config::from_toml(&src, &path) {
+            Ok(new_config) => {
+                // The file on disk is readable again, so the "my in-memory
+                // config is defaults because the startup load failed" premise
+                // no longer holds. Clear it BEFORE the equivalence check, or a
+                // user who hand-repairs their config mid-session would still
+                // get it renamed aside on the next save.
+                self.config_unreadable = false;
+                if new_config == self.config {
+                    // A touched-but-equivalent file (a comment edit, a
+                    // reformat, our own save on a path `mark_self_written`
+                    // missed). Nothing to apply, and re-theming would be a
+                    // visible flicker for no change.
+                    return;
+                }
+                let theme_changed = new_config.theme != self.config.theme;
+                self.config = new_config;
+                self.apply_config_live(ctx, theme_changed);
+                self.toast = Some("Reloaded config.toml".to_string());
+                ctx.request_repaint();
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "c0pl4nd::config",
+                    path = ?path,
+                    "config hot reload failed to parse; keeping the running config"
+                );
+                self.toast = Some(crate::user_error::config_reload_failed(e.to_string()));
             }
         }
     }
@@ -2658,28 +3499,38 @@ impl C0pl4ndApp {
     // exact production path (the same observation-accessor discipline the other
     // public accessors above follow).
 
-    /// Whether a multi-line paste is currently awaiting confirmation. (Test /
-    /// observation API for the paste-safety overlay.)
+    /// Whether a paste is currently awaiting confirmation. (Test / observation
+    /// API for the paste-safety overlay.)
     #[allow(dead_code)]
     pub fn has_pending_paste(&self) -> bool {
         self.pending_paste.is_some()
     }
 
-    /// Send the deferred multi-line paste to the focused pane through the core
+    /// Which gate deferred the pending paste (multi-line vs oversized), or
+    /// `None` when nothing is pending. Observation API so a test can assert the
+    /// SIZE gate fired rather than merely that *something* was deferred.
+    #[allow(dead_code)]
+    pub fn pending_paste_reason(&self) -> Option<c0pl4nd_core::paste_guard::PasteConfirmReason> {
+        self.pending_paste_reason
+    }
+
+    /// Send the deferred paste to the focused pane through the core
     /// paste-injection guard, then clear it. Returns the text that was sent (for
     /// tests; `None` if nothing was pending). The OS side effect aside, this is
     /// the same path a non-deferred paste takes.
     pub fn confirm_pending_paste(&mut self) -> Option<String> {
         let text = self.pending_paste.take()?;
+        self.pending_paste_reason = None;
         if let Some(term) = self.terms.get_mut(&self.focused_pane) {
             term.write_paste(&text);
         }
         Some(text)
     }
 
-    /// Discard the deferred multi-line paste without sending it.
+    /// Discard the deferred paste without sending it.
     pub fn cancel_pending_paste(&mut self) {
         self.pending_paste = None;
+        self.pending_paste_reason = None;
     }
 
     /// Whether a just-typed line should be recorded in command history. PRIVACY:
@@ -2827,10 +3678,50 @@ impl C0pl4ndApp {
         }
     }
 
-    /// The palette's filtered results for the current query — every history entry
-    /// (most-recent-first) when the query is empty, fuzzy-filtered otherwise.
-    fn palette_results(&self) -> Vec<String> {
-        self.cmd_history.search(&self.palette_query)
+    /// The palette's filtered rows for the current query.
+    ///
+    /// The palette lists BOTH previously-run shell commands and the shell's own
+    /// [`Action`]s, so it can actually DO things (new tab, split, settings, font
+    /// size, theme-independent view flip …) rather than only re-run history:
+    ///
+    /// - a query starting with `>` filters to ACTIONS ONLY (the VS Code
+    ///   convention), so the action list is one keystroke away no matter how
+    ///   long the history is;
+    /// - otherwise the history matches come first (the palette's original job,
+    ///   most-recent-first / fuzzy-filtered) followed by the matching actions,
+    ///   so a fresh session with no history opens straight onto the actions.
+    fn palette_results(&self) -> Vec<PaletteEntry> {
+        if let Some(rest) = self.palette_query.trim_start().strip_prefix('>') {
+            return Self::matching_actions(rest.trim_start())
+                .into_iter()
+                .map(PaletteEntry::Action)
+                .collect();
+        }
+        let mut rows: Vec<PaletteEntry> = self
+            .cmd_history
+            .search(&self.palette_query)
+            .into_iter()
+            .map(PaletteEntry::History)
+            .collect();
+        rows.extend(
+            Self::matching_actions(&self.palette_query)
+                .into_iter()
+                .map(PaletteEntry::Action),
+        );
+        rows
+    }
+
+    /// The actions whose labels fuzzy-match `query`, best-scoring first with
+    /// declaration order as the stable tiebreak. An empty query scores every
+    /// action 0, so the list keeps [`Action::ALL`] order.
+    fn matching_actions(query: &str) -> Vec<Action> {
+        let mut scored: Vec<(i32, usize, Action)> = Action::ALL
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| c0pl4nd_core::fuzzy::score(a.label(), query).map(|s| (s, i, *a)))
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.into_iter().map(|(_, _, a)| a).collect()
     }
 
     /// Move the palette selection by `delta` rows, clamped to the result range.
@@ -2851,14 +3742,32 @@ impl C0pl4ndApp {
     /// move it to the front of the history, and close the palette. Returns the
     /// command run (for tests). Closes the palette with no command when the
     /// result set is empty.
-    fn run_palette_selection(&mut self) -> Option<String> {
-        let cmd = self.palette_results().get(self.palette_sel).cloned();
-        if let Some(ref c) = cmd {
-            self.run_command_in_focused(c);
-        }
-        self.last_palette_run = cmd.clone();
+    fn run_palette_selection(&mut self, ctx: &egui::Context) -> Option<String> {
+        let entry = self.palette_results().get(self.palette_sel).cloned();
+        let ran = match &entry {
+            Some(PaletteEntry::History(cmd)) => {
+                self.run_command_in_focused(cmd);
+                self.last_palette_run = Some(cmd.clone());
+                Some(cmd.clone())
+            }
+            Some(PaletteEntry::Action(action)) => {
+                // The SAME dispatch path the keybinding dispatcher uses — the
+                // palette is a second surface onto one action layer, never a
+                // second implementation of it.
+                self.dispatch_action(*action, ctx);
+                self.last_palette_run = None;
+                self.last_palette_action = Some(*action);
+                Some(action.label().to_string())
+            }
+            None => {
+                self.last_palette_run = None;
+                None
+            }
+        };
+        // Closing AFTER the dispatch means the "Command palette" action itself
+        // (which toggles the flag) still ends with the palette closed.
         self.palette_open = false;
-        cmd
+        ran
     }
 
     /// Write `cmd` followed by a carriage return (what the shell sees for Enter)
@@ -3121,6 +4030,24 @@ impl C0pl4ndApp {
         self.last_palette_run.clone()
     }
 
+    /// The action most recently dispatched from the palette, if any. Observation
+    /// accessor for the palette-dispatch interaction tests.
+    #[allow(dead_code)]
+    pub fn last_palette_action(&self) -> Option<Action> {
+        self.last_palette_action
+    }
+
+    /// The command-palette rows for the current query, as display strings.
+    /// Observation accessor for the interaction tests (asserts the `>` filter and
+    /// the history/action ordering through the real result builder).
+    #[allow(dead_code)]
+    pub fn palette_row_labels(&self) -> Vec<String> {
+        self.palette_results()
+            .iter()
+            .map(|e| e.display(&self.config.keybindings))
+            .collect()
+    }
+
     /// The most recent URL a Ctrl-click opened, or `None`. Observable accessor
     /// for the hyperlink interaction test.
     #[allow(dead_code)]
@@ -3209,6 +4136,12 @@ impl C0pl4ndApp {
         }
         let sel = self.palette_sel;
         let history_empty = self.cmd_history.is_empty();
+        // Render text is resolved BEFORE the window closure so the closure's
+        // `&mut palette_query` does not collide with the `keybindings` read.
+        let rows: Vec<String> = results
+            .iter()
+            .map(|e| e.display(&self.config.keybindings))
+            .collect();
         let query = &mut self.palette_query;
         let mut clicked: Option<usize> = None;
 
@@ -3220,16 +4153,16 @@ impl C0pl4ndApp {
             .show(ctx, |ui| {
                 let resp = ui.add(
                     egui::TextEdit::singleline(query)
-                        .hint_text("Search previously-run commands…")
+                        .hint_text("Search commands and actions — type > for actions only…")
                         .desired_width(f32::INFINITY),
                 );
                 // Keep the search box focused for the palette's whole lifetime so
                 // typed characters always populate the query, never the PTY.
                 resp.request_focus();
                 ui.separator();
-                if results.is_empty() {
+                if rows.is_empty() {
                     ui.weak(if history_empty {
-                        "No commands run yet — run something, then reopen with Ctrl+Shift+P."
+                        "No matches — type > to list every action."
                     } else {
                         "No matches."
                     });
@@ -3238,22 +4171,22 @@ impl C0pl4ndApp {
                         .max_height(280.0)
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            for (i, cmd) in results.iter().enumerate() {
-                                if ui.selectable_label(i == sel, cmd).clicked() {
+                            for (i, row) in rows.iter().enumerate() {
+                                if ui.selectable_label(i == sel, row).clicked() {
                                     clicked = Some(i);
                                 }
                             }
                         });
                 }
                 ui.separator();
-                ui.weak("Up/Down select · Enter run · Esc close");
+                ui.weak("Up/Down select · Enter run · Esc close · > actions only");
             });
         // Exclude the palette from the whole-window motion overlays this frame.
         self.note_overlay_rect(win.map(|w| w.response.rect));
 
         if let Some(i) = clicked {
             self.palette_sel = i;
-            self.run_palette_selection();
+            self.run_palette_selection(ctx);
         }
     }
 }
@@ -3283,9 +4216,16 @@ impl eframe::App for C0pl4ndApp {
     /// keeps that typed-text undo history entirely in memory.
     ///
     /// Window geometry (position + size) is NOT lost by this: it is persisted
-    /// independently via [`c0pl4nd_core::Config::persist_geometry`] into the
-    /// config TOML AND by eframe's own `persist_window` native-window state, both
-    /// of which are unaffected by `persist_egui_memory`.
+    /// independently by eframe's own `persist_window` native-window state
+    /// (enabled at `egui_main.rs:263`), which is unaffected by
+    /// `persist_egui_memory`.
+    ///
+    /// Note: [`c0pl4nd_core::Config::persist_geometry`] writes the `[window]`
+    /// geometry keys into the config TOML, but its only caller is
+    /// `crates/app/src/window.rs` — the LEGACY winit shell, behind the
+    /// default-off `legacy-winit` feature, which is not compiled into this
+    /// binary. This shell never calls it, so those keys play no part in
+    /// geometry here.
     fn persist_egui_memory(&self) -> bool {
         false
     }
@@ -3409,14 +4349,280 @@ impl C0pl4ndApp {
     /// failure surfaces as a toast (the same channel the settings save uses) and
     /// never blocks the live in-memory apply. `what` names the change for the
     /// toast (e.g. "The font size").
+    ///
+    /// The SINGLE write seam for `config.toml`. Every shipping writer goes
+    /// through here so the "the startup load failed, so my in-memory config is
+    /// defaults" hazard is handled in exactly one place.
+    ///
+    /// When [`Self::config_unreadable`] is set, `self.config` carries none of
+    /// the user's values, so writing it would replace their file with defaults.
+    /// A document merge cannot help — the values are not in this process. The
+    /// only non-destructive move is to rename the original aside FIRST, then
+    /// write, and tell the user where their file went. One quarantine per
+    /// session: subsequent saves write normally, because after the first write
+    /// the file on disk is genuinely ours.
+    ///
+    /// If the original cannot even be set aside, the write is ABANDONED — an
+    /// unwritable-but-present config is left exactly as it is rather than
+    /// overwritten. The one exception is a file that has since vanished: there
+    /// is nothing to preserve, so the save proceeds.
+    ///
+    /// `what` names the change for the failure toast, matching
+    /// [`crate::user_error::config_save_failed`].
+    pub(crate) fn save_config_guarded(&mut self, path: &std::path::Path, what: &str) {
+        if self.config_unreadable {
+            // One quarantine per session, cleared BEFORE the attempt so a
+            // failure cannot wedge every later save in this session.
+            self.config_unreadable = false;
+            match c0pl4nd_core::config::quarantine_config_file(path) {
+                Ok(bak) => {
+                    // Logged as well as toasted: `prepare_shutdown` is a real
+                    // caller, and a toast raised while the window is closing is
+                    // never painted — the log is the only channel that survives
+                    // there.
+                    tracing::warn!(
+                        target: "c0pl4nd::config",
+                        backup = ?bak,
+                        "unreadable config set aside before writing new settings"
+                    );
+                    self.toast = Some(format!(
+                        "Your settings file couldn't be read, so it was saved as {} \
+                         before C0PL4ND wrote new settings.",
+                        bak.display()
+                    ));
+                }
+                Err(e) => {
+                    if path.exists() {
+                        // Present but un-renameable (permissions, a lock). Do
+                        // NOT overwrite it — leaving the user's bytes intact
+                        // beats persisting this one change.
+                        tracing::warn!(
+                            target: "c0pl4nd::config",
+                            path = ?path,
+                            "could not set the unreadable config aside; refusing to overwrite it"
+                        );
+                        self.toast = Some(crate::user_error::config_save_failed(e, what));
+                        return;
+                    }
+                    // Vanished since startup — nothing to preserve, so the
+                    // save below is not destructive.
+                }
+            }
+        }
+        if let Err(e) = self.config.save_to(path) {
+            tracing::warn!(target: "c0pl4nd::config", path = ?path, "could not save config: {e}");
+            self.toast = Some(crate::user_error::config_save_failed(e, what));
+        }
+    }
+
     fn persist_config_change(&mut self, what: &str) {
         if !self.live_window {
             return;
         }
         if let Some(path) = c0pl4nd_core::Config::default_path() {
-            if let Err(e) = self.config.save_to(&path) {
-                self.toast = Some(crate::user_error::config_save_failed(e, what));
+            self.save_config_guarded(&path, what);
+            // Our own write — re-stamp so the hot-reload watcher does not read
+            // it back as an external edit on its next poll.
+            self.config_watch.mark_self_written();
+        }
+    }
+
+    // ---- the close path: guard → action → exit / hide / confirm ----
+    //
+    // Every close surface funnels through `handle_close_request`, which applies
+    // the two `WindowConfig` decisions in order and is the ONLY place that
+    // decides whether the app actually goes away.
+
+    /// Report whether a system-tray icon actually exists.
+    ///
+    /// Called by the shipping binary right after its best-effort `tray::init`
+    /// (the tray is binary-local — it needs the real HWND and the winit message
+    /// loop — so the lib cannot ask it directly). Until something calls this the
+    /// answer is `false`, and close-to-tray degrades to a real exit rather than
+    /// hiding the window behind an icon that does not exist.
+    pub fn set_tray_available(&mut self, available: bool) {
+        self.tray_available = available;
+    }
+
+    /// Whether a system-tray icon exists (see [`Self::set_tray_available`]).
+    pub fn tray_available(&self) -> bool {
+        self.tray_available
+    }
+
+    /// Pin the terminal caret's blink phase for deterministic visual-QA capture,
+    /// or `None` to restore the free-running phase.
+    ///
+    /// Snapshot scenes render a handful of frames and then read the pixels; the
+    /// caret's phase is a function of the frame clock, so the same scene showed a
+    /// painted caret on one run and none on the next. Pin it with
+    /// `Some(CursorBlinkPhase::On)` before capturing and the caret is in the
+    /// frame every time.
+    pub fn set_cursor_blink_phase(&mut self, phase: Option<CursorBlinkPhase>) {
+        self.cursor_blink_phase = phase;
+    }
+
+    /// The pinned cursor-blink phase, if any (see [`Self::set_cursor_blink_phase`]).
+    pub fn cursor_blink_phase(&self) -> Option<CursorBlinkPhase> {
+        self.cursor_blink_phase
+    }
+
+    /// How many panes have a shell command STILL RUNNING — the count
+    /// `WindowConfig::close_guard` decides on.
+    ///
+    /// Reads each pane's OSC 133 marks via [`PaneTerm::has_running_command`]. A
+    /// shell with no prompt integration emits no marks and reports `false`, so
+    /// the guard MISSES rather than nags — the documented and deliberate
+    /// direction (a spurious "something is running" prompt on every close would
+    /// be worse than an occasional silent kill).
+    pub fn busy_pane_count(&self) -> usize {
+        self.terms
+            .values()
+            .filter(|t| t.has_running_command())
+            .count()
+    }
+
+    /// Apply BOTH window-close decisions, in order, and record the result.
+    ///
+    /// 1. `close_guard(busy_panes, already_confirmed)` — is a shell command still
+    ///    running? If so the close is HELD for confirmation. `close_confirmed`
+    ///    (the user's "Close anyway") short-circuits it, so the second pass
+    ///    cannot re-prompt: the commands are still running when they say yes, and
+    ///    without the short-circuit the prompt would loop forever.
+    /// 2. `close_action(tray_available, explicit_quit)` — exit, or hide to the
+    ///    tray? Two of its inputs are load-bearing rather than cosmetic: with NO
+    ///    tray it always exits (a hide would strand the window with no icon to
+    ///    restore it), and an explicit quit always exits (the tray menu's own
+    ///    Quit posts `WM_CLOSE` into this very path, so without it close-to-tray
+    ///    would swallow the one affordance that closes the app).
+    pub(crate) fn close_decision(&mut self, explicit_quit: bool) -> CloseOutcome {
+        let busy = self.busy_pane_count();
+        let outcome = match self.config.window.close_guard(busy, self.close_confirmed) {
+            c0pl4nd_core::config::CloseGuard::Confirm { busy_panes } => {
+                CloseOutcome::Confirm { busy_panes }
             }
+            c0pl4nd_core::config::CloseGuard::Proceed => {
+                match self
+                    .config
+                    .window
+                    .close_action(self.tray_available, explicit_quit)
+                {
+                    c0pl4nd_core::config::CloseAction::HideToTray => CloseOutcome::HideToTray,
+                    c0pl4nd_core::config::CloseAction::Exit => CloseOutcome::Exit,
+                }
+            }
+        };
+        self.last_close_outcome = Some(outcome);
+        outcome
+    }
+
+    /// Run [`Self::close_decision`] and carry out whatever it decided.
+    ///
+    /// `os_close` marks a request the OS already accepted (the `close_requested`
+    /// viewport flag): those must be CANCELLED when the close does not proceed,
+    /// or winit tears the window down anyway and the guard/tray decision is
+    /// cosmetic. An in-app request (`WindowCmd::Close`, the Alt+F4 the caption
+    /// subclass swallowed) has nothing to cancel.
+    fn handle_close_request(&mut self, ctx: &egui::Context, explicit_quit: bool, os_close: bool) {
+        match self.close_decision(explicit_quit) {
+            CloseOutcome::Confirm { busy_panes } => {
+                self.close_confirm = Some(busy_panes);
+                if os_close {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
+            }
+            CloseOutcome::HideToTray => {
+                self.close_confirm = None;
+                // The close did not happen, so a later one must be able to warn
+                // again about whatever is still running.
+                self.close_confirmed = false;
+                if os_close {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+            CloseOutcome::Exit => {
+                self.close_confirm = None;
+                // Fast clean shutdown: persist config + reap every PTY child so
+                // none orphan, then exit immediately. This skips eframe/wgpu's
+                // slow graceful GPU-device + swapchain + winit-window-destroy
+                // teardown — the real source of the slow-to-close latency.
+                self.prepare_shutdown();
+                self.exit_requests += 1;
+                // Gated on `live_window` so the headless egui_kittest harness —
+                // which has no real viewport — records the exit instead of
+                // killing the test process mid-run.
+                if self.live_window {
+                    std::process::exit(0);
+                }
+            }
+        }
+    }
+
+    /// The most recent close decision, or `None` if no close has been requested.
+    pub fn last_close_outcome(&self) -> Option<CloseOutcome> {
+        self.last_close_outcome
+    }
+
+    /// How many close requests reached the real exit branch.
+    pub fn exit_requests(&self) -> u32 {
+        self.exit_requests
+    }
+
+    /// The busy-pane count the pending close confirmation is showing, or `None`
+    /// when no confirmation is up.
+    pub fn close_confirm_busy_panes(&self) -> Option<usize> {
+        self.close_confirm
+    }
+
+    /// The running-command close confirmation: a small centred modal naming how
+    /// many panes still have a command in flight, with "Close anyway" / "Keep
+    /// working". Closing kills every child outright, so an in-flight
+    /// `cargo build` / `rsync` / migration would otherwise die with no prompt.
+    /// Enter = close anyway, Esc = keep working (so the modal is keyboard-drivable,
+    /// mirroring the paste confirm).
+    fn close_confirm_window(&mut self, ctx: &egui::Context) {
+        let Some(busy_panes) = self.close_confirm else {
+            return;
+        };
+        let (confirm, cancel) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        let mut do_close = confirm;
+        let mut do_cancel = cancel;
+        let win = egui::Window::new("Close while a command is running?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let panes = if busy_panes == 1 { "pane" } else { "panes" };
+                ui.label(format!(
+                    "{busy_panes} {panes} still have a command running. Closing \
+                     ends them immediately."
+                ));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Close anyway (Enter)").clicked() {
+                        do_close = true;
+                    }
+                    if ui.button("Keep working (Esc)").clicked() {
+                        do_cancel = true;
+                    }
+                });
+            });
+        // Exclude the confirm modal from the whole-window motion overlays.
+        self.note_overlay_rect(win.map(|w| w.response.rect));
+        if do_close {
+            // Record the answer, then re-enter the SAME close path: the guard now
+            // short-circuits to Proceed and `close_action` gets its say.
+            self.close_confirmed = true;
+            self.close_confirm = None;
+            self.handle_close_request(ctx, false, false);
+        } else if do_cancel {
+            self.close_confirm = None;
+            self.close_confirmed = false;
         }
     }
 
@@ -3427,9 +4633,10 @@ impl C0pl4ndApp {
             if let Some(path) = c0pl4nd_core::Config::default_path() {
                 // Surface a persist failure instead of silently dropping the
                 // user's settings change — mirrors the legacy shell (window.rs).
-                if let Err(e) = self.config.save_to(&path) {
-                    tracing::warn!("could not save config: {e}");
-                }
+                // This is the one writer that fires with NO user action beyond
+                // launching and quitting, so it is also the one that most needs
+                // the unreadable-config quarantine the seam applies.
+                self.save_config_guarded(&path, "Your settings");
             }
         }
         // 2) Kill every pane's shell FIRST, in one pass, so all N children
@@ -3461,28 +4668,47 @@ impl C0pl4ndApp {
     /// top-level path (same compromise the reference app documents).
     #[allow(deprecated)]
     pub fn frame_tick(&mut self, ctx: &egui::Context) {
-        // Fast close for an OS-initiated window-close (Alt+F4, taskbar → Close,
-        // the system menu). The in-app caption-× already takes the fast path
-        // (`WindowCmd::Close` → `prepare_shutdown` + `process::exit(0)`); without
-        // this, an OS close falls through to eframe/wgpu's slow graceful
-        // GPU-device + swapchain + winit-window teardown — the real source of the
-        // slow-to-close latency (the PTY teardown is ~2ms). Mirror the fast path.
-        // Gated on `live_window` so the headless egui_kittest harness, which has
-        // no real viewport, never calls `process::exit` mid-test.
-        if self.live_window && ctx.input(|i| i.viewport().close_requested()) {
-            self.prepare_shutdown();
-            std::process::exit(0);
+        // Fast close for an OS-initiated window-close (taskbar → Close, the system
+        // menu, and the tray menu's Quit — which posts WM_CLOSE). The in-app
+        // caption-× reaches the same decision via `WindowCmd::Close`; without this,
+        // an OS close falls through to eframe/wgpu's slow graceful GPU-device +
+        // swapchain + winit-window teardown — the real source of the slow-to-close
+        // latency (the PTY teardown is ~2ms).
+        //
+        // Routed through `handle_close_request` so the running-command guard and
+        // the close-to-tray preference actually apply here. `os_close = true`
+        // because winit has ALREADY accepted this close and will tear the window
+        // down unless the decision cancels it. `take_explicit_quit` consumes the
+        // flag the tray's Quit sets — the ONLY thing distinguishing that Quit from
+        // an ordinary ✕ by the time it arrives here, and without it close-to-tray
+        // would swallow the one affordance that closes the app.
+        //
+        // No longer gated on `live_window`: the exit itself is (inside
+        // `handle_close_request`), so the headless egui_kittest harness can drive
+        // the real decision without `process::exit` killing the test process.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.handle_close_request(ctx, take_explicit_quit(), true);
         }
         // Alt+F4 close, restored in-app. Removing WS_SYSMENU (to kill the doubled
         // native close button — see `caption_close`) means DefWindowProc no longer
         // translates Alt+F4 into a WM_CLOSE, so egui/winit still delivers the key
-        // event but the OS never turns it into a close_requested. Handle it here
-        // and take the same fast-exit path as the caption-× / OS close. Gated on
-        // `live_window` so the headless harness never calls `process::exit`.
-        if self.live_window && ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::F4)) {
-            self.prepare_shutdown();
-            std::process::exit(0);
+        // event but the OS never turns it into a close_requested — hence
+        // `os_close = false`: there is no accepted OS close to cancel here.
+        if ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::F4)) {
+            self.handle_close_request(ctx, take_explicit_quit(), false);
         }
+        // Config HOT RELOAD: pick up an external `config.toml` edit live, with
+        // no relaunch. Runs BEFORE the theme/motion ticks below so a reloaded
+        // theme or motion setting takes effect on THIS frame rather than the
+        // next. Throttled inside the watcher to one filesystem stat per
+        // `config_watch::POLL_INTERVAL`.
+        // A SECOND `c0pl4nd.exe` launch (another "Open C0PL4ND here", or just
+        // running the exe again) is forwarded to THIS instance rather than
+        // opening a rival window. Its pane is opened here, on the UI thread —
+        // the window procedure that received it only queues, because it runs
+        // inside a synchronous `SendMessage` the other process is blocked on.
+        self.drain_forwarded_launches(ctx);
+        self.config_hot_reload_tick(ctx);
         // Follow-OS dark/light (SCR1B3 parity): when enabled, track the OS
         // appearance and swap between the default dark/light themes to match.
         self.follow_os_theme_tick(ctx);
@@ -3621,8 +4847,13 @@ impl C0pl4ndApp {
         // cheap (≤ MAX_PANES panes; the render path already locks each pane many
         // times per frame) and idempotent. Clamped to the Settings slider range.
         let scrollback = self.config.scrollback_lines.clamp(100, 1_000_000);
+        // Same per-frame, idempotent apply for the OSC 52 clipboard-READ gate
+        // (`clipboard_read_allow`, DEFAULT-DENY) so the setting takes effect —
+        // and so turning it back off takes effect just as promptly.
+        let clipboard_read_allow = self.config.clipboard_read_allow;
         for term in self.terms.values() {
             term.set_max_scrollback(scrollback);
+            term.set_clipboard_read_allowed(clipboard_read_allow);
         }
         // Wire each live pane's UI-wake callback (once) so live PTY output wakes
         // the render loop — the other half of the damage-tracked-redraw scheme
@@ -3638,23 +4869,13 @@ impl C0pl4ndApp {
         if self.live_window {
             self.wire_pane_wakes(ctx);
         }
-        // Live font apply: when the user changes the Family (or a Fallback) in
-        // settings, the configured font stack changed since the last install —
-        // re-install it THIS frame so the new typeface shows without a relaunch.
-        // The `applied_font_family` key folds the family + fallbacks into one
-        // string so the (expensive) re-install runs ONLY on an actual change,
-        // never every frame. A re-install changes the font atlas, so the cached
-        // galleys (which reference the old atlas) must be dropped (audit #2).
-        else {
-            let want = font_apply_key(&self.config.font);
-            if want != self.applied_font_family {
-                install_chrome_fonts(ctx, &self.config.font);
-                self.applied_font_family = want;
-                self.galley_cache.clear();
-                // A settings re-install supersedes any in-flight startup load.
-                self.pending_fonts = None;
-            }
-        }
+        // Live font apply runs in BOTH the live window AND headless — it must NOT
+        // be gated on `live_window`. Previously this lived in the `else` of the
+        // `if self.live_window` above, so a Family/Fallback change was INERT in the
+        // real window (`live_window == true` took the `wire_pane_wakes` arm and
+        // never the font apply); only headless tests ever exercised it. That made
+        // the font dropdown a no-op in production. It is now an unconditional call.
+        self.apply_live_font_change(ctx);
         // Off-thread startup font load (audit #3): when the worker thread that
         // enumerated the system font DB has finished, swap in the custom stack.
         // Until then the window painted with the built-in mono. `try_recv` is
@@ -3684,209 +4905,72 @@ impl C0pl4ndApp {
         // Surface an opt-in launch update check result (if one arrived) as a
         // toast. No-op when no check was attached (every headless test).
         self.poll_update_check();
-        // 0a) command palette: Ctrl+Shift+P (Cmd+Shift+P on macOS) toggles it. The
-        //     matching key-press is removed from the event stream so it never
-        //     reaches the PTY — without this, on the close frame (palette already
-        //     open) the `P` would fall through to `forward_input_to_focused` and
-        //     be encoded as the Ctrl+P control byte. Done explicitly rather than
-        //     via `consume_key` so the ctrl-OR-command match is unambiguous on
-        //     every platform.
-        let toggle_palette = ctx.input_mut(|i| {
-            let mut found = false;
-            i.events.retain(|ev| {
-                let hit = matches!(
-                    ev,
-                    egui::Event::Key { key: egui::Key::P, pressed: true, modifiers, .. }
-                    if modifiers.shift && (modifiers.ctrl || modifiers.command)
-                );
-                found |= hit;
-                !hit
-            });
-            found
-        });
-        if toggle_palette {
-            self.toggle_palette();
-        }
+        // 0a) KEYBOARD SHORTCUTS — the single, config-driven dispatcher.
+        //
+        //     Every shortcut the shell has is resolved HERE from the live
+        //     `config.keybindings` (see `egui_app::actions`): the chord strings
+        //     are parsed by the SAME `Chord` code `Keybindings::validate` uses,
+        //     matched EXACTLY on modifiers, consumed out of the event stream (so
+        //     a bound chord never also reaches the PTY as a control byte), and
+        //     dispatched through `dispatch_action` — the same entry point the
+        //     command palette uses. Rebinding an action in `config.toml` really
+        //     moves its chord because nothing else opens/closes/splits anything.
+        //
+        //     This replaced ~8 hand-rolled `events.retain` blocks that hard-wired
+        //     Ctrl+Shift+{P,F,H,T,W,D,E,Z,K,A}, Ctrl+{,}, F11, Ctrl+{+,-,0} and
+        //     Ctrl+Shift+{Home,End}; the defaults reproduce every one of them.
+        let fired_actions = self.dispatch_keybindings(ctx);
 
-        // 0a') find overlay: Ctrl+Shift+F (Cmd+Shift+F on macOS) toggles it —
-        //      matching the documented binding (KEYBINDINGS.md / config `search`)
-        //      and the palette's own Ctrl+Shift+P convention. Using the SHIFTED
-        //      chord deliberately leaves plain Ctrl+F free to reach the shell as
-        //      the Ctrl+F control byte (0x06, readline/emacs forward-char). The
-        //      matching key-press is removed from the event stream so it never
-        //      reaches the PTY. The ctrl-OR-command match is done explicitly (not
-        //      via `consume_key`) so it is unambiguous on every platform — the
-        //      same discipline the palette chord uses above.
-        let toggle_search = ctx.input_mut(|i| {
-            let mut found = false;
-            i.events.retain(|ev| {
-                let hit = matches!(
-                    ev,
-                    egui::Event::Key { key: egui::Key::F, pressed: true, modifiers, .. }
-                    if modifiers.shift && (modifiers.ctrl || modifiers.command) && !modifiers.alt
-                );
-                found |= hit;
-                !hit
-            });
-            found
-        });
-        if toggle_search {
-            self.toggle_search();
-        }
-
-        // 0a'') history sidebar: Ctrl+Shift+H (Cmd+Shift+H on macOS) toggles the
-        //       command-history quick-run sidebar. The matching key-press is
-        //       removed from the event stream so it never reaches the PTY — the
-        //       same chord-leak discipline the palette + find chords use above
-        //       (without this, `H` would fall through to the PTY as the Ctrl+H
-        //       control byte = backspace). Done explicitly (not `consume_key`) so
-        //       the ctrl-OR-command match is unambiguous on every platform.
-        let toggle_history = ctx.input_mut(|i| {
-            let mut found = false;
-            i.events.retain(|ev| {
-                let hit = matches!(
-                    ev,
-                    egui::Event::Key { key: egui::Key::H, pressed: true, modifiers, .. }
-                    if modifiers.shift && (modifiers.ctrl || modifiers.command)
-                );
-                found |= hit;
-                !hit
-            });
-            found
-        });
-        if toggle_history {
-            self.toggle_history_sidebar();
-        }
-
-        // 0a''') frameless fullscreen (#36): F11 toggles borderless OS fullscreen
-        //        (the window is already `decorations: false`, so `Fullscreen` —
-        //        not `Maximized` — is the right call; it covers the monitor with
-        //        no border and keeps DWM compositing so the acrylic/mica backdrop
-        //        still composites). The F11 key-press is removed from the event
-        //        stream so it never reaches the PTY as the F11 escape sequence —
-        //        the SAME chord-leak discipline the palette / find / history
-        //        chords use above. Esc ALSO exits fullscreen, but ONLY when no
-        //        overlay owns Esc (the palette + find consume Esc to close
-        //        themselves; handling it here too would fight them), and is left
-        //        in the stream otherwise so those overlays still see it.
-        let toggle_fullscreen = ctx.input_mut(|i| {
-            let mut found = false;
-            i.events.retain(|ev| {
-                let hit = matches!(
-                    ev,
-                    egui::Event::Key {
-                        key: egui::Key::F11,
-                        pressed: true,
-                        ..
-                    }
-                );
-                found |= hit;
-                !hit
-            });
-            found
-        });
+        // 0a') frameless fullscreen (#36): the `fullscreen` binding (F11 by
+        //      default) toggles borderless OS fullscreen through the dispatcher
+        //      above — the window is already `decorations: false`, so
+        //      `Fullscreen` (not `Maximized`) is the right call: it covers the
+        //      monitor with no border and keeps DWM compositing so the
+        //      acrylic/mica backdrop still composites.
+        //
+        //      Esc ALSO exits fullscreen, but ONLY when no overlay owns Esc (the
+        //      palette + find consume Esc to close themselves; handling it here
+        //      too would fight them), and is left in the stream otherwise so
+        //      those overlays still see it. Esc-exit stays here rather than
+        //      becoming a binding precisely because it is conditional on that
+        //      overlay state.
         let esc_exit_fullscreen = self.fullscreen
             && !self.palette_open
             && !self.search_open
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-        if toggle_fullscreen || esc_exit_fullscreen {
-            // F11 toggles; an Esc in fullscreen always EXITS. Read the OS-reported
-            // state so a fullscreen entered via another path is honoured.
-            let now = ctx.input(|i| i.viewport().fullscreen.unwrap_or(self.fullscreen));
-            let want = if esc_exit_fullscreen { false } else { !now };
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(want));
-            // Local mirror is the source of truth the panels read THIS frame —
-            // `i.viewport().fullscreen` updates a frame late (the OS reports back
-            // next frame), so a local mirror avoids a one-frame flash of the
-            // titlebar on enter / of the bare grid on exit.
-            self.fullscreen = want;
-        } else {
-            // Reconcile the mirror from the OS each frame so a fullscreen toggled
-            // via another path (e.g. a window-manager shortcut) stays honest.
+        if esc_exit_fullscreen {
+            self.set_fullscreen(ctx, false);
+        } else if !fired_actions.contains(&Action::ToggleFullscreen) {
+            // Reconcile the local mirror from the OS each frame so a fullscreen
+            // toggled via another path (e.g. a window-manager shortcut) stays
+            // honest — but NOT on a frame we just commanded a change, because
+            // `i.viewport().fullscreen` still reports the OLD state until the OS
+            // reports back next frame (that stale read would undo the toggle).
             if let Some(os) = ctx.input(|i| i.viewport().fullscreen) {
                 self.fullscreen = os;
             }
         }
 
-        // 0a'''') font zoom (E-parity): Ctrl/Cmd with +/=/-/0, or Ctrl/Cmd+wheel.
-        //         Mutates config.font.size (the renderer reads it every frame),
-        //         clamped to [6, 48] like the legacy shell. The chords are
-        //         consumed so they never reach the PTY; the pane's local wheel
-        //         scrollback skips a Ctrl-held wheel (see render_pane_body) so a
-        //         Ctrl+wheel only zooms.
+        // 0a'') font zoom (E-parity): the increase/decrease/reset FONT bindings
+        //       (Ctrl/Cmd with +/=/- and 0 by default) run through the
+        //       dispatcher above. What stays here is the part that is NOT a key
+        //       chord: Ctrl/Cmd + wheel (and trackpad pinch) live zoom.
+        //
+        //       egui reroutes a zoom-modifier wheel into `zoom_delta()` (a
+        //       MULTIPLICATIVE factor) and ZEROES `smooth_scroll_delta` for that
+        //       frame, so the zoom MUST be read from `zoom_delta` — a
+        //       scroll-delta read never fires under a held Ctrl/Cmd. It is 1.0
+        //       with no zoom, > 1.0 zooming in (wheel up), < 1.0 out. Map that
+        //       onto an ADDITIVE point step so it feeds the SAME clamp + debounced
+        //       persist as the keyboard zoom (`nudge_font_size`): ~one wheel notch
+        //       ≈ ±1pt, clamped so a fast pinch cannot jump size in one frame.
+        //       The pane's local wheel scrollback skips a Ctrl-held wheel (see
+        //       `render_pane_body`) so a Ctrl+wheel only zooms.
         {
-            let mut dz = 0.0_f32;
-            let mut reset = false;
-            ctx.input_mut(|i| {
-                i.events.retain(|ev| {
-                    if let egui::Event::Key {
-                        key,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } = ev
-                    {
-                        // Accept either `command` (macOS ⌘, and egui-winit maps
-                        // this to Ctrl on Windows/Linux) OR the raw `ctrl` bit, so
-                        // the chord fires on every platform AND under synthetic
-                        // test events (which set `ctrl` but not `command`) — the
-                        // same `ctrl || command` discipline the palette/find chords
-                        // above use.
-                        if (modifiers.command || modifiers.ctrl) && !modifiers.alt {
-                            match key {
-                                egui::Key::Plus | egui::Key::Equals => {
-                                    dz += 1.0;
-                                    return false;
-                                }
-                                egui::Key::Minus => {
-                                    dz -= 1.0;
-                                    return false;
-                                }
-                                egui::Key::Num0 => {
-                                    reset = true;
-                                    return false;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    true
-                });
-            });
-            // Ctrl/Cmd + wheel (and trackpad pinch) live font zoom. egui reroutes
-            // a zoom-modifier wheel into `zoom_delta()` (a MULTIPLICATIVE factor)
-            // and ZEROES `smooth_scroll_delta` for that frame, so the zoom MUST be
-            // read from `zoom_delta` — a scroll-delta read never fires under a held
-            // Ctrl/Cmd. `zoom_delta` is 1.0 when there is no zoom, > 1.0 zooming in
-            // (wheel up), < 1.0 out. Map that onto an ADDITIVE point step so it
-            // feeds the same clamp as the keyboard zoom: ~one wheel notch ≈ ±1pt
-            // (matching Ctrl+=/-), clamped so a fast pinch can't jump size in one
-            // frame. This also covers `matches_any(COMMAND)`, so a synthetic
-            // ctrl-only wheel event (tests) triggers it just like real winit.
             let zoom = ctx.input(|i| i.zoom_delta());
             if (zoom - 1.0).abs() > f32::EPSILON {
-                dz += ((zoom - 1.0) * 4.0).clamp(-3.0, 3.0);
-            }
-            let before = self.config.font.size;
-            if reset {
-                self.config.font.size = c0pl4nd_core::Config::default().font.size;
-            } else if dz != 0.0 {
-                self.config.font.size = (self.config.font.size + dz).clamp(6.0, 48.0);
-            }
-            if self.config.font.size != before {
-                // The renderer reads `config.font.size` every frame, so the new
-                // size applies live immediately. The PERSIST is DEBOUNCED: writing
-                // the whole config file (atomic temp-write + rename + perms) on
-                // every wheel notch is wasteful under a fast zoom, so we schedule a
-                // single save `FONT_SAVE_DEBOUNCE` after the LAST change instead.
-                // `frame_tick` flushes it; a repaint is scheduled for the deadline
-                // so an otherwise-idle app still wakes to write it.
-                ctx.request_repaint();
-                let now = ctx.input(|i| i.time);
-                self.pending_font_save_at = Some(now + FONT_SAVE_DEBOUNCE_SECS);
-                ctx.request_repaint_after(std::time::Duration::from_secs_f64(
-                    FONT_SAVE_DEBOUNCE_SECS,
-                ));
+                let dz = ((zoom - 1.0) * 4.0).clamp(-3.0, 3.0);
+                self.nudge_font_size(ctx, dz);
             }
         }
 
@@ -3955,53 +5039,6 @@ impl C0pl4ndApp {
             }
         }
 
-        // 0a'''''')b scroll-to-edge (best-in-class parity): Ctrl+Shift+Home jumps
-        //           the scrollback to the oldest retained line; Ctrl+Shift+End
-        //           snaps back to live output. The chord is removed from the event
-        //           stream so Home/End don't also reach the PTY as cursor-motion
-        //           bytes. Explicit ctrl-OR-command match via events.retain (NOT
-        //           consume_key), same cross-platform discipline as jump-to-prompt
-        //           above.
-        let scroll_edge = ctx.input_mut(|i| {
-            let mut to_top: Option<bool> = None;
-            i.events.retain(|ev| {
-                if let egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } = ev
-                {
-                    let cmd = modifiers.ctrl || modifiers.command;
-                    if cmd && modifiers.shift && !modifiers.alt {
-                        if *key == egui::Key::Home {
-                            to_top = Some(true); // to top (oldest)
-                            return false;
-                        } else if *key == egui::Key::End {
-                            to_top = Some(false); // to bottom (live)
-                            return false;
-                        }
-                    }
-                }
-                true
-            });
-            to_top
-        });
-        if let Some(to_top) = scroll_edge {
-            if let Some(term) = self.terms.get_mut(&self.focused_pane) {
-                let moved = if to_top {
-                    term.scroll_to_top()
-                } else {
-                    let was = term.view_offset();
-                    term.scroll_to_bottom();
-                    was != 0
-                };
-                if moved {
-                    ctx.request_repaint();
-                }
-            }
-        }
-
         // 0a''''''') DEC ?1004 focus reporting (E-parity): on a window focus-in/out
         //            EDGE, tell the focused pane's program (so vim/tmux see
         //            FocusGained/FocusLost). report_focus is a no-op unless the
@@ -4014,129 +5051,76 @@ impl C0pl4ndApp {
             self.was_focused = focused_now;
         }
 
-        // 0a'''''''') window-management keyboard shortcuts (F-parity): the egui
-        //            shell offered new/close/split ONLY as chrome buttons. Add
-        //            Ctrl/Cmd+Shift+{T,W,D,E} = new-pane / close-pane / split-right
-        //            / split-down, and Ctrl/Cmd+, = settings. Matched + consumed
-        //            via events.retain (the proven cross-platform chord-leak
-        //            discipline the find/history chords use) so the letters never
-        //            reach the PTY as control bytes.
-        let mut act_new = false;
-        let mut act_close = false;
-        let mut act_split_h = false;
-        let mut act_split_v = false;
-        let mut act_zoom = false;
-        let mut act_settings = false;
-        let mut act_clear_scrollback = false;
-        let mut act_copy_all = false;
+        // 0a''''''''') CLIPBOARD CHORDS — `Event::Copy` / `Event::Cut`, NOT `Event::Key`.
+        //
+        // `egui-winit` intercepts the clipboard chords in its window-event
+        // dispatcher and RETURNS EARLY, so it never emits an `Event::Key` for
+        // them (egui-winit-0.34.3/src/lib.rs:1016-1027). Its predicate ignores
+        // Shift — `is_copy_command` is `modifiers.command && key == C` (:1311) —
+        // and on Windows/Linux `modifiers.command` IS `ctrl` (:473). So BOTH
+        // `Ctrl+C` and `Ctrl+Shift+C` (and `Ctrl+Insert`) collapse into a single
+        // `egui::Event::Copy`, and `Ctrl+X` into `egui::Event::Cut`.
+        //
+        // Matching `Event::Key { key: C, .. }` here — as this handler used to —
+        // is therefore DEAD CODE: copy silently did nothing, and, far worse,
+        // `Ctrl+C` never reached the PTY, so a running command could not be
+        // interrupted. We recover the chord from the frame's modifier snapshot
+        // (`InputState::modifiers`, which egui copies verbatim from
+        // `RawInput::modifiers` — egui-0.34.3/src/input_state/mod.rs:485 — and
+        // which egui-winit keeps current from `ModifiersChanged`) and:
+        //
+        //   Ctrl+Shift+C          → copy the selection (the terminal copy chord).
+        //   Ctrl+C  WITH selection → copy the selection AND CLEAR it (Windows
+        //                            Terminal's behaviour). Clearing is what keeps
+        //                            SIGINT reachable: the very next Ctrl+C has no
+        //                            selection and therefore interrupts.
+        //   Ctrl+C  NO selection   → restore the swallowed key so the normal PTY
+        //                            forwarder encodes it — 0x03, SIGINT.
+        //   Ctrl+X (any selection) → always restore the key (0x18 / the readline
+        //                            `C-x` prefix); a terminal cannot "cut" its
+        //                            scrollback, so cut must never eat the chord.
+        //
+        // macOS: `command` is Super there, so `Ctrl+C`/`Ctrl+X` still arrive as
+        // real `Event::Key`s and are untouched by this block; a `Cmd+C`/`Cmd+X`
+        // reaches us with `ctrl == false` and always means COPY, never interrupt.
+        //
+        // Restoring the key (rather than writing 0x03 directly) keeps ONE PTY
+        // encoding path: the kitty keyboard protocol, REPORT-EVENT-TYPES, and
+        // `forward_key` all still apply, exactly as if egui-winit had not
+        // swallowed the chord.
+        let selection_live = self
+            .selection
+            .is_some_and(|s| s.anchor != s.head && self.terms.contains_key(&s.pane));
+        let mut copy_sel = false;
+        let mut clear_after_copy = false;
         ctx.input_mut(|i| {
-            i.events.retain(|ev| {
-                if let egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } = ev
-                {
-                    let cmd = modifiers.command || modifiers.ctrl;
-                    if cmd && modifiers.shift && !modifiers.alt {
-                        match key {
-                            egui::Key::T => {
-                                act_new = true;
-                                return false;
-                            }
-                            egui::Key::W => {
-                                act_close = true;
-                                return false;
-                            }
-                            egui::Key::D => {
-                                act_split_h = true;
-                                return false;
-                            }
-                            egui::Key::E => {
-                                act_split_v = true;
-                                return false;
-                            }
-                            egui::Key::Z => {
-                                act_zoom = true;
-                                return false;
-                            }
-                            egui::Key::K => {
-                                // Clear scrollback (WezTerm's Ctrl+Shift+K).
-                                act_clear_scrollback = true;
-                                return false;
-                            }
-                            egui::Key::A => {
-                                // Copy the whole buffer (Windows Terminal / Ghostty
-                                // "Select all" → copy).
-                                act_copy_all = true;
-                                return false;
-                            }
-                            _ => {}
+            let m = i.modifiers;
+            let mut kept: Vec<egui::Event> = Vec::with_capacity(i.events.len());
+            for ev in i.events.drain(..) {
+                match ev {
+                    egui::Event::Copy => {
+                        if m.shift || !m.ctrl {
+                            copy_sel = true;
+                        } else if selection_live {
+                            copy_sel = true;
+                            clear_after_copy = true;
+                        } else {
+                            kept.push(restored_chord_key(egui::Key::C, m));
                         }
                     }
-                    if cmd && !modifiers.shift && !modifiers.alt && *key == egui::Key::Comma {
-                        act_settings = true;
-                        return false;
+                    egui::Event::Cut => {
+                        if m.ctrl {
+                            kept.push(restored_chord_key(egui::Key::X, m));
+                        } else {
+                            // macOS `Cmd+X`: no cut semantics in a terminal grid —
+                            // treat it as a copy rather than dropping it.
+                            copy_sel = true;
+                        }
                     }
-                }
-                true
-            });
-        });
-        if act_new {
-            self.new_terminal();
-        }
-        if act_split_h {
-            self.split(egui_tiles::LinearDir::Horizontal);
-        }
-        if act_split_v {
-            self.split(egui_tiles::LinearDir::Vertical);
-        }
-        if act_close {
-            self.close_pane(self.focused_pane);
-        }
-        if act_zoom {
-            self.toggle_zoom_pane();
-        }
-        if act_settings {
-            self.settings_open = !self.settings_open;
-        }
-        if act_clear_scrollback {
-            // Ctrl/Cmd+Shift+K: clear the focused pane's scrollback (same effect
-            // as the right-click "Clear scrollback" item), then repaint so the
-            // now-shorter scrollbar reflects it this frame.
-            if let Some(term) = self.terms.get_mut(&self.focused_pane) {
-                term.clear_scrollback();
-            }
-            ctx.request_repaint();
-        }
-        if act_copy_all {
-            // Ctrl/Cmd+Shift+A: copy the focused pane's WHOLE buffer (scrollback +
-            // screen) to the clipboard — the no-selection companion to
-            // Ctrl/Cmd+Shift+C. An empty buffer copies nothing.
-            if let Some(term) = self.terms.get(&self.focused_pane) {
-                if let Some(text) = term.buffer_text() {
-                    ctx.copy_text(text);
+                    other => kept.push(other),
                 }
             }
-        }
-
-        // 0a''''''''') Ctrl/Cmd+Shift+C copies the live mouse selection to the
-        //             clipboard on demand (the MANUAL copy path; copy-on-select is
-        //             the auto path). Consumed so C never reaches the PTY as the
-        //             Ctrl+C interrupt byte.
-        let copy_sel = ctx.input_mut(|i| {
-            let mut hit = false;
-            i.events.retain(|ev| {
-                let m = matches!(
-                    ev,
-                    egui::Event::Key { key: egui::Key::C, pressed: true, modifiers, .. }
-                    if modifiers.shift && (modifiers.ctrl || modifiers.command) && !modifiers.alt
-                );
-                hit |= m;
-                !m
-            });
-            hit
+            i.events = kept;
         });
         if copy_sel {
             if let Some(sel) = self.selection {
@@ -4158,6 +5142,12 @@ impl C0pl4ndApp {
                     }
                 }
             }
+        }
+        if clear_after_copy {
+            // Windows Terminal semantics: a bare `Ctrl+C` that copied a selection
+            // also DISMISSES it, so the chord is not permanently hijacked — the
+            // next `Ctrl+C` finds no selection and sends SIGINT.
+            self.selection = None;
         }
 
         // 0b) route this frame's input. When the palette is open, its navigation
@@ -4191,7 +5181,7 @@ impl C0pl4ndApp {
                 self.palette_open = false;
             }
             if enter {
-                self.run_palette_selection();
+                self.run_palette_selection(ctx);
             }
         } else if self.search_open {
             // The find overlay owns input while open: its TextEdit captures the
@@ -4416,27 +5406,11 @@ impl C0pl4ndApp {
         if actions.report_issue {
             self.issue_intake.open_fresh();
         }
-        // View-mode toggle (#30): flip the pane shell layout (Grid ⇄ Tabs) and
-        // persist it. The disk write is real-window-only (the headless harness
-        // observes the in-memory flip; persisting there would pollute the user's
-        // real config.toml — the same discipline `settings_window` follows).
+        // View-mode toggle (#30): the chrome button and the `toggle_view_mode`
+        // action/binding share ONE method, so the flip + its persist behave
+        // identically however the user reached it.
         if actions.toggle_view_mode {
-            self.config.view_mode = self.config.view_mode.toggled();
-            if self.live_window {
-                if let Some(path) = c0pl4nd_core::Config::default_path() {
-                    // Surface a persist failure (read-only %APPDATA%, full disk,
-                    // permission error) instead of silently dropping the user's
-                    // settings change — mirrors the legacy shell (window.rs). A
-                    // GUI user never sees stderr, so a visible toast (the same
-                    // channel the config-LOAD error uses) is the real surface.
-                    if let Err(e) = self.config.save_to(&path) {
-                        self.toast = Some(crate::user_error::config_save_failed(
-                            e,
-                            "The layout change",
-                        ));
-                    }
-                }
-            }
+            self.toggle_view_mode();
         }
         // One-shot "make panes symmetrical": rebuild the layout as a UNIFORM grid
         // so all panes are equal-sized regardless of the prior (possibly nested /
@@ -4444,10 +5418,8 @@ impl C0pl4ndApp {
         // panes stayed uneven". Preserves pane order + every attached terminal
         // (panes carry only their id). No-op for a 0/1-pane tree.
         if actions.equalize_panes {
-            if let Some(grid) = grid::rebuild_as_uniform_grid(&self.grid_tree) {
-                self.grid_tree = grid;
-                ctx.request_repaint();
-            }
+            // Shared with the `equalize_panes` action/binding — one method.
+            self.equalize_panes(ctx);
         }
         // Caption command: issue the REAL OS viewport command AND record it so an
         // interaction test can assert the click had its effect.
@@ -4462,16 +5434,13 @@ impl C0pl4ndApp {
                     self.toggle_maximize(ctx, is_max);
                 }
                 WindowCmd::Close => {
-                    // Fast clean shutdown: run the necessary cleanup (persist
-                    // config + reap every PTY child so none orphan), then exit
-                    // immediately. This skips eframe/wgpu's slow graceful
-                    // GPU-device + swapchain + winit-window-destroy teardown —
-                    // the OS reclaims the GPU/window handles instantly — which is
-                    // what made the window slow to close. `prepare_shutdown` does
-                    // the load-bearing work; `process::exit(0)` is safe under
-                    // `#![forbid(unsafe_code)]`.
-                    self.prepare_shutdown();
-                    std::process::exit(0);
+                    // The caption ✕. Same decision funnel as the OS close and
+                    // Alt+F4: the running-command guard may hold it for
+                    // confirmation, and close-to-tray may hide instead of exit.
+                    // `os_close = false` — nothing accepted a close to cancel;
+                    // `explicit_quit = false` — the ✕ means "close this window",
+                    // which is exactly what close-to-tray reinterprets.
+                    self.handle_close_request(ctx, false, false);
                 }
             }
         }
@@ -4511,6 +5480,14 @@ impl C0pl4ndApp {
         //     discards it. Rendered before the tint so the wash sits over it too.
         if self.pending_paste.is_some() {
             self.paste_confirm_window(ctx);
+        }
+
+        // 5c-bis) the running-command close confirmation, if a close was HELD by
+        //     `close_guard`. Enter closes anyway (re-entering the same close path
+        //     with the answer recorded), Esc keeps working. Only ever up when a
+        //     pane reported an unfinished OSC 133 command AND the preference is on.
+        if self.close_confirm.is_some() {
+            self.close_confirm_window(ctx);
         }
 
         // 5d) W1TN3SS opt-in reporting dialogs (float above the chrome). The
@@ -4679,6 +5656,29 @@ impl C0pl4ndApp {
         }
     }
 
+    /// Re-install the configured font stack when the user changes the Family (or a
+    /// Fallback) in settings, so the new typeface shows THIS frame without a
+    /// relaunch. The `applied_font_family` key folds the family + fallbacks into
+    /// one string so the (expensive) re-install runs ONLY on an actual change,
+    /// never every frame. A re-install changes the font atlas, so the cached
+    /// galleys (which reference the old atlas) must be dropped (audit #2).
+    ///
+    /// This MUST run in both the live window AND headless: it previously lived in
+    /// the `else` of `if self.live_window`, so in the real window the
+    /// `live_window == true` arm took `wire_pane_wakes` and the font apply never
+    /// ran — the font dropdown was a silent no-op in production, exercised only by
+    /// headless tests. It is now called unconditionally.
+    fn apply_live_font_change(&mut self, ctx: &egui::Context) {
+        let want = font_apply_key(&self.config.font);
+        if want != self.applied_font_family {
+            install_chrome_fonts(ctx, &self.config.font);
+            self.applied_font_family = want;
+            self.galley_cache.clear();
+            // A settings re-install supersedes any in-flight startup load.
+            self.pending_fonts = None;
+        }
+    }
+
     /// Drain every live pane's terminal-owed effects once per frame.
     ///
     /// PTY query replies (device attributes, cursor-position reports, OSC color
@@ -4697,12 +5697,14 @@ impl C0pl4ndApp {
     fn pump_pane_effects(&mut self, ctx: &egui::Context) {
         let mut clipboard: Vec<String> = Vec::new();
         let mut colors: Vec<ColorSet> = Vec::new();
-        let mut notified = false;
+        let mut notifications: Vec<c0pl4nd_core::term::Notification> = Vec::new();
+        let mut progress: Vec<c0pl4nd_core::term::osc::Progress> = Vec::new();
         for pane in self.terms.values_mut() {
             let fx = pane.pump_host_effects();
             clipboard.extend(fx.clipboard_writes);
             colors.extend(fx.color_sets);
-            notified |= fx.notified;
+            notifications.extend(fx.notifications);
+            progress.extend(fx.progress);
         }
         // OSC 52 → OS clipboard (write only; reads stay default-off in core).
         for text in clipboard {
@@ -4718,15 +5720,43 @@ impl C0pl4ndApp {
             }
             ctx.request_repaint();
         }
-        // OSC 9/777 desktop notification while the window is unfocused → request
-        // user attention (taskbar flash). The notification TEXT is never read
-        // here (privacy: it can carry a 2FA code / secret URL — never log it).
-        // `focused` is `None` before the first focus event; treat that as focused
-        // so a notification at startup does not spuriously flash.
-        if notified && !ctx.input(|i| i.viewport().focused.unwrap_or(true)) {
+        // OSC 9/777 desktop notification while the window is unfocused → a real
+        // OS toast AND the taskbar flash.
+        //
+        // The flash is KEPT alongside the toast deliberately: it is the only
+        // signal on a host where no toast can be shown (non-Windows, notifications
+        // disabled by policy, no installed Start-Menu shortcut carrying the
+        // AUMID), and it is what leaves the taskbar button highlighted after the
+        // toast auto-dismisses. Dropping it would weaken shipped behaviour.
+        //
+        // `notify::plan` owns BOTH decisions so they cannot drift apart, and it
+        // reaches the same focused-suppression predicate this block used to call
+        // directly (`taskbar::should_request_attention`) rather than reimplementing
+        // it — `focused == None` at startup is treated as focused, so an rc-file's
+        // notification during launch neither toasts nor flashes.
+        //
+        // The notification TEXT is read here and shown. That is not a privacy
+        // regression: the old "never surface the text" rule was about LOGGING
+        // (an OSC payload can carry a 2FA code or a secret URL), and nothing on
+        // this path traces, logs, or persists it — `notify::show` builds it into
+        // a toast XML string, hands it to the shell, and drops it.
+        let focused = ctx.input(|i| i.viewport().focused);
+        let plan = crate::notify::plan(&notifications, focused);
+        if let Some(text) = &plan.toast {
+            crate::notify::show(text);
+        }
+        if plan.flash {
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                 egui::UserAttentionType::Informational,
             ));
+        }
+        // OSC 9;4 taskbar progress → the Windows taskbar button's progress
+        // segment. Only the LAST report of the frame is visible on a single
+        // button, so `latest_progress` collapses the frame's stream to one
+        // apply; an empty drain leaves the button untouched (no needless COM
+        // call every frame).
+        if let Some(latest) = taskbar::latest_progress(&progress) {
+            taskbar::apply_progress(taskbar::map_progress_state(latest.state), latest.percent);
         }
     }
 
@@ -4826,6 +5856,37 @@ impl C0pl4ndApp {
 /// otherwise-quiescent screen. Matches the 530 ms cadence the cursor painter and
 /// the legacy winit shell use.
 const CURSOR_BLINK_HALF_PERIOD_MS: u64 = 530;
+
+/// Whether the terminal caret is PAINTED this frame.
+///
+/// * `forced` — the visual-QA phase pin ([`C0pl4ndApp::set_cursor_blink_phase`]).
+///   When set it wins outright, which is the whole point: the free-running form
+///   below made a snapshot scene capture the caret solid on one run and gone on
+///   the next, so the PNGs could not serve the "cursor placement" eyeball their
+///   module doc claims. `None` — the shipping app's only state — leaves the
+///   behaviour exactly as it was.
+/// * Otherwise the caret blinks only on the FOCUSED pane and only when
+///   configured to; an unfocused or blink-disabled caret is steady-on (it is
+///   drawn as a hollow outline instead, so it must not also vanish).
+///
+/// Pure, so the phase wiring is unit-testable without a frame.
+fn cursor_blink_on(
+    forced: Option<CursorBlinkPhase>,
+    blink: bool,
+    focused: bool,
+    time_secs: f64,
+) -> bool {
+    if let Some(phase) = forced {
+        return phase == CursorBlinkPhase::On;
+    }
+    if !(blink && focused) {
+        return true;
+    }
+    // Full period = two half-periods, tied to the same constant the idle repaint
+    // tick schedules from, so the caret cannot toggle at a rate nothing repaints.
+    let period = 2.0 * (CURSOR_BLINK_HALF_PERIOD_MS as f64) / 1000.0;
+    (time_secs / period).fract() < 0.5
+}
 
 /// Frames the atlas-warmup gate holds the grid's glyphs off (and GPU-fences in
 /// `ui`) after a (re)warm, so the warmed atlas is uploaded + resident before any
@@ -5158,6 +6219,156 @@ fn grid_text_origin(rect: egui::Rect, padding: f32) -> egui::Pos2 {
     rect.left_top() + egui::vec2(p, p)
 }
 
+/// Alpha the theme's opaque `selection_background` is washed over the grid at.
+///
+/// The theme colour is an opaque RGB; painting it solid would hide the text
+/// underneath (the wash is drawn AFTER the glyphs). This alpha is the previous
+/// hard-coded wash's alpha, so the selection reads exactly as before while now
+/// taking the ACTIVE THEME's hue instead of a fixed steel blue.
+const SELECTION_WASH_ALPHA: u8 = 0x60;
+
+/// Snap a POINT coordinate to the physical-pixel grid at `ppp`.
+///
+/// Background quads must tile without seams: two adjacent cells with the same
+/// background are painted as separate rectangles whose shared edge lands on a
+/// fractional pixel at most DPI scalings. Rounding that edge to a whole physical
+/// pixel makes the left quad's right edge and the right quad's left edge the
+/// SAME value, so they abut exactly — no bright hairline where the window
+/// background shows through, and no double-blended overlap.
+fn snap_to_physical(v: f32, ppp: f32) -> f32 {
+    if ppp > 0.0 {
+        (v * ppp).round() / ppp
+    } else {
+        v
+    }
+}
+
+/// Draw one span's underline in `style`, from `x0` to `x1` with its top at `y`.
+///
+/// Every variant is drawn ANALYTICALLY from the span geometry (no glyph, no
+/// texture), so all of them stay crisp and correctly-proportioned at any
+/// `pixels_per_point` — the requirement that rules out rendering the curly
+/// variant as a repeated `~`-like glyph, which aliases into mush on HiDPI.
+// Geometry primitive: endpoints, thickness, colour, style and pixels-per-point
+// are all independent painting parameters. A struct would not reduce the count,
+// only rename it — the same rationale as `glyph_button`'s existing allow.
+#[allow(clippy::too_many_arguments)]
+fn paint_underline(
+    painter: &egui::Painter,
+    x0: f32,
+    x1: f32,
+    y: f32,
+    thickness: f32,
+    color: egui::Color32,
+    style: c0pl4nd_core::grid::UnderlineStyle,
+    ppp: f32,
+) {
+    use c0pl4nd_core::grid::UnderlineStyle as U;
+    if x1 <= x0 {
+        return;
+    }
+    // A solid horizontal bar from `a` to `b`, snapped so it is exactly the
+    // requested thickness in physical pixels.
+    let bar = |a: f32, b: f32, top: f32| {
+        let ty = snap_to_physical(top, ppp);
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(a, ty),
+                egui::pos2(b, ty + thickness.max(1.0 / ppp.max(0.01))),
+            ),
+            0.0,
+            color,
+        );
+    };
+    match style {
+        U::None => {}
+        U::Single => bar(x0, x1, y),
+        // Two hairlines with a gap of one thickness between them.
+        U::Double => {
+            bar(x0, x1, y - thickness);
+            bar(x0, x1, y + thickness);
+        }
+        // Dot on / dot off.
+        //
+        // Each dot MUST be wider than TWO PHYSICAL PIXELS, and that is a hard
+        // constraint of the rasteriser, not a taste call. `epaint`'s
+        // `Tessellator::tessellate_rect` re-routes any un-stroked rect whose
+        // WIDTH is `<= 2.0 * feathering` (and `feathering` is exactly one
+        // physical pixel) into `tessellate_line_segment` between the rect's
+        // top-centre and bottom-centre — i.e. it approximates a thin rect as a
+        // VERTICAL hairline. For an underline dot that vertical segment is one
+        // pixel long, so it feathers away to nothing.
+        //
+        // That is precisely what shipped: this arm drew `bar(x, x + thickness)`
+        // every `thickness * 2.0`, and with `thickness = (ch * 0.06).max(1.0 /
+        // ppp)` = 1.02pt at ppp 1.0 it emitted 46 rects ~1.02pt wide that
+        // rasterised to ZERO pixels — the row was byte-identical to a row with
+        // no underline at all, even at a per-channel tolerance of 90/255, while
+        // the same run gave 94px solid and 60px dashed. `ESC[4:4m` was
+        // indistinguishable from `ESC[24m`. `U::Dashed` only ever escaped it
+        // because its dash is `thickness * 4.0` wide.
+        //
+        // Three physical pixels clears the threshold with margin, so the dot
+        // takes the real rect path; its 1px HEIGHT then takes the HORIZONTAL
+        // line-segment path, landing on the same crisp single scanline
+        // `U::Single` does. A 3-on/3-off period stays visibly finer than
+        // `U::Dashed` (4 on, 3 off), so the two styles remain distinct.
+        //
+        // The x edges are deliberately NOT run through `snap_to_physical` here:
+        // `tessellate_rect` already rounds every filled rect to the physical
+        // pixel grid (`round_rects_to_pixels`, on by default), so snapping first
+        // is a measured no-op — with and without it this run renders the same 48
+        // pixels in the same 16 dots. The physical-pixel WIDTH FLOOR is the whole
+        // fix; anything else here would be decoration that reads as load-bearing.
+        U::Dotted => {
+            let px = 1.0 / ppp.max(0.01);
+            let dot = (thickness * 2.0).max(3.0 * px);
+            let step = (thickness * 4.0).max(6.0 * px);
+            let mut x = x0;
+            while x < x1 {
+                bar(x, (x + dot).min(x1), y);
+                x += step;
+            }
+        }
+        // Longer dashes at a 7x period — visually distinct from dotted.
+        U::Dashed => {
+            let dash = (thickness * 4.0).max(2.0);
+            let step = (thickness * 7.0).max(3.0);
+            let mut x = x0;
+            while x < x1 {
+                bar(x, (x + dash).min(x1), y);
+                x += step;
+            }
+        }
+        // Undercurl (nvim LSP diagnostics): a sine sampled at ~1 physical pixel
+        // so the wave has the same shape and amplitude in PHYSICAL terms on a
+        // 1x and a 2x display.
+        U::Curly => {
+            let amplitude = thickness * 1.5;
+            let period = (thickness * 6.0).max(4.0);
+            let sample = (1.0 / ppp.max(0.01)).max(0.25);
+            let mid = y + thickness * 0.5;
+            let mut pts: Vec<egui::Pos2> = Vec::new();
+            let mut x = x0;
+            while x < x1 {
+                let phase = (x - x0) / period * std::f32::consts::TAU;
+                pts.push(egui::pos2(x, mid + phase.sin() * amplitude));
+                x += sample;
+            }
+            // Always close on the span's right edge so the curl spans the full
+            // run regardless of where the sampling loop happened to stop.
+            let phase = (x1 - x0) / period * std::f32::consts::TAU;
+            pts.push(egui::pos2(x1, mid + phase.sin() * amplitude));
+            if pts.len() >= 2 {
+                painter.add(egui::Shape::line(
+                    pts,
+                    egui::Stroke::new(thickness.max(1.0 / ppp.max(0.01)), color),
+                ));
+            }
+        }
+    }
+}
+
 /// Paint a pane's visible grid with egui's NATIVE text painter, using the
 /// per-row colour runs from [`PaneTerm::grid_rows`]. This is the single,
 /// engine-agnostic render path for BOTH the live window and the headless
@@ -5196,6 +6407,9 @@ fn paint_grid_native(
     theme: &c0pl4nd_core::Theme,
     focused: bool,
     cursor_cfg: c0pl4nd_core::config::CursorConfig,
+    // Deterministic cursor-blink phase override for visual-QA capture; `None`
+    // leaves the caret's phase free-running off the frame clock.
+    cursor_blink_phase: Option<CursorBlinkPhase>,
     effects: c0pl4nd_core::config::EffectsConfig,
     padding: f32,
 ) {
@@ -5224,7 +6438,7 @@ fn paint_grid_native(
                 term.grid_text()
                     .unwrap_or_default()
                     .lines()
-                    .map(|line| vec![(line.to_string(), default_fg)])
+                    .map(|line| vec![(line.to_string(), pane_term::RunStyle::plain(default_fg))])
                     .collect(),
             )
         }
@@ -5252,13 +6466,62 @@ fn paint_grid_native(
     // (advanced by each glyph's cell width) is the true grid column. Blank cells
     // are skipped (the background is already painted); this also bounds the glyph
     // count to the non-blank glyphs actually on screen.
+    // --- PASS 1: per-cell BACKGROUNDS -------------------------------------
+    // Every cell whose resolved background is NOT the window default gets a
+    // filled quad, painted BEFORE any glyph so the text sits on top of it. This
+    // is what makes `grep --color`, `ls` directory colours, `git diff`, fzf's
+    // selected row, starship segments and every TUI's selected row show their
+    // coloured block — the runs used to carry only a foreground, so all of that
+    // rendered as plain text on the window background. It is also what makes
+    // reverse video (SGR `7`) visible at all: with no quad, an inverse cell drew
+    // its BACKGROUND colour as text onto an unchanged background.
+    //
+    // `row_cell_spans` merges neighbouring same-style runs, so a highlighted
+    // region is ONE quad rather than one per glyph, and the quads are snapped to
+    // the physical pixel grid: adjacent spans share a snapped boundary, so they
+    // tile exactly with no hairline seam and no overlap at any DPI.
+    let bold_font = egui::FontId::new(font_size, fonts::bold_monospace_family());
+    let faux_bold = !fonts::bold_face_available();
+    for (row_idx, runs) in rows.iter().enumerate() {
+        let row_y = origin.y + row_idx as f32 * ch;
+        let y0 = snap_to_physical(row_y, ppp);
+        let y1 = snap_to_physical(row_y + ch, ppp);
+        for span in pane_term::row_cell_spans(runs) {
+            let Some(bg) = span.style.bg else {
+                continue; // window default — the common case, no quad needed
+            };
+            let x0 = snap_to_physical(origin.x + span.col as f32 * cw, ppp);
+            let x1 = snap_to_physical(origin.x + (span.col + span.width) as f32 * cw, ppp);
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)),
+                0.0,
+                egui::Color32::from_rgb(bg.0, bg.1, bg.2),
+            );
+        }
+    }
+
+    // --- PASS 2: glyphs ----------------------------------------------------
     for (row_idx, runs) in rows.iter().enumerate() {
         let row_y = origin.y + row_idx as f32 * ch;
         // `row_glyph_cells` is the single source of truth for per-cell X: each
         // painted glyph paired with its grid cell column (wide glyphs advance 2,
         // blanks skipped). Positions are COMPUTED from the cell column, never
         // accumulated from glyph advances — see its doc + unit tests.
-        for (c, rgb, col_cells) in pane_term::row_glyph_cells(runs) {
+        for (c, style, col_cells) in pane_term::row_glyph_cells(runs) {
+            let rgb = style.fg;
+            let attrs = glyph_cache::GlyphAttrs {
+                bold: style.bold,
+                italic: style.italic,
+            };
+            // A bold cell is drawn with the dedicated bold FAMILY (egui's FontId
+            // selects a family, not a weight). When the machine has no bold cut
+            // that family mirrors the regular stack, so the glyph is additionally
+            // double-struck a half physical pixel to the right — faux bold, the
+            // same fallback every terminal uses rather than drawing SGR-1 thin.
+            let glyph_font = if style.bold { &bold_font } else { &font };
             let cell_origin = egui::pos2(origin.x + col_cells as f32 * cw, row_y);
             // --- chromatic aberration (CRT effect, off by default): pure-
             // channel ghosts at ±offset BEHIND the crisp glyph (red left,
@@ -5269,15 +6532,15 @@ fn paint_grid_native(
                 let red = egui::Color32::from_rgba_unmultiplied(255, 0, 0, ghost_alpha);
                 let red_g = galley_cache.glyph(
                     painter,
-                    glyph_cache_key(c, (ghost_alpha, 0, 1), RowPass::GhostRed, style_key),
-                    || build_glyph_job(c, &font, red),
+                    glyph_cache_key(c, (ghost_alpha, 0, 1), RowPass::GhostRed, style_key, attrs),
+                    || build_glyph_job(c, glyph_font, red, attrs),
                 );
                 painter.galley(cell_origin + egui::vec2(-off, 0.0), red_g, default_fg32);
                 let blue = egui::Color32::from_rgba_unmultiplied(0, 0, 255, ghost_alpha);
                 let blue_g = galley_cache.glyph(
                     painter,
-                    glyph_cache_key(c, (ghost_alpha, 0, 2), RowPass::GhostBlue, style_key),
-                    || build_glyph_job(c, &font, blue),
+                    glyph_cache_key(c, (ghost_alpha, 0, 2), RowPass::GhostBlue, style_key, attrs),
+                    || build_glyph_job(c, glyph_font, blue, attrs),
                 );
                 painter.galley(cell_origin + egui::vec2(off, 0.0), blue_g, default_fg32);
             }
@@ -5285,10 +6548,85 @@ fn paint_grid_native(
             let color = egui::Color32::from_rgb(rgb.0, rgb.1, rgb.2);
             let main_g = galley_cache.glyph(
                 painter,
-                glyph_cache_key(c, rgb, RowPass::Main, style_key),
-                || build_glyph_job(c, &font, color),
+                glyph_cache_key(c, rgb, RowPass::Main, style_key, attrs),
+                || build_glyph_job(c, glyph_font, color, attrs),
             );
+            // Faux bold: no bold cut is installed, so double-strike the SAME
+            // galley half a PHYSICAL pixel right, UNDER the crisp pass. That
+            // thickens the stem at any DPI without shifting the cell (the offset
+            // is sub-cell), which is how a terminal shows SGR-1 on a font that
+            // ships only one weight.
+            if style.bold && faux_bold {
+                painter.galley(
+                    cell_origin + egui::vec2(0.5 / ppp.max(0.01), 0.0),
+                    std::sync::Arc::clone(&main_g),
+                    default_fg32,
+                );
+            }
             painter.galley(cell_origin, main_g, default_fg32);
+        }
+    }
+
+    // --- PASS 3: line decorations -----------------------------------------
+    // Underlines (including the `4:0..5` styled variants and the SGR 58/59
+    // underline colour) and strikethrough are drawn ANALYTICALLY per contiguous
+    // span rather than baked into each glyph's galley. Per-span is what makes an
+    // underline continuous across a word instead of one dash per glyph, and
+    // analytic is what makes the curly variant survive HiDPI — a sampled sine
+    // scales with `pixels_per_point`, a pre-rendered squiggle glyph does not.
+    for (row_idx, runs) in rows.iter().enumerate() {
+        let row_y = origin.y + row_idx as f32 * ch;
+        for span in pane_term::row_cell_spans(runs) {
+            if !span.style.has_decoration() {
+                continue;
+            }
+            let x0 = origin.x + span.col as f32 * cw;
+            let x1 = origin.x + (span.col + span.width) as f32 * cw;
+            // At least one PHYSICAL pixel, so a decoration is never sub-pixel and
+            // invisible on a low-DPI display.
+            let thickness = (ch * 0.06).max(1.0 / ppp.max(0.01));
+            let deco_rgb = span.style.underline_color.unwrap_or(span.style.fg);
+            let deco = egui::Color32::from_rgb(deco_rgb.0, deco_rgb.1, deco_rgb.2);
+            if span.style.underline != c0pl4nd_core::grid::UnderlineStyle::None {
+                paint_underline(
+                    painter,
+                    x0,
+                    x1,
+                    row_y + ch - thickness * 2.0,
+                    thickness,
+                    deco,
+                    span.style.underline,
+                    ppp,
+                );
+            }
+            if span.style.strikeout {
+                // Strikethrough always takes the TEXT colour: SGR 58 scopes the
+                // custom colour to the underline only.
+                let fg = span.style.fg;
+                let y = snap_to_physical(row_y + ch * 0.55, ppp);
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0, y),
+                        egui::pos2(x1, y + thickness.max(1.0 / ppp.max(0.01))),
+                    ),
+                    0.0,
+                    egui::Color32::from_rgb(fg.0, fg.1, fg.2),
+                );
+            }
+            if span.style.overline {
+                // SGR 53: a line along the TOP of the cell, in the TEXT colour
+                // (like strikeout, the custom SGR-58 colour is underline-scoped).
+                let fg = span.style.fg;
+                let y = snap_to_physical(row_y, ppp);
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0, y),
+                        egui::pos2(x1, y + thickness.max(1.0 / ppp.max(0.01))),
+                    ),
+                    0.0,
+                    egui::Color32::from_rgb(fg.0, fg.1, fg.2),
+                );
+            }
         }
     }
 
@@ -5298,14 +6636,14 @@ fn paint_grid_native(
         let cell = egui::Rect::from_min_size(cell_min, egui::vec2(cw, ch));
         let cur = c0pl4nd_core::theme::parse_hex(&theme.cursor).unwrap_or((0, 255, 144));
         let col32 = egui::Color32::from_rgb(cur.0, cur.1, cur.2);
-        // Blink only on the focused pane (and only if configured). The live
-        // window repaints every frame, so the phase animates without an explicit
-        // repaint request; headless tests see a steady ON frame.
-        let on = if cursor_cfg.blink && focused {
-            (painter.ctx().input(|i| i.time) / 1.06).fract() < 0.5
-        } else {
-            true
-        };
+        // Blink only on the focused pane (and only if configured), with an
+        // optional pinned phase for deterministic visual-QA capture.
+        let on = cursor_blink_on(
+            cursor_blink_phase,
+            cursor_cfg.blink,
+            focused,
+            painter.ctx().input(|i| i.time),
+        );
         if on {
             match cursor_cfg.style {
                 c0pl4nd_core::config::CursorStyle::Block => {
@@ -5422,6 +6760,25 @@ fn quote_path_for_shell(path: &std::path::Path, shell_label: &str) -> String {
 /// whose text is already delivered via `egui::Event::Text` (ordinary printable
 /// characters), so they are not double-sent. Ctrl-letter chords ARE encoded
 /// here (egui does not emit `Event::Text` for them) into their C0 control byte.
+/// Rebuild the `Event::Key` that `egui-winit` swallowed when it converted a
+/// clipboard chord into `Event::Copy` / `Event::Cut`.
+///
+/// `Event::Copy`/`Event::Cut` carry no key and no modifiers, so the chord is
+/// reconstructed from the frame's modifier snapshot plus the key the predicate
+/// that fired implies (`C` for copy, `X` for cut). Feeding this back into the
+/// event queue lets the ONE existing PTY encoder ([`egui_key_to_logical`] +
+/// `PaneTerm::forward_key`) produce the control byte, instead of a second
+/// hand-rolled `write_bytes` path that would bypass the kitty keyboard protocol.
+fn restored_chord_key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    }
+}
+
 fn egui_key_to_logical(
     key: egui::Key,
     mods: c0pl4nd_core::term::KeyModifiers,
@@ -5556,8 +6913,116 @@ mod resize_tests {
 }
 
 #[cfg(test)]
+#[path = "close_path_tests.rs"]
+mod close_path_tests;
+#[cfg(test)]
+mod pty_gate;
+#[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;
+#[cfg(test)]
+mod config_guard_tests {
+    //! The shipping data-loss path: when the startup load FAILED, `self.config`
+    //! is `Config::default()`, so any save replaces the user's file with
+    //! defaults — and `prepare_shutdown` performs one on EVERY window close, so
+    //! launching with a bad config and quitting was enough to destroy it. The
+    //! write seam must set the original aside first.
+    use super::C0pl4ndApp;
+
+    fn headless_app() -> C0pl4ndApp {
+        C0pl4ndApp::bootstrap_with(c0pl4nd_core::Config::default())
+    }
+
+    #[test]
+    fn the_first_save_of_an_unreadable_config_session_sets_the_original_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let bak = dir.path().join("config.toml.bak");
+        // What a user's file looks like when the load failed: real settings,
+        // one value out of range. `self.config` is defaults, so these values
+        // exist NOWHERE in the process — only in this file.
+        let original = "theme = \"ghost-paper\"\nopacity = 1.5\nscrollback_lines = 42\n";
+        std::fs::write(&path, original).unwrap();
+
+        let mut app = headless_app();
+        app.config_unreadable = true;
+        app.save_config_guarded(&path, "Your settings");
+
+        assert_eq!(
+            std::fs::read_to_string(&bak).expect("the original must be set aside"),
+            original,
+            "the user's bytes are preserved verbatim, not overwritten"
+        );
+        let toast = app.toast.clone().expect("the user must be told");
+        assert!(
+            toast.contains("config.toml.bak"),
+            "the toast must name the backup path, else the file is unfindable: {toast}"
+        );
+        assert!(
+            c0pl4nd_core::Config::load_from(&path).is_ok(),
+            "and the new settings are written and loadable"
+        );
+
+        // One quarantine per session: a SECOND save must not roll the backup
+        // forward and lose the original (the whole point of keeping it).
+        app.config.theme = "itasha-corp".to_string();
+        app.save_config_guarded(&path, "Your settings");
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            original,
+            "the second save must not overwrite the backup with our own output"
+        );
+    }
+
+    #[test]
+    fn a_readable_config_session_never_quarantines_and_merges_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let bak = dir.path().join("config.toml.bak");
+        std::fs::write(&path, "theme = \"ghost-paper\"\nfrom_a_newer_build = 7\n").unwrap();
+
+        let mut app = headless_app();
+        assert!(
+            !app.config_unreadable,
+            "a bootstrapped app has no failed load to recover from"
+        );
+        app.save_config_guarded(&path, "Your settings");
+
+        assert!(
+            !bak.exists(),
+            "a config that loaded fine must never be set aside"
+        );
+        // Asserted on the raw text rather than a parsed `toml::Table`: `toml`
+        // is a dependency of `c0pl4nd-core`, not of this crate, and the merge is
+        // already asserted structurally by the core suite. What matters here is
+        // that routing through the guarded seam did not lose it.
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("from_a_newer_build = 7"),
+            "the merging save must preserve a key this build has no field for; \
+             file is now:\n{written}"
+        );
+    }
+
+    #[test]
+    fn a_config_that_vanished_after_a_failed_load_is_still_saved() {
+        // Nothing to preserve, so refusing the write would strand the user's
+        // change for no benefit.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut app = headless_app();
+        app.config_unreadable = true;
+        app.save_config_guarded(&path, "Your settings");
+
+        assert!(
+            path.exists(),
+            "the save proceeds when there is nothing to lose"
+        );
+        assert!(!dir.path().join("config.toml.bak").exists());
+    }
+}
+
 #[cfg(test)]
 mod config_load_tests {
     //! F5-2: a present-but-broken config file must surface an error (so the host
@@ -5605,5 +7070,131 @@ mod config_load_tests {
         let (cfg, err) = load_config_from(Some(path));
         assert_eq!(cfg.theme, "ghost-paper");
         assert!(err.is_none());
+    }
+}
+
+#[cfg(test)]
+mod forced_colors_wiring_tests {
+    //! The OS high-contrast auto-select, at the seam that actually MUTATES the
+    //! loaded config. `c0pl4nd_core::forced_colors` tests the precedence rule as
+    //! a pure function; these test that this crate applies that rule to a real
+    //! `Config` and to `follow_os_theme_tick`, which is where getting it
+    //! backwards would silently discard a user's deliberate theme choice.
+    use super::{apply_forced_colors_auto_theme_with, C0pl4ndApp};
+
+    /// THE precedence contract at the wiring layer: a config carrying an
+    /// explicit theme choice must come back UNCHANGED even while the OS is
+    /// asking for high contrast.
+    #[test]
+    fn an_explicit_theme_choice_survives_the_os_high_contrast_request() {
+        for chosen in ["phosphor-amber", "ghost-paper", "itasha-void-high-contrast"] {
+            let mut cfg = c0pl4nd_core::Config {
+                theme: chosen.to_string(),
+                ..Default::default()
+            };
+            let applied = apply_forced_colors_auto_theme_with(&mut cfg, true);
+            assert!(
+                !applied,
+                "{chosen:?} is an explicit choice — auto-select must not report a change"
+            );
+            assert_eq!(
+                cfg.theme, chosen,
+                "{chosen:?} must survive an OS high-contrast request"
+            );
+        }
+    }
+
+    /// The other half: an untouched default DOES follow the OS request.
+    #[test]
+    fn an_untouched_default_theme_follows_the_os_high_contrast_request() {
+        let mut cfg = c0pl4nd_core::Config::default();
+        let applied = apply_forced_colors_auto_theme_with(&mut cfg, true);
+        assert!(applied, "an unchosen theme must follow the OS request");
+        assert_eq!(cfg.theme, c0pl4nd_core::forced_colors::HIGH_CONTRAST_THEME);
+    }
+
+    /// No OS request → nothing is touched, whatever the theme is.
+    #[test]
+    fn without_an_os_request_the_theme_is_never_touched() {
+        let mut cfg = c0pl4nd_core::Config::default();
+        let default_theme = cfg.theme.clone();
+        assert!(!apply_forced_colors_auto_theme_with(&mut cfg, false));
+        assert_eq!(cfg.theme, default_theme);
+    }
+
+    /// The headless bootstrap must NOT inherit the host machine's real
+    /// accessibility settings, or every other test in this suite would behave
+    /// differently on a developer running High Contrast.
+    #[test]
+    fn the_headless_bootstrap_reports_no_forced_colors() {
+        assert!(
+            !C0pl4ndApp::bootstrap().forced_colors,
+            "bootstrap must not sample the host OS — tests would vary by machine"
+        );
+    }
+
+    /// While forced colors are on, the dark/light follow must not run at all —
+    /// otherwise it would swap the high-contrast theme back for a brand theme
+    /// on the next observed frame and undo the accessibility selection.
+    /// `last_os_theme` must also survive, so turning high contrast OFF does not
+    /// re-apply a stale observation.
+    #[test]
+    fn forced_colors_suppresses_the_os_theme_follow_without_forgetting_it() {
+        let ctx = egui::Context::default();
+        let mut app = C0pl4ndApp::bootstrap();
+        app.config.follow_os_theme = true;
+        app.forced_colors = true;
+        app.config.theme = c0pl4nd_core::forced_colors::HIGH_CONTRAST_THEME.to_string();
+        app.last_os_theme = Some(egui::Theme::Dark);
+
+        app.follow_os_theme_tick(&ctx);
+
+        assert_eq!(
+            app.config.theme,
+            c0pl4nd_core::forced_colors::HIGH_CONTRAST_THEME,
+            "the follow must not override the high-contrast theme"
+        );
+        assert_eq!(
+            app.last_os_theme,
+            Some(egui::Theme::Dark),
+            "the tracked appearance must be kept, not forgotten"
+        );
+    }
+}
+
+#[cfg(test)]
+mod changelog_wiring_tests {
+    //! The in-app changelog panel reads `c0pl4nd_core::changelog::current()`.
+    //! These assert the binary-level contract the panel depends on: the entry it
+    //! renders is for THIS build, and it is never blank-with-no-explanation.
+
+    /// The panel must always have something to render — either a body, or a
+    /// notice explaining why there is none. A blank panel with no explanation is
+    /// the failure mode this feature exists to avoid.
+    #[test]
+    fn the_panel_always_has_something_to_render() {
+        let entry = c0pl4nd_core::changelog::current();
+        assert!(
+            !entry.is_empty() || entry.notice.is_some(),
+            "an empty changelog body MUST carry a notice explaining itself"
+        );
+        assert!(!entry.heading.is_empty(), "the panel needs a heading");
+    }
+
+    /// The embedded changelog is the one shipping in THIS binary, so the entry
+    /// resolves against this crate's own version, not some other tree's.
+    #[test]
+    fn the_entry_resolves_for_this_builds_version() {
+        let entry = c0pl4nd_core::changelog::current();
+        let version = env!("CARGO_PKG_VERSION");
+        // Either the running version's own section (heading names it) or an
+        // announced fallback that names the version it looked for.
+        let names_version = entry.heading.contains(version)
+            || entry.notice.as_deref().is_some_and(|n| n.contains(version));
+        assert!(
+            names_version,
+            "heading {:?} / notice {:?} must reference v{version}",
+            entry.heading, entry.notice
+        );
     }
 }

@@ -16,6 +16,27 @@
 //! 4. clamp `WM_GETMINMAXINFO` to the monitor work area so a maximized window
 //!    does not cover the taskbar.
 //!
+//! ## Relationship to the SHIPPING window's `egui_app::win_chrome`
+//!
+//! This module belongs to the PRESERVED `c0pl4nd-legacy` binary (`main.rs` ->
+//! `window.rs`), which is gated behind the default-OFF `legacy-winit` feature.
+//! The canonical `c0pl4nd` binary never links it: its frame comes from winit
+//! (which already zeroes `WM_NCCALCSIZE` on an undecorated window) plus the
+//! additive `egui_app::win_chrome` caption subclass.
+//!
+//! Step 4 above — the `WM_GETMINMAXINFO` work-area clamp — has been PORTED to
+//! `win_chrome` so the shipping window gets it too. It is a port, not a move:
+//! this copy stays because it is the legacy binary's own frame, and the ported
+//! copy deliberately differs (it does not clamp `ptMaxTrackSize`, and it runs
+//! AFTER the subclass chain rather than before). Steps 1-3 are NOT ported —
+//! winit supplies the equivalent on the shipping window, and re-adding them
+//! there would fight its frameless composition. See `win_chrome`'s PORT NOTEs.
+//!
+//! **Do not delete this module.** It has live static importers (`window.rs`
+//! calls `install`, `set_interactive_zones`, and `flash_taskbar`), it is a
+//! declared `[[bin]]` target in `Cargo.toml`, and `ci.yml` lints it on every
+//! push via `cargo clippy --bin c0pl4nd-legacy --features legacy-winit`.
+//!
 //! All of this is installed via `SetWindowSubclass` so winit's own wndproc keeps
 //! running for everything we don't intercept. Entirely `#[cfg(windows)]`; the
 //! caller no-ops elsewhere. This module owns ONLY the native frame — the GPU

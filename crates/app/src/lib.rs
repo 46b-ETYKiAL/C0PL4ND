@@ -29,7 +29,22 @@
 //! modules can stay where they are. `panic_hook` resolves `crate::reporting`
 //! through the binary's root re-export.
 
+/// `--cwd <path>` / `-d <path>` parsing + the one-shot startup-directory store
+/// the initial pane's PTY spawn consumes. In the lib (not a binary module) so
+/// the wiring suites in `tests/` drive the SAME store the shipping binary sets.
+pub mod cli_cwd;
+/// Host-side system-clipboard READ, the answering half of an opted-in OSC 52
+/// clipboard query. The only place in C0PL4ND that pulls text off the OS
+/// clipboard; always called behind the core's default-off gate.
+pub mod clipboard_read;
 pub mod egui_app;
 pub mod issue_intake;
+/// Real Windows desktop notifications (WinRT toasts) for OSC 9 / OSC 777, plus
+/// the pure suppression/sanitising/escaping decisions behind them and the
+/// `System.AppUserModel.ID` the installer shortcut must carry. A lib-root
+/// module (not `egui_app::notify`) because `egui_app`'s submodules are private,
+/// which would make this unreachable — and therefore dead — until its call site
+/// in the pump lands; see the module docs for that seam.
+pub mod notify;
 pub mod reporting;
 pub mod user_error;

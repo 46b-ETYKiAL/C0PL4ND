@@ -16,25 +16,146 @@
 //!   runs ready for the paint layer, reusing [`Theme::cell_colors`] so the
 //!   foreground/background/inverse handling matches the winit renderer exactly.
 //!
-//! The glyphon GPU paint itself lives in [`super::term_render`]; this module is
-//! UI-toolkit-free (no egui, no wgpu) so it can be driven headlessly with
-//! simulated input — which is exactly the "typing reaches the PTY and the grid
-//! updates" class of bug Milestone 2 must guard against.
+//! This module produces no pixels. The paint itself is `paint_grid_native` in
+//! [`super`] (`egui_app/mod.rs`): it consumes the [`RunStyle`]-tagged rows from
+//! [`PaneTerm::grid_rows`] and draws them with egui's OWN text painter — the
+//! same rasteriser that draws the chrome. There is no `term_render` module and
+//! no glyphon paint: the glyphon GPU paths (in-pass callback AND offscreen
+//! texture) composited black inside `egui_tiles` panes on the real eframe/winit
+//! swapchain, so that path was removed in favour of native egui text (see the
+//! `paint_grid_native` doc comment for the full rationale). `glyphon` survives
+//! in the tree only for the legacy winit-driven `c0pl4nd-legacy` binary, which
+//! does not use this module at all.
+//!
+//! Keeping the paint out of here is deliberate: this module is UI-toolkit-free
+//! (no egui, no wgpu) so it can be driven headlessly with simulated input —
+//! which is exactly the "typing reaches the PTY and the grid updates" class of
+//! bug Milestone 2 must guard against.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use c0pl4nd_core::term::{
     encode_key, encode_key_kitty, ColorSet, KeyEventKind, KeyModifiers, LogicalKey, MouseButton,
-    MouseEventKind, MouseMode, MouseModifiers,
+    MouseEventKind, MouseMode, MouseModifiers, Notification, Progress,
 };
 use c0pl4nd_core::{Session, Theme};
 
-/// A foreground colour run: a string of consecutive same-colour glyphs and the
-/// RGB triple they render in. The egui paint layer turns these into glyphon
-/// `Attrs`; keeping the type as a plain `(String, (u8,u8,u8))` keeps this module
-/// free of any glyphon/egui dependency (so it stays headlessly testable).
-pub type ColorRun = (String, (u8, u8, u8));
+/// The fully-resolved rendition of one terminal cell: the colours [`Theme::cell_colors`]
+/// produced plus the SGR attribute bits the core parsed. This is the ONLY colour
+/// carrier the paint layer sees — the renderer never re-derives a colour, it just
+/// draws what the core resolved (one source of truth, per the theme API contract).
+///
+/// `bg` is `Option` exactly as [`Theme::cell_colors`] returns it: `None` means
+/// "the window default background", which the renderer SKIPS painting a quad for
+/// (the overwhelmingly common case — a default-background cell needs no quad).
+/// A `Some(_)` background is what makes `grep --color`, `ls` directory colours,
+/// `git diff`, fzf's selected row and every TUI's selected row show their block.
+///
+/// Plain data (no egui / glyphon types) so this module stays headlessly testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunStyle {
+    /// Effective foreground RGB (inverse already applied by `Theme::cell_colors`).
+    pub fg: (u8, u8, u8),
+    /// Effective background RGB, or `None` for the window default (skip the quad).
+    pub bg: Option<(u8, u8, u8)>,
+    /// SGR `1` — render with a bold face (or faux-bold when none is installed).
+    pub bold: bool,
+    /// SGR `3` — render italic/oblique.
+    pub italic: bool,
+    /// SGR `4` / `4:0..5` — the styled-underline selection.
+    pub underline: c0pl4nd_core::grid::UnderlineStyle,
+    /// SGR `58`/`59` — the underline's own colour, or `None` to use [`Self::fg`].
+    pub underline_color: Option<(u8, u8, u8)>,
+    /// SGR `9` — crossed-out.
+    pub strikeout: bool,
+    /// SGR `53` — a line ABOVE the cell (overline). Parsed into `CellFlags` but
+    /// previously dropped at this boundary, so `\e[53m` had no visible effect.
+    pub overline: bool,
+}
+
+impl RunStyle {
+    /// A plain run in `fg` on the default background with no attributes — the
+    /// shape the dead-session mono fallback and the pure-colour tests want.
+    pub const fn plain(fg: (u8, u8, u8)) -> Self {
+        RunStyle {
+            fg,
+            bg: None,
+            bold: false,
+            italic: false,
+            underline: c0pl4nd_core::grid::UnderlineStyle::None,
+            underline_color: None,
+            strikeout: false,
+            overline: false,
+        }
+    }
+
+    /// Whether this run draws any line decoration (underline / strikeout /
+    /// overline), i.e. whether the renderer's decoration pass has anything to do.
+    pub fn has_decoration(&self) -> bool {
+        self.strikeout
+            || self.overline
+            || self.underline != c0pl4nd_core::grid::UnderlineStyle::None
+    }
+}
+
+/// A colour run: a string of consecutive glyphs that share one fully-resolved
+/// [`RunStyle`], and that style. The egui paint layer turns each run into
+/// background quads, glyph galleys, and line decorations; keeping the payload a
+/// plain data struct keeps this module free of any egui/glyphon dependency.
+pub type ColorRun = (String, RunStyle);
+
+/// One contiguous horizontal span of grid CELLS that share a [`RunStyle`]:
+/// `col..col + width` on a single row. Produced by [`row_cell_spans`] and
+/// consumed by the renderer's background-quad and line-decoration passes, both
+/// of which want per-span rectangles rather than per-glyph positions.
+///
+/// Unlike [`row_glyph_cells`], BLANK cells are INCLUDED — a run of spaces with a
+/// coloured background is precisely the highlighted block a terminal must draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellSpan {
+    /// First grid column of the span (0-based).
+    pub col: usize,
+    /// Span width in grid CELLS (a wide glyph contributes 2).
+    pub width: usize,
+    /// The rendition every cell in the span shares.
+    pub style: RunStyle,
+}
+
+/// Project one row's runs onto contiguous [`CellSpan`]s, MERGING neighbouring
+/// runs that resolved to the same [`RunStyle`].
+///
+/// Merging matters for correctness, not just batching: two adjacent quads that
+/// meet at a fractional-pixel boundary can leave a visible hairline seam, so the
+/// renderer wants the widest possible span. `build_color_runs` already splits a
+/// wide glyph into its own run even when its style matches its neighbours, and
+/// this re-joins those — a coloured background behind CJK text is one solid
+/// block, not one quad per glyph.
+pub fn row_cell_spans(runs: &[ColorRun]) -> Vec<CellSpan> {
+    let mut out: Vec<CellSpan> = Vec::new();
+    let mut col = 0usize;
+    for (text, style) in runs {
+        let width: usize = text.chars().map(cell_render_width).sum();
+        if width == 0 {
+            continue;
+        }
+        match out.last_mut() {
+            // Merge with the previous span when the style matches AND the spans
+            // actually touch (they always do here, but the check keeps the
+            // function total for hand-built inputs).
+            Some(prev) if prev.style == *style && prev.col + prev.width == col => {
+                prev.width += width;
+            }
+            _ => out.push(CellSpan {
+                col,
+                width,
+                style: *style,
+            }),
+        }
+        col += width;
+    }
+    out
+}
 
 /// The number of terminal CELLS a glyph occupies: 2 for an East-Asian wide /
 /// fullwidth glyph (and wide emoji), 1 otherwise. Mirrors the core VT layer's
@@ -87,13 +208,13 @@ fn copy_row_text(row: &[c0pl4nd_core::Cell], lo: usize, hi: usize) -> String {
 /// another cell — the failure mode that reverted the per-run approach). Pulling
 /// it out as a pure function makes wide-glyph alignment unit-testable WITHOUT a
 /// live display.
-pub fn row_glyph_cells(runs: &[ColorRun]) -> Vec<(char, (u8, u8, u8), usize)> {
+pub fn row_glyph_cells(runs: &[ColorRun]) -> Vec<(char, RunStyle, usize)> {
     let mut out = Vec::new();
     let mut col = 0usize;
-    for (text, rgb) in runs {
+    for (text, style) in runs {
         for c in text.chars() {
             if c != ' ' {
-                out.push((c, *rgb, col));
+                out.push((c, *style, col));
             }
             col += cell_render_width(c);
         }
@@ -124,33 +245,37 @@ fn build_color_runs(
     cells: &[c0pl4nd_core::Cell],
     cols: usize,
     default_cell: &c0pl4nd_core::Cell,
-    mut color_of: impl FnMut(&c0pl4nd_core::Cell) -> (u8, u8, u8),
+    mut style_of: impl FnMut(&c0pl4nd_core::Cell) -> RunStyle,
 ) -> Vec<ColorRun> {
     let mut runs: Vec<ColorRun> = Vec::new();
     let mut run = String::new();
-    let mut run_color: Option<(u8, u8, u8)> = None;
+    let mut run_style: Option<RunStyle> = None;
     let mut col = 0;
     while col < cols {
         let cell = cells.get(col).unwrap_or(default_cell);
-        let fg = color_of(cell);
+        let style = style_of(cell);
         if cell_render_width(cell.c) >= 2 {
-            if let Some(pc) = run_color.take() {
+            if let Some(pc) = run_style.take() {
                 runs.push((std::mem::take(&mut run), pc));
             }
-            runs.push((cell.c.to_string(), fg));
+            runs.push((cell.c.to_string(), style));
             col += 2; // skip the trailing continuation spacer cell
             continue;
         }
-        if run_color != Some(fg) {
-            if let Some(pc) = run_color.take() {
+        // Break the run on ANY rendition change — background included. Breaking
+        // only on foreground (the pre-background behaviour) would merge a
+        // highlighted cell into its unhighlighted neighbour's run and lose the
+        // background boundary entirely.
+        if run_style != Some(style) {
+            if let Some(pc) = run_style.take() {
                 runs.push((std::mem::take(&mut run), pc));
             }
-            run_color = Some(fg);
+            run_style = Some(style);
         }
         run.push(cell.c);
         col += 1;
     }
-    if let Some(pc) = run_color {
+    if let Some(pc) = run_style {
         runs.push((run, pc));
     }
     runs
@@ -228,11 +353,23 @@ pub struct HostEffects {
     /// OSC 4 / 10 / 11 / 12 / 104 color set/reset requests. The app applies each
     /// to its live theme and repaints.
     pub color_sets: Vec<ColorSet>,
-    /// `true` if a desktop notification (OSC 9 / OSC 777) fired this drain. The
-    /// app requests user attention (taskbar flash) when the window is unfocused.
-    /// The notification TEXT is deliberately not surfaced — it can carry 2FA
-    /// codes / secret URLs and must never be logged (privacy).
-    pub notified: bool,
+    /// Desktop notifications (OSC 9 / OSC 777) drained this frame, in emit
+    /// order. The app raises the LAST one as a real OS toast and flashes the
+    /// taskbar, both while the window is unfocused (`crate::notify::plan`).
+    ///
+    /// This used to be a bare `notified: bool` that threw the text away, on the
+    /// stated ground that a payload can carry a 2FA code or a secret URL. That
+    /// constraint is about **logging**, not about **showing**: showing it to the
+    /// user at the moment they asked for it is the entire point of OSC 9, and
+    /// every peer emulator does it. Nothing here or downstream traces, logs, or
+    /// persists the payload — it is built into a toast XML string, handed to the
+    /// shell, and dropped (see `crate::notify`).
+    pub notifications: Vec<Notification>,
+    /// `OSC 9 ; 4` taskbar-progress reports (C26) drained this frame, in emit
+    /// order. The app drives the Windows taskbar-button progress segment from
+    /// the LATEST one (`super::taskbar`). Empty in the common case; a build tool
+    /// streaming progress fills it.
+    pub progress: Vec<Progress>,
 }
 
 /// Write bytes to a pane's PTY, logging a failure ONLY when the session is
@@ -289,6 +426,29 @@ fn image_display_row(line: usize, window_start: usize, rows: usize) -> Option<i3
         return None;
     }
     Some(row as i32)
+}
+
+/// Whether the OSC 133 command marks say a command is STILL RUNNING.
+///
+/// The shell brackets each command with `;C` (output starts) and `;D` (command
+/// finished). The marks arrive in order and are only ever evicted from the FRONT
+/// under the core's flood cap, so the ordering holds: a command is in flight
+/// exactly when the LAST mark is a `;C` that no `;D` has closed.
+///
+/// **Limit — this reports what the SHELL reports.** A shell with no OSC 133
+/// prompt integration emits no marks at all, so an empty slice is `false`: we
+/// genuinely cannot tell, and a close-confirmation that fired on every close for
+/// an unintegrated shell would be worse than none. This is deliberately the
+/// conservative direction (miss rather than nag); it is the same constraint
+/// [`PaneTerm::last_command_exit_code`] already documents for the status bar.
+/// Pure, so the rule is exhaustively unit-tested with no shell and no PTY.
+#[must_use]
+fn command_in_flight(marks: &[c0pl4nd_core::term::osc::CommandMark]) -> bool {
+    use c0pl4nd_core::term::osc::CommandMarkKind;
+    matches!(
+        marks.last().map(|m| m.kind),
+        Some(CommandMarkKind::OutputStart)
+    )
 }
 
 /// One pane's live terminal. Owns the PTY session and the rendering inputs the
@@ -422,7 +582,42 @@ impl PaneTerm {
     /// same deliberate test-facing-public-API pattern the chrome accessors use.
     #[allow(dead_code)]
     pub fn spawn_program(theme: Theme, program: &str, args: &[&str], cols: u16, rows: u16) -> Self {
-        match Session::spawn_program(program, args, rows, cols) {
+        Self::spawn_program_in(theme, program, args, cols, rows, None)
+    }
+
+    /// Like [`spawn_program`](Self::spawn_program) but starts the program in an
+    /// explicit working directory — the named-shell-profile counterpart to
+    /// [`spawn_in_with_term`](Self::spawn_in_with_term).
+    ///
+    /// Why it exists: `spawn_term_in` in `egui_app/mod.rs` picks ONE of two
+    /// branches — the default profile (program `None`) takes
+    /// `spawn_in_with_term` and carries the cwd, while a NAMED profile took
+    /// `spawn_program`, which had no cwd parameter at all. So reopening a closed
+    /// pane (or restoring a layout) under a named profile silently landed in the
+    /// default directory. One missing parameter, both paths; this is the variant
+    /// that closes it.
+    ///
+    /// `cwd = None` is the shell's own default directory. A `cwd` that no longer
+    /// names an existing directory falls back to home inside the core spawn (a
+    /// stale restored cwd is not an error), and a failed spawn degrades to an
+    /// error label, never a panic — identical to
+    /// [`spawn_program`](Self::spawn_program), which now delegates here so the
+    /// two can never drift apart.
+    ///
+    /// WIRED: `egui_app::spawn_pane_term` — the ONE spawn funnel both
+    /// `spawn_term_in` (the split / new-tab / reopen path) and the deferred
+    /// first-spawn in `render_pane_body` go through — calls this for every named
+    /// profile. The `allow(dead_code)` it carried while that call site was
+    /// outside the owning change is gone.
+    pub fn spawn_program_in(
+        theme: Theme,
+        program: &str,
+        args: &[&str],
+        cols: u16,
+        rows: u16,
+        cwd: Option<&str>,
+    ) -> Self {
+        match Session::spawn_program_in(program, args, rows, cols, cwd) {
             Ok(session) => {
                 // P0.3: enroll the shell in the kill-on-close job so it (and its
                 // descendants) cannot outlive the app, even on a hard exit/crash.
@@ -542,14 +737,16 @@ impl PaneTerm {
     ///   focus reports) are written STRAIGHT BACK to THIS pane's PTY — they are
     ///   answers this terminal owes the program running in it.
     /// - **Host-global effects** (OSC 52 clipboard writes, OSC 4/10/11/12/104
-    ///   color *sets*, OSC 9/777 notifications) are returned in [`HostEffects`]
-    ///   for the app shell to apply once.
+    ///   color *sets*, OSC 9/777 notifications, `OSC 9 ; 4` taskbar progress)
+    ///   are returned in [`HostEffects`] for the app shell to apply once.
     ///
-    /// Also drains the `OSC 9 ; 4` taskbar-progress queue (currently no UI) so
-    /// it cannot grow without bound while a build tool streams progress. Without
-    /// this whole drain the egui shell silently dropped every reply AND leaked
-    /// the unread queues — the legacy winit shell drained them but the egui
-    /// rewrite never ported the wiring.
+    /// The `OSC 9 ; 4` taskbar-progress reports are surfaced in
+    /// [`HostEffects::progress`] and consumed by the app's taskbar wiring
+    /// (`super::taskbar`) — previously this queue was drained-and-discarded
+    /// (bounded-growth guard only, no UI). Without this whole drain the egui
+    /// shell silently dropped every reply AND leaked the unread queues — the
+    /// legacy winit shell drained them but the egui rewrite never ported the
+    /// wiring.
     ///
     /// No-op (empty effects) for a failed-spawn pane or a poisoned terminal lock.
     pub fn pump_host_effects(&mut self) -> HostEffects {
@@ -566,6 +763,20 @@ impl PaneTerm {
             let Ok(mut term) = term_arc.lock() else {
                 return out;
             };
+            // OSC 52 clipboard READ: answer any request the core PARKED for us.
+            // The core only ever parks one when the user opted in
+            // (`clipboard_read_allow`, default OFF) — a denied query was already
+            // refused inside the parser with an empty-payload reply and never
+            // reaches here, so this loop cannot leak a clipboard the user did
+            // not open. Runs BEFORE `take_pty_response` so the answer ships in
+            // the same drain rather than a frame later. A failed read yields
+            // `None` → an empty reply, which still releases a program blocking
+            // on the answer.
+            for req in term.take_clipboard_reads() {
+                let text = crate::clipboard_read::read_selection(req.selection);
+                let text = text.as_ref().map(|t| t.as_str()).unwrap_or("");
+                term.respond_clipboard_read(req.selection, text);
+            }
             let response = term.take_pty_response();
             for mut cw in term.take_clipboard_writes() {
                 // `ClipboardWrite` zeroizes its buffer on drop; take the text out
@@ -574,13 +785,16 @@ impl PaneTerm {
                 out.clipboard_writes.push(std::mem::take(&mut cw.text));
             }
             out.color_sets = term.take_color_sets();
-            if !term.take_notifications().is_empty() {
-                out.notified = true;
-            }
-            // Bounded-growth guard: drain the progress queue even though there is
-            // no taskbar-progress UI yet (matches the legacy shell, which also
-            // has none — but the legacy shell never let the queue accumulate).
-            let _ = term.take_progress();
+            // OSC 9 / OSC 777 → surfaced WITH their text, so `crate::notify` can
+            // raise a real OS toast. The text used to be fetched here and thrown
+            // away (only its length was tested, into a `notified: bool`), which
+            // made the whole notification a taskbar flash carrying no message.
+            out.notifications = term.take_notifications();
+            // OSC 9 ; 4 taskbar progress → surfaced for the app's taskbar wiring
+            // (`super::taskbar`) to drive the Windows taskbar-button segment.
+            // Draining here also keeps the queue from growing unbounded while a
+            // build tool streams progress.
+            out.progress = term.take_progress();
             response
         };
         if !response.is_empty() {
@@ -801,6 +1015,25 @@ impl PaneTerm {
         }
     }
 
+    /// Apply the `clipboard_read_allow` setting to this pane's live terminal —
+    /// whether a program inside it may READ the system clipboard via
+    /// `OSC 52 ; c ; ?`. DEFAULT-DENY; without this call the terminal keeps its
+    /// own default (denied), so a wiring failure fails closed.
+    ///
+    /// Applied every frame like the scrollback cap, so flipping the setting takes
+    /// effect immediately — including turning it back OFF, which also refuses any
+    /// request still in flight rather than stranding the program that made it.
+    /// No-op for a dead pane / poisoned lock.
+    pub fn set_clipboard_read_allowed(&self, allowed: bool) {
+        if let Some(session) = self.session.as_ref() {
+            if let Ok(mut term) = session.terminal().lock() {
+                if term.clipboard_read_enabled() != allowed {
+                    term.set_clipboard_read_enabled(allowed);
+                }
+            }
+        }
+    }
+
     /// The ABSOLUTE line at the top of the visible window (`scrollback_len −
     /// view_offset`). Mouse selections are anchored to absolute lines so they
     /// survive scrolling / jump-to-prompt / new output (the display row a cell
@@ -970,6 +1203,95 @@ impl PaneTerm {
         let term = session.terminal();
         let guard = term.lock().ok()?;
         guard.last_command_exit_code()
+    }
+
+    /// The ABSOLUTE content lines of this pane's captured OSC 133 `;A`/`;B`
+    /// shell-prompt marks — the same set [`jump_to_prompt`](Self::jump_to_prompt)
+    /// walks, surfaced so the scrollbar can also draw them as a map of where each
+    /// command began. Already in the `history.len() + row` absolute space
+    /// `window_start` uses, so no display-row mapping is needed.
+    ///
+    /// Empty for a dead pane / poisoned lock, and for the common case of a shell
+    /// with no prompt integration (which emits no marks at all).
+    pub fn prompt_mark_lines(&self) -> Vec<usize> {
+        let Some(session) = self.session.as_ref() else {
+            return Vec::new();
+        };
+        session
+            .terminal()
+            .lock()
+            .map(|t| t.prompt_marks().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// The ABSOLUTE content lines of the OSC 133 `;D` command-end marks whose
+    /// shell-reported exit code was NON-ZERO — "a command failed here". The
+    /// per-command counterpart to [`last_command_exit_code`](Self::last_command_exit_code),
+    /// which only answers for the most recent one.
+    ///
+    /// A `;D` with no exit code at all is NOT a failure (the shell simply did not
+    /// report one — the neutral "done" state), so it is excluded; so are `;C`
+    /// output-start marks, which carry no code.
+    pub fn failed_command_lines(&self) -> Vec<usize> {
+        use c0pl4nd_core::term::osc::CommandMarkKind;
+        let Some(session) = self.session.as_ref() else {
+            return Vec::new();
+        };
+        session
+            .terminal()
+            .lock()
+            .map(|t| {
+                t.command_marks()
+                    .iter()
+                    .filter(|m| {
+                        matches!(
+                            m.kind,
+                            CommandMarkKind::CommandEnd {
+                                exit_code: Some(code)
+                            } if code != 0
+                        )
+                    })
+                    .map(|m| m.line)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether this pane has a shell command STILL RUNNING — the signal the
+    /// close path needs before it kills every child (`prepare_shutdown` reaps
+    /// every PTY child with no prompt today, so an in-flight build/migration
+    /// dies silently).
+    ///
+    /// Derived from the OSC 133 marks the terminal ALREADY captures — no process
+    /// handle, no process-tree walk, no extra Win32 FFI. See
+    /// [`command_in_flight`] for the rule and its limits.
+    ///
+    /// Gated on the shell still being alive: a pane whose shell died mid-command
+    /// keeps its trailing `;C` mark forever, and reporting that as "running"
+    /// would warn about a process that no longer exists. `false` for a
+    /// failed-spawn pane, a dead shell, or a poisoned lock (the close path must
+    /// never be blocked by an unreadable pane).
+    ///
+    /// WIRED: the consuming branch is the close path in `egui_app/mod.rs` —
+    /// [`C0pl4ndApp::busy_pane_count`](super::C0pl4ndApp::busy_pane_count) counts
+    /// the panes reporting `true` and hands that count to
+    /// `config.window.close_guard`, which every close path
+    /// (`close_requested` / Alt+F4 / `WindowCmd::Close`) routes through. The
+    /// `allow(dead_code)` this carried while that call site was outside the
+    /// owning change is therefore gone: a future edit that unwires the count now
+    /// fails the build here instead of silently going dormant.
+    pub fn has_running_command(&self) -> bool {
+        let Some(session) = self.session.as_ref() else {
+            return false;
+        };
+        if !session.is_alive() {
+            return false;
+        }
+        session
+            .terminal()
+            .lock()
+            .map(|t| command_in_flight(t.command_marks()))
+            .unwrap_or(false)
     }
 
     /// Write raw bytes straight to the PTY (used for pasted text). Best-effort:
@@ -1167,7 +1489,28 @@ impl PaneTerm {
         let mut rows_out: Vec<Vec<ColorRun>> = Vec::with_capacity(grid_rows);
         guard.for_visible_rows(|_, row| {
             let mut runs = build_color_runs(row, cols, &default_cell, |cell| {
-                self.theme.cell_colors(cell, default_fg, default_bg).0
+                // ONE colour authority: `Theme::cell_colors` resolves fg AND the
+                // optional bg (applying SGR inverse). Both halves are kept — the
+                // background used to be thrown away here, which is why every
+                // highlighted cell (grep matches, ls dir colours, TUI selected
+                // rows) rendered as plain text, and why an inverse cell painted
+                // its background colour ONTO the unchanged background, i.e.
+                // invisibly.
+                let (fg, bg) = self.theme.cell_colors(cell, default_fg, default_bg);
+                RunStyle {
+                    fg,
+                    bg,
+                    bold: cell.flags.bold,
+                    italic: cell.flags.italic,
+                    underline: cell.flags.underline_style,
+                    // SGR 58/59: resolved through the SAME core colour API (never
+                    // re-derived); `None` leaves the decoration in the run's fg.
+                    underline_color: cell
+                        .underline_color
+                        .map(|c| self.theme.resolve_color(c, fg)),
+                    strikeout: cell.flags.strikeout,
+                    overline: cell.flags.overline,
+                }
             });
             // BiDi (F3-2): reorder this row's logical-order runs into VISUAL
             // order for right-to-left scripts (Arabic/Hebrew). The fast path
@@ -1212,12 +1555,20 @@ impl PaneTerm {
     }
 
     /// The visible grid as plain text (used by tests to assert PTY output landed
-    /// on screen, and as a headless render fallback). `None` for a dead session.
+    /// on screen, by the AccessKit screen-reader node, by the in-terminal search
+    /// corpus and the history echo gate, and as a headless render fallback).
+    /// `None` for a dead session.
+    ///
+    /// Uses [`Terminal::screen_text`], NOT the raw `Grid::to_text` dump: the
+    /// latter emits the blank continuation cell after a width-2 glyph, so a CJK
+    /// line came back as `"日 本 語"` — which broke substring search, hid CJK
+    /// commands from history, and made a screen reader announce a phantom space
+    /// between every wide glyph.
     pub fn grid_text(&self) -> Option<String> {
         let session = self.session.as_ref()?;
         let term = session.terminal();
         let guard = term.lock().ok()?;
-        Some(guard.grid().to_text())
+        Some(guard.screen_text())
     }
 
     /// The active theme's default background as an `(r,g,b)` triple — the colour
@@ -1245,8 +1596,12 @@ impl PaneTerm {
     /// sequences (e.g. `?1000h`) directly into the parser — deterministically,
     /// without depending on the asynchronous PTY reader thread (which would make
     /// the test flaky). Returns `None` for a failed-spawn pane.
+    ///
+    /// `pub(super)` so the egui-shell wiring tests in `mod_tests.rs` can drive a
+    /// pane's parser directly (e.g. the OSC 9;4 -> taskbar pump wire); still
+    /// `#[cfg(test)]`, so it exists in no shipping build.
     #[cfg(test)]
-    fn terminal_for_test(
+    pub(super) fn terminal_for_test(
         &self,
     ) -> Option<std::sync::Arc<std::sync::Mutex<c0pl4nd_core::Terminal>>> {
         self.session.as_ref().map(Session::terminal)
@@ -1256,9 +1611,344 @@ impl PaneTerm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egui_app::pty_gate::{require_live_pty, require_live_spawn};
 
     fn void_theme() -> Theme {
         Theme::builtin_void()
+    }
+
+    // ---- OSC 133 "a command is still running" (the close-warning signal) ----
+
+    /// Build a mark slice for the pure rule without any terminal at all.
+    fn marks(
+        kinds: &[c0pl4nd_core::term::osc::CommandMarkKind],
+    ) -> Vec<c0pl4nd_core::term::osc::CommandMark> {
+        kinds
+            .iter()
+            .enumerate()
+            .map(|(i, k)| c0pl4nd_core::term::osc::CommandMark { kind: *k, line: i })
+            .collect()
+    }
+
+    #[test]
+    fn command_in_flight_is_true_only_for_an_unclosed_output_start() {
+        use c0pl4nd_core::term::osc::CommandMarkKind::{CommandEnd, OutputStart};
+        let end0 = CommandEnd { exit_code: Some(0) };
+        let end1 = CommandEnd { exit_code: Some(1) };
+        let end_none = CommandEnd { exit_code: None };
+
+        // No marks: an unintegrated shell reports nothing, so we cannot tell.
+        // Deliberately the conservative answer — see `command_in_flight`'s doc.
+        assert!(!command_in_flight(&[]), "no marks must not claim a command");
+        // A bare `;C` with no closing `;D` is the whole point: RUNNING.
+        assert!(command_in_flight(&marks(&[OutputStart])));
+        // `;C` then `;D` — the command finished, whatever its exit code.
+        assert!(!command_in_flight(&marks(&[OutputStart, end0])));
+        assert!(!command_in_flight(&marks(&[OutputStart, end1])));
+        assert!(!command_in_flight(&marks(&[OutputStart, end_none])));
+        // A finished command followed by a NEW `;C` is running again.
+        assert!(command_in_flight(&marks(&[OutputStart, end0, OutputStart])));
+        // ...and closing that one settles back to idle.
+        assert!(!command_in_flight(&marks(&[
+            OutputStart,
+            end0,
+            OutputStart,
+            end1
+        ])));
+        // Only the LAST mark decides — a long idle history must not read as busy.
+        assert!(!command_in_flight(&marks(&[
+            OutputStart,
+            end0,
+            OutputStart,
+            end0,
+            OutputStart,
+            end0
+        ])));
+        // A lone `;D` (integration switched on mid-session) is idle, not running.
+        assert!(!command_in_flight(&marks(&[end0])));
+    }
+
+    /// The accessor must read the LIVE terminal, not a snapshot: driving the real
+    /// OSC 133 bytes through the parser has to flip it both ways. This is the
+    /// wire from "the shell said `;C`" to "the close path would warn".
+    #[test]
+    fn has_running_command_follows_the_live_osc133_marks() {
+        let pane = PaneTerm::spawn(void_theme(), 80, 24);
+        // A fresh pane has no marks at all → not running.
+        assert!(
+            !pane.has_running_command(),
+            "a fresh pane must not claim a running command"
+        );
+        // No shell on this box → the None default above is the assertion.
+        // Under C0PL4ND_REQUIRE_PTY=1 (CI) a failed spawn is a hard failure
+        // instead, so this cannot become a body that never runs.
+        let Some(term) = require_live_pty(&pane) else {
+            return;
+        };
+        // The shell announces a command's output starts here (`OSC 133 ; C`).
+        term.lock().unwrap().advance(b"\x1b]133;C\x07");
+        assert!(
+            pane.has_running_command(),
+            "after ESC]133;C BEL the pane must report a command in flight"
+        );
+        // ...and the matching `;D` clears it.
+        term.lock().unwrap().advance(b"\x1b]133;D;0\x07");
+        assert!(
+            !pane.has_running_command(),
+            "after ESC]133;D the command has finished — no warning"
+        );
+    }
+
+    /// A failed-spawn pane has no session; the close path must get a plain
+    /// `false` rather than a panic or an unwrap on `None`.
+    #[test]
+    fn has_running_command_is_false_for_a_failed_spawn_pane() {
+        let pane =
+            PaneTerm::spawn_program(void_theme(), "c0pl4nd-no-such-program-exists", &[], 80, 24);
+        assert!(
+            pane.error().is_some(),
+            "the bogus program must have failed to spawn"
+        );
+        assert!(
+            !pane.has_running_command(),
+            "a failed-spawn pane must never block the close path"
+        );
+    }
+
+    // ---- spawn_program_in: the named-profile cwd that used to be dropped ----
+
+    /// A uniquely-named directory under the OS temp dir. The unique component is
+    /// what the assertions match on, so Windows 8.3 short-name mangling of the
+    /// PARENT (`RUNNER~1`) can never make a correct spawn look wrong.
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("c0pl4nd-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the test cwd");
+        dir
+    }
+
+    /// Does `grid` show `needle`, ignoring the terminal's HARD WRAP?
+    ///
+    /// The probe prints an absolute path into an 80-column grid, so a long temp
+    /// path is split across rows MID-TOKEN and a plain `contains` reports a
+    /// CORRECT spawn as a failure. Measured on macOS CI, where the runner's
+    /// temp dir resolves through the `/private` symlink:
+    ///
+    /// ```text
+    /// /private/var/folders/df/djsxfhc17x95674wsm_g8s980000gn/T/c0pl4nd-spawn-in-13600-
+    /// 1785939352831829000
+    /// ```
+    ///
+    /// The unique component is split at the row edge, so the child HAD run in
+    /// the requested directory and the assertion failed anyway. Windows never
+    /// showed it because its temp path is short enough to leave the token
+    /// intact — the defect was platform-hidden, not absent.
+    ///
+    /// Both sides drop every space and line break before comparing; the needle
+    /// is a single path component with neither, so this cannot match anything
+    /// else. It matters most for the NEGATIVE assertions: a wrapped token makes
+    /// a plain `!contains` falsely pass.
+    fn shows_unwrapped(grid: &str, needle: &str) -> bool {
+        fn squash(s: &str) -> String {
+            s.chars().filter(|c| !c.is_whitespace()).collect()
+        }
+        squash(grid).contains(&squash(needle))
+    }
+
+    /// Poll the pane's visible grid for `needle` until `timeout`. The PTY reader
+    /// is a background thread, so the output arrives asynchronously; returns the
+    /// last grid seen so a failure message can show what DID land.
+    fn wait_for_grid(pane: &PaneTerm, needle: &str, timeout: std::time::Duration) -> String {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut last = String::new();
+        loop {
+            last = pane.grid_text().unwrap_or(last);
+            if shows_unwrapped(&last, needle) {
+                return last;
+            }
+            if std::time::Instant::now() >= deadline {
+                return last;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// A program that prints its own working directory, so the assertion is on
+    /// where the child ACTUALLY ran — not merely on the argument being stored.
+    fn print_cwd_program() -> (&'static str, Vec<&'static str>) {
+        #[cfg(windows)]
+        {
+            ("cmd.exe", vec!["/C", "cd"])
+        }
+        #[cfg(not(windows))]
+        {
+            ("/bin/sh", vec!["-c", "pwd"])
+        }
+    }
+
+    /// THE regression this variant exists for: with a named shell profile the
+    /// reopen/restore path had no way to pass a cwd, so the pane came back in the
+    /// default directory. The child must print the directory we asked for.
+    ///
+    /// Asserts the value reached its USE (the spawned process's real cwd), not
+    /// that it was stored somewhere — a `spawn_program_in` that accepted `cwd`
+    /// and then dropped it on the floor would pass any "a pane appeared" check.
+    #[test]
+    fn spawn_program_in_starts_the_child_in_the_requested_directory() {
+        let dir = unique_dir("spawn-in");
+        let unique = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("unique component")
+            .to_string();
+        let (program, args) = print_cwd_program();
+        let pane = PaneTerm::spawn_program_in(void_theme(), program, &args, 80, 24, dir.to_str());
+        if !require_live_spawn(&pane) {
+            // No shell available on this host: nothing to observe. Not a pass
+            // for the behaviour — just an absent platform. Under
+            // C0PL4ND_REQUIRE_PTY=1 (CI) this is a hard failure instead.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let grid = wait_for_grid(&pane, &unique, std::time::Duration::from_secs(20));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            shows_unwrapped(&grid, &unique),
+            "the child must RUN in the requested cwd; wanted {unique:?} in the \
+             grid, got:\n{grid}"
+        );
+    }
+
+    /// The home directory a cwd-less spawn is documented to fall back to
+    /// (`pty::dirs_home`). `None` on a host with neither variable set.
+    fn home_dir() -> Option<String> {
+        #[cfg(windows)]
+        let v = std::env::var_os("USERPROFILE");
+        #[cfg(not(windows))]
+        let v = std::env::var_os("HOME");
+        v.and_then(|s| s.into_string().ok())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Case-insensitively: does the grid show the child running in `dir`?
+    /// Windows reports drive letters and path case inconsistently, so an exact
+    /// match would be flaky where the behaviour is correct.
+    fn grid_shows_dir(grid: &str, dir: &str) -> bool {
+        grid.to_lowercase().contains(&dir.to_lowercase())
+    }
+
+    /// The companion direction: `cwd = None` lands in HOME — the fallback
+    /// `PtyProcess::spawn_program_in_with_term` applies when no directory is
+    /// given. `spawn_program` now delegates to `spawn_program_in(.., None)`, so
+    /// this pins that the delegation did not change the old behaviour.
+    ///
+    /// Asserts POSITIVELY (it landed in home), not merely that it avoided one
+    /// nominated directory: a weaker "not in dir X" form passes for a spawn that
+    /// landed in any of the thousands of other wrong directories.
+    #[test]
+    fn spawn_program_without_a_cwd_lands_in_home() {
+        let Some(home) = home_dir() else {
+            return; // No home on this host: the fallback is unobservable.
+        };
+        let (program, args) = print_cwd_program();
+        let pane = PaneTerm::spawn_program(void_theme(), program, &args, 80, 24);
+        // Absent platform → skip; under C0PL4ND_REQUIRE_PTY=1 (CI) → hard fail.
+        if !require_live_spawn(&pane) {
+            return;
+        }
+        let grid = wait_for_grid(&pane, &home, std::time::Duration::from_secs(20));
+        assert!(
+            grid_shows_dir(&grid, &home),
+            "a cwd-less spawn must fall back to home ({home:?}); got:\n{grid}"
+        );
+    }
+
+    /// A `cwd` that no longer exists (a stale restored layout) must degrade to
+    /// the home fallback the core spawn provides — never a failed pane, and
+    /// never the missing path. Again asserted positively (it IS home) plus the
+    /// negative (it is NOT the vanished directory).
+    #[test]
+    fn spawn_program_in_falls_back_to_home_when_the_cwd_is_gone() {
+        let dir = unique_dir("spawn-stale");
+        let unique = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("unique component")
+            .to_string();
+        let stale = dir.to_str().expect("utf8 path").to_string();
+        // Delete it BEFORE spawning: this is exactly a restored-but-removed dir.
+        std::fs::remove_dir_all(&dir).expect("remove the test cwd");
+        let (program, args) = print_cwd_program();
+        let pane = PaneTerm::spawn_program_in(void_theme(), program, &args, 80, 24, Some(&stale));
+        assert!(
+            pane.error().is_none(),
+            "a stale cwd must not fail the spawn, got: {:?}",
+            pane.error()
+        );
+        let Some(home) = home_dir() else {
+            return;
+        };
+        let grid = wait_for_grid(&pane, &home, std::time::Duration::from_secs(20));
+        assert!(
+            grid_shows_dir(&grid, &home),
+            "a vanished cwd must fall back to home ({home:?}); got:\n{grid}"
+        );
+        assert!(
+            !shows_unwrapped(&grid, &unique),
+            "the child cannot be running in a directory that does not exist; \
+             got:\n{grid}"
+        );
+    }
+
+    /// SGR 53 (overline) must reach the renderer's decoration pass. `has_decoration`
+    /// is the gate that pass consults per span, so an overline-only run MUST report
+    /// `true` — otherwise the pass skips it and `\e[53m` stays invisible (the exact
+    /// dormancy this wires: the flag was parsed into `CellFlags` but dropped here).
+    #[test]
+    fn overline_only_run_reports_a_decoration() {
+        let mut s = RunStyle::plain((200, 200, 200));
+        assert!(!s.has_decoration(), "a plain run has nothing to decorate");
+        s.overline = true;
+        assert!(
+            s.has_decoration(),
+            "an overline-only run must be decorated, or the paint pass skips it"
+        );
+    }
+
+    /// The cell → RunStyle mapping must carry `CellFlags::overline` through, not
+    /// drop it. Builds a real overline cell and asserts the run it produces is
+    /// overlined — would fail if the build site forgot the field.
+    #[test]
+    fn cell_overline_flag_reaches_the_run_style() {
+        use c0pl4nd_core::Cell;
+        let mut cell = Cell {
+            c: 'x',
+            ..Cell::default()
+        };
+        cell.flags.overline = true;
+        let theme = void_theme();
+        let (fg, bg) = theme.cell_colors(&cell, (255, 255, 255), (0, 0, 0));
+        // The same construction the render path uses (kept in sync with the
+        // `grid_rows` build site).
+        let style = RunStyle {
+            fg,
+            bg,
+            bold: cell.flags.bold,
+            italic: cell.flags.italic,
+            underline: cell.flags.underline_style,
+            underline_color: None,
+            strikeout: cell.flags.strikeout,
+            overline: cell.flags.overline,
+        };
+        assert!(
+            style.overline,
+            "the overline flag was dropped building the run"
+        );
+        assert!(style.has_decoration());
     }
 
     #[test]
@@ -1279,15 +1969,15 @@ mod tests {
         };
         // Grid: 'a', '漢' (wide), ' ' (continuation spacer the core wrote), 'b'.
         let cells = vec![c('a'), c('漢'), c(' '), c('b')];
-        let runs = build_color_runs(&cells, 4, &Cell::default(), |_| (1, 2, 3));
+        let runs = build_color_runs(&cells, 4, &Cell::default(), |_| RunStyle::plain((1, 2, 3)));
         // The wide glyph is its OWN run and the spacer is NOT emitted, so the run
         // column accounting never double-counts the wide glyph's width.
         assert_eq!(
             runs,
             vec![
-                ("a".to_string(), (1, 2, 3)),
-                ("漢".to_string(), (1, 2, 3)),
-                ("b".to_string(), (1, 2, 3)),
+                ("a".to_string(), RunStyle::plain((1, 2, 3))),
+                ("漢".to_string(), RunStyle::plain((1, 2, 3))),
+                ("b".to_string(), RunStyle::plain((1, 2, 3))),
             ]
         );
     }
@@ -1302,16 +1992,16 @@ mod tests {
         let cells = vec![c('a'), c('b'), c('c')];
         let runs = build_color_runs(&cells, 3, &Cell::default(), |cell| {
             if cell.c == 'c' {
-                (0, 255, 0)
+                RunStyle::plain((0, 255, 0))
             } else {
-                (255, 0, 0)
+                RunStyle::plain((255, 0, 0))
             }
         });
         assert_eq!(
             runs,
             vec![
-                ("ab".to_string(), (255, 0, 0)),
-                ("c".to_string(), (0, 255, 0))
+                ("ab".to_string(), RunStyle::plain((255, 0, 0))),
+                ("c".to_string(), RunStyle::plain((0, 255, 0)))
             ]
         );
     }
@@ -1366,16 +2056,16 @@ mod tests {
         // shifts 'b' by two cells. THIS is the property that makes CJK/emoji
         // render cell-accurately; it is verified here without a live display.
         let runs = vec![
-            ("a".to_string(), (1, 1, 1)),
-            ("漢".to_string(), (2, 2, 2)),
-            ("b".to_string(), (3, 3, 3)),
+            ("a".to_string(), RunStyle::plain((1, 1, 1))),
+            ("漢".to_string(), RunStyle::plain((2, 2, 2))),
+            ("b".to_string(), RunStyle::plain((3, 3, 3))),
         ];
         assert_eq!(
             row_glyph_cells(&runs),
             vec![
-                ('a', (1, 1, 1), 0),
-                ('漢', (2, 2, 2), 1),
-                ('b', (3, 3, 3), 3),
+                ('a', RunStyle::plain((1, 1, 1)), 0),
+                ('漢', RunStyle::plain((2, 2, 2)), 1),
+                ('b', RunStyle::plain((3, 3, 3)), 3),
             ]
         );
     }
@@ -1384,27 +2074,30 @@ mod tests {
     fn row_glyph_cells_skips_blanks_but_still_advances_the_column() {
         // A blank is not painted (background is drawn separately) but still
         // advances the cell column, so 'b' lands at cell 2.
-        let runs = vec![("a b".to_string(), (9, 9, 9))];
+        let runs = vec![("a b".to_string(), RunStyle::plain((9, 9, 9)))];
         assert_eq!(
             row_glyph_cells(&runs),
-            vec![('a', (9, 9, 9), 0), ('b', (9, 9, 9), 2)]
+            vec![
+                ('a', RunStyle::plain((9, 9, 9)), 0),
+                ('b', RunStyle::plain((9, 9, 9)), 2)
+            ]
         );
     }
 
     #[test]
     fn row_glyph_cells_handles_two_adjacent_wide_glyphs() {
         let runs = vec![
-            ("漢".to_string(), (1, 1, 1)),
-            ("字".to_string(), (2, 2, 2)),
-            ("x".to_string(), (3, 3, 3)),
+            ("漢".to_string(), RunStyle::plain((1, 1, 1))),
+            ("字".to_string(), RunStyle::plain((2, 2, 2))),
+            ("x".to_string(), RunStyle::plain((3, 3, 3))),
         ];
         // 漢@0, 字@2 (after the first wide glyph), x@4 (after the second).
         assert_eq!(
             row_glyph_cells(&runs),
             vec![
-                ('漢', (1, 1, 1), 0),
-                ('字', (2, 2, 2), 2),
-                ('x', (3, 3, 3), 4)
+                ('漢', RunStyle::plain((1, 1, 1)), 0),
+                ('字', RunStyle::plain((2, 2, 2)), 2),
+                ('x', RunStyle::plain((3, 3, 3)), 4)
             ]
         );
     }
@@ -1479,7 +2172,8 @@ mod tests {
         );
         // If the shell could not spawn on this box, there is no terminal to
         // drive; the Off default above is still the meaningful assertion.
-        let Some(term) = pane.terminal_for_test() else {
+        // Under C0PL4ND_REQUIRE_PTY=1 (CI) that is a hard failure, not a skip.
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         // App enables ?1000 (normal button tracking) — the badge-trigger state.
@@ -1517,8 +2211,9 @@ mod tests {
             "a press while mouse mode is Off must not be reported"
         );
         // If the shell could not spawn there is no terminal to enable ?1000 on;
-        // the Off assertion above is still the meaningful one.
-        let Some(term) = pane.terminal_for_test() else {
+        // the Off assertion above is still the meaningful one. Under
+        // C0PL4ND_REQUIRE_PTY=1 (CI) that is a hard failure, not a skip.
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         term.lock().unwrap().advance(b"\x1b[?1000h");
@@ -1543,7 +2238,7 @@ mod tests {
     #[test]
     fn pump_host_effects_drains_every_queue() {
         let pane = PaneTerm::spawn(void_theme(), 80, 24);
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         {
@@ -1552,6 +2247,7 @@ mod tests {
             t.advance(b"\x1b]52;c;aGVsbG8=\x07"); // OSC 52 write "hello"
             t.advance(b"\x1b]4;1;rgb:ff/00/00\x07"); // OSC 4 set index 1 = red
             t.advance(b"\x1b]9;Build complete\x07"); // OSC 9 desktop notification
+            t.advance(b"\x1b]9;4;1;42\x07"); // OSC 9;4 taskbar progress: Normal 42%
         }
         let mut pane = pane;
         let fx = pane.pump_host_effects();
@@ -1568,7 +2264,23 @@ mod tests {
             }],
             "OSC 4 set must surface as an indexed color set"
         );
-        assert!(fx.notified, "OSC 9 must mark a notification as received");
+        assert_eq!(
+            fx.notifications,
+            vec![Notification {
+                title: String::new(),
+                body: "Build complete".to_string(),
+            }],
+            "OSC 9 must surface the notification WITH its text — a bare \
+             `notified` flag cannot be turned into a toast"
+        );
+        assert_eq!(
+            fx.progress,
+            vec![Progress {
+                state: c0pl4nd_core::term::ProgressState::Normal,
+                percent: 42,
+            }],
+            "OSC 9;4 progress must be SURFACED (not drained-and-discarded) for the taskbar"
+        );
         // The PTY reply and every other queue must now be drained.
         let mut t = term.lock().unwrap();
         assert!(
@@ -1584,6 +2296,100 @@ mod tests {
             t.take_notifications().is_empty(),
             "notification queue drained"
         );
+        assert!(t.take_progress().is_empty(), "progress queue drained");
+    }
+
+    /// A freshly spawned pane must DENY OSC 52 clipboard reads, and the refusal
+    /// must be the empty-payload reply rather than silence. This is the
+    /// fail-closed half: a pane that is never told about the setting keeps the
+    /// safe default, so a wiring failure cannot open the hole.
+    #[test]
+    fn pane_denies_clipboard_reads_until_told_otherwise() {
+        let pane = PaneTerm::spawn(void_theme(), 80, 24);
+        let Some(term) = require_live_pty(&pane) else {
+            return;
+        };
+        let mut t = term.lock().unwrap();
+        assert!(
+            !t.clipboard_read_enabled(),
+            "a fresh pane must deny clipboard reads"
+        );
+        t.advance(b"\x1b]52;c;?\x07");
+        assert!(
+            t.take_clipboard_reads().is_empty(),
+            "a denied read must never be parked for the host to serve"
+        );
+        assert_eq!(
+            t.take_pty_response(),
+            b"\x1b]52;c;\x07".to_vec(),
+            "the refusal must be an empty-payload OSC 52 reply, not silence"
+        );
+    }
+
+    /// The config → terminal wire: `set_clipboard_read_allowed` must actually
+    /// move the emulator's gate in BOTH directions. Without this the Settings
+    /// checkbox would persist a value that changed nothing (a dead setting), and
+    /// — worse — turning it back off would not close the hole.
+    #[test]
+    fn set_clipboard_read_allowed_moves_the_terminal_gate_both_ways() {
+        let pane = PaneTerm::spawn(void_theme(), 80, 24);
+        let Some(term) = require_live_pty(&pane) else {
+            return;
+        };
+        assert!(!term.lock().unwrap().clipboard_read_enabled());
+
+        pane.set_clipboard_read_allowed(true);
+        assert!(
+            term.lock().unwrap().clipboard_read_enabled(),
+            "opting in must reach the emulator"
+        );
+
+        pane.set_clipboard_read_allowed(false);
+        assert!(
+            !term.lock().unwrap().clipboard_read_enabled(),
+            "opting back OUT must reach the emulator too"
+        );
+        // And a request parked while it was on must have been refused, not left
+        // to strand the program that made it.
+        let mut t = term.lock().unwrap();
+        assert!(t.take_clipboard_reads().is_empty());
+    }
+
+    /// `pump_host_effects` must SERVE a parked OSC 52 read in the same drain:
+    /// answer it, then ship the reply. Asserting the response queue is empty
+    /// afterwards is what pins the ordering — if the answer were produced AFTER
+    /// `take_pty_response`, the reply would sit here for a frame instead of
+    /// going out with this drain.
+    #[test]
+    fn pump_host_effects_serves_a_parked_clipboard_read() {
+        let pane = PaneTerm::spawn(void_theme(), 80, 24);
+        let Some(term) = require_live_pty(&pane) else {
+            return;
+        };
+        pane.set_clipboard_read_allowed(true);
+        {
+            let mut t = term.lock().unwrap();
+            t.advance(b"\x1b]52;c;?\x07");
+            assert_eq!(
+                t.take_clipboard_reads().len(),
+                1,
+                "precondition: an opted-in read parks a request"
+            );
+            // Re-park it for the pump to find (the assert above drained it).
+            t.advance(b"\x1b]52;c;?\x07");
+        }
+        let mut pane = pane;
+        let _ = pane.pump_host_effects();
+        let mut t = term.lock().unwrap();
+        assert!(
+            t.take_clipboard_reads().is_empty(),
+            "pump must consume the parked read request"
+        );
+        assert!(
+            t.take_pty_response().is_empty(),
+            "pump must answer BEFORE draining the response queue, so the reply \
+             ships in this drain rather than a frame later"
+        );
     }
 
     /// [`PaneTerm::scroll_view`] drives local scrollback: after enough output to
@@ -1594,7 +2400,7 @@ mod tests {
     #[test]
     fn scroll_view_moves_the_scrollback_offset() {
         let pane = PaneTerm::spawn(void_theme(), 80, 6);
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         // Produce many more lines than the 6-row screen so there is scrollback.
@@ -1639,7 +2445,7 @@ mod tests {
         );
         // If the shell could not spawn on this box there is no terminal to
         // drive; the None default above is still the meaningful assertion.
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         // The program sets its window title via OSC 0 (BEL-terminated).
@@ -1669,7 +2475,7 @@ mod tests {
         );
         // If the shell could not spawn on this box there is no terminal to
         // drive; the None default above is still the meaningful assertion.
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         // The shell reports a successful command end (`OSC 133 ; D ; 0`).
@@ -1708,7 +2514,7 @@ mod tests {
     fn grid_rows_is_damage_gated_and_content_correct() {
         let pane = PaneTerm::spawn(void_theme(), 80, 24);
         // If the shell could not spawn on this box there is no terminal to read.
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         term.lock().unwrap().advance(b"hello world");
@@ -1738,7 +2544,7 @@ mod tests {
     #[test]
     fn grid_rows_cache_invalidated_by_set_theme() {
         let mut pane = PaneTerm::spawn(void_theme(), 80, 24);
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         term.lock().unwrap().advance(b"x");
@@ -1758,7 +2564,7 @@ mod tests {
     #[test]
     fn report_focus_only_reports_when_armed() {
         let pane = PaneTerm::spawn(void_theme(), 80, 24);
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         let mut pane = pane;
@@ -1789,7 +2595,7 @@ mod tests {
     #[test]
     fn jump_to_prompt_scrolls_to_a_prompt_mark() {
         let pane = PaneTerm::spawn(void_theme(), 80, 3);
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         {
@@ -1818,7 +2624,7 @@ mod tests {
     #[test]
     fn selection_text_extracts_ordered_trimmed_rows() {
         let pane = PaneTerm::spawn(void_theme(), 80, 4);
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         {
@@ -1849,7 +2655,7 @@ mod tests {
     #[test]
     fn selection_text_block_mode_clips_every_row_to_the_column_range() {
         let pane = PaneTerm::spawn(void_theme(), 80, 4);
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         {

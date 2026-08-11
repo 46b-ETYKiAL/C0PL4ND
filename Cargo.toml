@@ -11,10 +11,29 @@ exclude = ["fuzz"]
 [workspace.package]
 version = "0.4.25"
 edition = "2021"
-rust-version = "1.80"
+# True floor, established empirically (`cargo check --workspace --locked` under
+# RUSTUP_TOOLCHAIN=<ver>), not asserted. Three independent constraints, highest
+# wins:
+#   1.95  `sysinfo` 0.39.6 — a NORMAL dependency of c0pl4nd-core — declares
+#         rust-version 1.95. Cargo refuses outright below it: "rustc 1.92.0 is
+#         not supported by the following package: sysinfo@0.39.6 requires
+#         rustc 1.95". This is the binding constraint.
+#   1.87  `is_multiple_of` (crates/core/src/term.rs, crates/core/src/layout/
+#         action.rs, crates/app/src/window.rs). Not negotiable by rewriting:
+#         clippy 1.95 under `-D warnings` REJECTS the MSRV-safe `% 2 != 0` form
+#         via `manual_is_multiple_of`, so the lint set itself forces the 1.87 API.
+#   1.82  `is_none_or` (crates/core/src/image.rs, crates/app/src/egui_app/mod.rs).
+# The previous value (1.80) was provably false on all three counts — and the
+# tree does not even RESOLVE on 1.80 (a transitive dep needs edition2024, which
+# cargo 1.80 cannot parse). It went unnoticed because the `msrv` CI job was
+# vacuous: rust-toolchain.toml's directory override outranked the toolchain the
+# job installed, so the job re-tested the pinned channel. See the RUSTUP_TOOLCHAIN
+# comment on the `msrv` job in .github/workflows/ci.yml.
+# Bump this, the `msrv` job's `toolchain:`, and its RUSTUP_TOOLCHAIN together.
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
-homepage = "https://github.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND"
-repository = "https://github.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND"
+homepage = "https://github.com/46b-ETYKiAL/C0PL4ND"
+repository = "https://github.com/46b-ETYKiAL/C0PL4ND"
 authors = ["Itasha.Corp"]
 description = "A fast, GPU-accelerated, local-first terminal emulator for Windows, Linux, and macOS."
 

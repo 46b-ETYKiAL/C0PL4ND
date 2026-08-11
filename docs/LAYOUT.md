@@ -1,6 +1,6 @@
 # C0PL4ND — Layout & Multiplexing
 
-C0PL4ND uses a binary/n-ary **split-tree** to arrange multiple terminals in a single window, with **nested tabs per cell**, **drag-to-rearrange**, **layout persistence**, and **quick-layout presets** — all keyboard-first, none of it required if you only want a single pane.
+C0PL4ND uses a **split-tree** to arrange multiple terminals in a single window, with **drag-to-rearrange** and **pane zoom** — all keyboard-first, none of it required if you only want a single pane.
 
 ---
 
@@ -10,20 +10,18 @@ C0PL4ND uses a binary/n-ary **split-tree** to arrange multiple terminals in a si
 WINDOW
 └── TAB(s)
     └── LAYOUT (split-tree, up to MAX_PANES = 6 leaves)
-        └── CELL (each leaf = a TabGroup)
-            └── NESTED TAB(s)
-                └── TERMINAL (PTY)
+        └── CELL (each leaf)
+            └── TERMINAL (PTY)
 ```
 
 - Each **window** holds one or more **window-level tabs**.
 - Each window-level tab holds a **split-tree layout** of up to **six cells (panes)**.
-- Each **cell** is a TabGroup that holds one or more **nested tabs**.
-- Each nested tab owns a terminal (PTY) with its own shell + scrollback.
+- Each **cell** owns a terminal (PTY) with its own shell + scrollback.
 - Splits run horizontally (side-by-side) or vertically (top/bottom).
 - A single-pane tab draws **no** pane chrome — visually identical to a non-multiplexed terminal.
 - More than one pane gets a 1-px chrome: the **focused** pane carries a subtle signal-teal border; the others a muted grey.
 
-`MAX_PANES = 6` is a readability guardrail — past six panes the per-cell text becomes too small to scan. Trying to split past it is blocked with a transient notice.
+`MAX_PANES = 6` (`crates/app/src/egui_app/grid.rs:23`) is a readability guardrail — past six panes the per-cell text becomes too small to scan. Trying to split past it is blocked with a transient notice.
 
 ---
 
@@ -46,10 +44,9 @@ The `mod` modifier is **Ctrl** on Windows/Linux and **Cmd** (⌘) on macOS.
 | Split right (vertical) | `Ctrl+Shift+D` |
 | Split down (horizontal) | `Ctrl+Shift+E` |
 | Focus pane by direction | `Ctrl/Cmd+Shift + Arrow` |
-| Drag-to-rearrange (mouse) | hold `Ctrl+Shift` and drag from a pane |
 | Pane zoom (toggle) | `Ctrl+Shift+Z` |
 
-`Equalize Cells`, `Reset Layout`, the quick-layout presets, and named-workspace save/restore are run from the **command palette** (`Ctrl+Shift+P`), not from a dedicated chord — see the tables below.
+`Equalize Cells` is run from the **command palette** (`Ctrl+Shift+P`), not from a dedicated chord.
 
 ### Search & palette
 | Action | Key |
@@ -57,82 +54,51 @@ The `mod` modifier is **Ctrl** on Windows/Linux and **Cmd** (⌘) on macOS.
 | Search scrollback | `Ctrl+Shift+F` |
 | Command palette | `Ctrl+Shift+P` |
 
-The palette is the canonical entry-point for everything below — presets, save/restore, equalize, zoom.
-
 ---
 
 ## Drag-to-rearrange
 
-Hold `Ctrl+Shift` and click-drag from inside any pane. A **6 px move threshold** ensures normal clicks are never interpreted as drags. While dragging, the source pane dims and the candidate target shows a drop-zone highlight.
+Panes are rearranged by dragging them within the split-tree. The grid is built on
+[`egui_tiles`](https://docs.rs/egui_tiles) (`crates/app/src/egui_app/grid.rs`), and drag-to-rearrange
+is that crate's own affordance: drag a pane and drop it against an edge of another
+pane to re-split the tree around it.
 
-Each target pane is divided into **five drop zones**:
-
-```
-┌────────────────────┐
-│         TOP        │   Drop in TOP / BOTTOM / LEFT / RIGHT
-│ ┌────────────────┐ │   → place the source on that side of the target
-│ │                │ │     (creates a tree split)
-│ │L     CENTER   R│ │
-│ │                │ │   Drop in CENTER
-│ └────────────────┘ │   → merge the source's tabs into the
-│       BOTTOM       │     target's TabGroup
-└────────────────────┘
-```
-
-To move keyboard focus between panes without the mouse, use `Ctrl/Cmd+Shift + Arrow` (focus the adjacent pane in that direction).
+To move keyboard focus between panes without the mouse, use `Ctrl/Cmd+Shift + Arrow`
+(focus the adjacent pane in that direction).
 
 ---
 
-## Quick-layout presets
+## Not in this shell
 
-From the palette (`Ctrl+Shift+P`):
+The repository also contains a second, **unshipped** layout engine
+(`crates/core/src/layout/`, `crates/core/src/layout_persist.rs`) used only by the
+`c0pl4nd-legacy` binary, which is gated behind the default-off `legacy-winit`
+feature and is not part of any release build.
 
-| Preset | Shape |
-|---|---|
-| `Layout: 1` | single pane |
-| `Layout: 1x2` | two side-by-side |
-| `Layout: 2x1` | two stacked |
-| `Layout: 1+2` | one main left, two stacked right |
-| `Layout: 2x2` | four cells, grid |
-| `Layout: 1+3` | one main left, three stacked right |
-| `Layout: 2x3` | six cells, grid (the MAX_PANES ceiling) |
-| `Equalize Cells` | rebalance flex ratios |
-| `Pane Zoom` | toggle full-window zoom of the focused pane |
+The following belong to that engine and are **not** available in the shell you are
+running. They are listed here only because earlier revisions of this document
+described them as current:
 
----
+- Quick-layout presets (`Layout: 1x2`, `2x2`, `1+3`, `2x3`, …)
+- Named workspace save/restore (`Save Layout As…` / `Restore Layout`)
+- `Reset Layout`
+- Nested tabs *within* a cell (each cell owns exactly one terminal)
+- The custom five-zone (top/bottom/left/right/centre-merge) drop classifier and
+  its centre-merge behaviour
+- Automatic restore of a saved default layout on launch, and the corrupt-layout-file
+  fallback that went with it
 
-## Save & restore — named workspaces
-
-Use the palette:
-
-- **`Save Layout As…`** prompts for a name; the current split-tree (shape + per-leaf cwd, profile, and active-nested-tab index) is written to the workspaces directory next to your config file. The saved file is plain JSON — diff/version-control-friendly.
-- **`Restore Layout`** lists saved workspaces; selecting one rebuilds the split-tree, spawning **fresh** PTYs per leaf. **Live process state is not restored** — by design (a terminal is not a checkpoint/restore system; bringing back stale processes is the opposite of what an operator wants).
-
-On launch, if a saved **default** layout exists it is restored automatically; otherwise C0PL4ND starts with a single pane — the zero-config baseline.
-
----
-
-## Recovery / safety net
-
-C0PL4ND **never crashes** on a malformed layout file. If a saved layout is:
-
-- **corrupt JSON**, or
-- **larger than `MAX_PANES`**, or
-- has **invalid flex sums**,
-
-the loader logs the issue and falls back to a single pane. Your config is untouched. You can then:
-
-- run **`Reset Layout`** from the palette to clear to a single pane,
-- **`Equalize Cells`** to rebalance flex ratios when a drag has left things lopsided,
-- **`Pane Zoom`** to focus on one pane while keeping the others alive in the background.
+C0PL4ND starts with a single pane — the zero-config baseline.
 
 ---
 
 ## Architecture notes
 
-- The split-tree engine lives in `crates/core/src/layout/` — pure data, no GPU coupling, fully unit-tested.
-- Layout persistence is in `crates/core/src/layout_persist.rs` (serde JSON; round-trip + byte-stable + validation tests).
-- Drag state-machine and 5-zone classifier are in `crates/app/src/drag.rs`.
-- Per-leaf render geometry, pane chrome (gutters + 1-px borders + focused accent), and the cell tab-bar are in `crates/app/src/pane_render.rs`.
-
-The split-tree (vs. flat grid) decision and the MAX_PANES rationale are recorded in `docs/adr/`.
+- The shipped grid is an `egui_tiles::Tree<Pane>` in `crates/app/src/egui_app/grid.rs`;
+  pane interaction lives alongside it in the same module directory.
+- `MAX_PANES` is defined at `crates/app/src/egui_app/grid.rs:23`.
+- `crates/app/src/drag.rs` (five-zone classifier) and `crates/app/src/pane_render.rs`
+  are declared from `crates/app/src/main.rs` and used only by `crates/app/src/window.rs` —
+  i.e. they are part of the `legacy-winit` binary, not the shipped shell.
+- The split-tree engine at `crates/core/src/layout/` and its JSON persistence at
+  `crates/core/src/layout_persist.rs` are likewise legacy-only.

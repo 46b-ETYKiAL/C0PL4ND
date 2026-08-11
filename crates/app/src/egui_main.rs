@@ -29,6 +29,44 @@ mod panic_hook;
 #[path = "update/mod.rs"]
 mod update;
 
+// Additive Win32 caption subclass for the Windows 11 Snap Layouts flyout. It
+// lives physically under `egui_app/` (a sibling of the lib-owned chrome modules)
+// but is a BINARY-local module of the shipping `c0pl4nd` binary — declared here,
+// compiled only into egui_main, never into the `#[path]`-included kittest lib
+// harnesses (which have no real HWND). It quarantines the raw Win32 FFI behind its
+// own `#![allow(unsafe_code)]`, so this binary's `#![deny(unsafe_code)]` holds.
+#[path = "egui_app/win_chrome.rs"]
+mod win_chrome;
+
+// Additive system-tray icon (single-click minimize/restore + right-click menu).
+// A BINARY-local module of the shipping `c0pl4nd` binary, exactly like
+// `win_chrome`: it needs the real eframe HWND + the running winit event loop, so
+// it lives physically under `egui_app/` but is declared here and never compiled
+// into the `#[path]`-included kittest lib harnesses. Its raw Win32 FFI is
+// quarantined behind its own `#![allow(unsafe_code)]`, so this binary's
+// `#![deny(unsafe_code)]` holds.
+#[path = "egui_app/tray.rs"]
+mod tray;
+
+// Quake mode: a DEFAULT-OFF global hotkey that drops the window down from the top
+// of the monitor under the cursor and hides it again. A BINARY-local module for
+// the same reason as `tray`/`win_chrome` — it needs the real eframe HWND and the
+// running winit message loop (it reads `WM_HOTKEY` through its own
+// `SetWindowSubclass` entry, chaining rather than competing with `win_chrome`'s).
+// Its raw Win32 FFI is quarantined behind its own `#![allow(unsafe_code)]`.
+#[path = "egui_app/quake.rs"]
+mod quake;
+
+// Single-instance guard + argv forwarding: a SECOND `c0pl4nd.exe` hands its
+// `--cwd` to the running instance (which opens a tab and raises itself) instead
+// of starting a rival window. A BINARY-local module for the same reason as
+// `tray`/`quake` — it needs the real eframe HWND and the running winit message
+// loop (it reads `WM_COPYDATA` through its own `SetWindowSubclass` entry,
+// chaining rather than competing with `win_chrome`'s and `quake`'s). Its raw
+// Win32 FFI is quarantined behind its own `#![allow(unsafe_code)]`.
+#[path = "egui_app/single_instance.rs"]
+mod single_instance;
+
 // The egui shell lives in this crate's lib target so `tests/` links THIS
 // compilation instead of `#[path]`-including a private second copy — which made
 // llvm-cov attribute the kittest suites' coverage to an object the report never
@@ -36,7 +74,7 @@ mod update;
 // the binary's own modules: `panic_hook` reaches reporting this way.
 // W1TN3SS opt-in reporting glue (Tier-1 crash spool + manual issue intake).
 // Pure consumers of the pinned-tag `itasha-report-core` SDK; both default OFF.
-use c0pl4nd::{egui_app, user_error};
+use c0pl4nd::{cli_cwd, egui_app, user_error};
 
 // `reporting`'s only consumer in this binary is `panic_hook::capture_panic_w1tn3ss`,
 // which is itself `cfg(not(feature = "legacy-winit"))`. Carry the same gate here or
@@ -119,6 +157,47 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // `c0pl4nd --cwd <path>` (alias `-d <path>`, matching Windows Terminal) —
+    // the directory the INITIAL shell starts in. This is what the Explorer
+    // "Open C0PL4ND here" context-menu verb passes (`--cwd "%V"`), so the value
+    // is UNTRUSTED: a path that does not exist, or that names a file, is
+    // refused here with a clear message and a non-zero exit rather than
+    // silently ignored (which reads as "the menu entry is broken") or panicked.
+    //
+    // The validated directory is handed to the one-shot `cli_cwd` store, which
+    // the deferred first-pane spawn consumes and passes to
+    // `PaneTerm::spawn_in_with_term`. It is deliberately NOT applied with
+    // `std::env::set_current_dir`: `PtyProcess::spawn_program_in_with_term`
+    // always sets the child's directory explicitly (requested cwd, else the
+    // HOME fallback), so the child never inherits the process cwd and
+    // `set_current_dir` would be a silent no-op. Threading it to the spawn seam
+    // is the only wire that actually reaches the shell.
+    match cli_cwd::parse_startup_cwd(&args) {
+        Ok(Some(dir)) => cli_cwd::set_startup_cwd(&dir),
+        Ok(None) => {}
+        Err(e) => {
+            // `show_startup_error` also prints to stderr, and shows a dialog on
+            // Windows — where a release build is a GUI-subsystem app with no
+            // console, so stderr alone would be invisible.
+            panic_hook::show_startup_error("C0PL4ND couldn't start", &e.user_message());
+            std::process::exit(2);
+        }
+    }
+
+    // SINGLE INSTANCE. Deliberately placed AFTER the `--cwd` validation above:
+    // a malformed directory must still be refused with its clear message and
+    // exit 2, whether the user is launching the first window or the tenth — if
+    // this ran first, a bad path would be silently forwarded and swallowed.
+    //
+    // From here on a second launch is a TAB in the running window, not a rival
+    // process: without this, every "Open C0PL4ND here" spawns a whole new app.
+    // Any failure inside returns `Primary`, so a broken guard degrades to the
+    // previous behaviour (a second window) rather than to a launch that opens
+    // nothing.
+    if single_instance::acquire_or_forward(&args) == single_instance::Role::Secondary {
+        return Ok(());
+    }
+
     // The window position + size are persisted natively by eframe via the
     // `persistence` feature + `NativeOptions.persist_window` below (ron state
     // stored under the stable `with_app_id` folder). We set only the FIRST-RUN
@@ -136,21 +215,27 @@ fn main() -> eframe::Result<()> {
         // `ViewportCommand::Focus` and, on Windows 11 (foreground-lock), runs the
         // `win_foreground` AttachThreadInput nudge ONCE on the first frame as a
         // backstop (see `egui_app::win_foreground`).
-        .with_active(true)
-        // Suppress the native min/max caption buttons at CREATION. winit leaves
-        // WS_MINIMIZEBOX | WS_MAXIMIZEBOX set on an undecorated window (winit
-        // #2754), and Win11 DWM draws native min/max caption buttons from those
-        // style bits — which, once a translucent backdrop (mica/acrylic) is
-        // applied, composite THROUGH as a second, offset set over our own custom
-        // titlebar (the reported "doubled caption buttons"). Clearing the bits at
-        // creation stops winit from ever setting them, so DWM draws no native
-        // min/max buttons — with ZERO runtime style manipulation (a runtime
-        // SetWindowLongPtr/SWP_FRAMECHANGED fights winit's frameless composition
-        // and repaints a stray native frame). WS_SYSMENU is left intact, so
-        // Alt+F4, the taskbar right-click Close, and the window system menu all
-        // keep working; our own titlebar draws the min/max/close the user clicks.
-        .with_minimize_button(false)
-        .with_maximize_button(false);
+        .with_active(true);
+    // RESTORE the native minimize/maximize STYLE BITS (do NOT clear them at
+    // creation). egui-winit maps the min/max "enabled buttons" to
+    // WS_MINIMIZEBOX | WS_MAXIMIZEBOX on the (undecorated) window, and Windows
+    // gates ALL of Aero Snap on those bits: WS_MAXIMIZEBOX gates
+    // drag-to-top-maximize, drag-to-edge, Win+Left/Right/Up, Snap Assist AND the
+    // Windows 11 Snap Layouts flyout; WS_MINIMIZEBOX gates Win+Down and the
+    // taskbar minimize/restore animation. An earlier revision cleared both bits at
+    // creation (`.with_minimize_button(false)` / `.with_maximize_button(false)`) to
+    // stop DWM compositing a second native min/max set over the custom titlebar —
+    // but that ALSO disabled every snap gesture (the reported "drag-to-top doesn't
+    // maximize, no Snap Layouts"). winit 0.30.13 already hides the native
+    // non-client frame via a `WM_NCCALCSIZE`-returns-0 handler on the undecorated
+    // window, so keeping the style bits SET restores snap WITHOUT re-admitting a
+    // doubled native frame (real-Win11 verification of the transparent-window case
+    // is noted in `win_chrome`). The Win11 Snap Layouts FLYOUT additionally needs a
+    // `WM_NCHITTEST` -> `HTMAXBUTTON` reply over the maximize button; that is added
+    // by the additive `win_chrome` Win32 subclass (see the `win_chrome` module),
+    // which layers on top of winit's frame and never touches WM_NCCALCSIZE.
+    // (WS_SYSMENU's residual native close "x" is still stripped per-frame by
+    // `egui_app::caption_close`; that is orthogonal to these snap bits.)
     // Runtime window + taskbar icon (the sigil). The exe's embedded icon
     // resource (build.rs) covers the Start-menu shortcut / Explorer /
     // Add-Remove-Programs; this covers the live window. Best-effort — a decode
@@ -231,7 +316,107 @@ fn main() -> eframe::Result<()> {
         "C0PL4ND",
         options,
         Box::new(|cc| {
-            let app = egui_app::C0pl4ndApp::new(cc);
+            let mut app = egui_app::C0pl4ndApp::new(cc);
+            // Windows 11 Snap Layouts: prime the additive `win_chrome` caption
+            // subclass with the REAL eframe HWND (same handle `caption_close` /
+            // `win_foreground` use), then drive its per-frame maximize-button-rect
+            // publish + one-shot subclass install from a begin-pass hook. The hook
+            // runs every pass on the winit/main thread; `win_chrome::tick` reads the
+            // live `content_rect()` + `pixels_per_point()` so the published rect
+            // tracks window resize and DPI. Additive over winit's frame; a no-op off
+            // Windows and when `C0PL4ND_DISABLE_SNAP_CHROME` is set.
+            #[cfg(windows)]
+            {
+                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                if let Ok(handle) = cc.window_handle() {
+                    if let RawWindowHandle::Win32(w) = handle.as_raw() {
+                        win_chrome::prime_hwnd(w.hwnd.get());
+                    }
+                }
+            }
+            cc.egui_ctx.on_begin_pass(
+                "win_chrome_snap_layouts",
+                std::sync::Arc::new(|ui: &mut egui::Ui| win_chrome::tick(ui.ctx())),
+            );
+            // Windows 11 window MATERIAL: rounded corners + an explicit backdrop
+            // choice. A frameless window is square-cornered unless the app asks
+            // otherwise, and DWM's default `Auto` backdrop paints a system material
+            // UNDER our own per-pixel-alpha surface — which is what the `opacity`
+            // slider composites through, so the material has to be declined
+            // explicitly (see `win_chrome::desired_window_material`). Both go
+            // through winit's TYPED `WindowExtWindows` extension rather than a raw
+            // `DwmSetWindowAttribute`, so this `#![deny(unsafe_code)]` binary stays
+            // unsafe-free. `winit_window()` is `None` only in headless/test hosts.
+            // A no-op off Windows and when `C0PL4ND_DISABLE_SNAP_CHROME` is set.
+            if let Some(window) = cc.winit_window() {
+                win_chrome::apply_window_material(window.as_ref(), shipping_window_material());
+            }
+            // System-tray icon. Created HERE — after the window exists and on the
+            // event-loop thread — so it can prime the real HWND (for
+            // minimize/restore) and register its click/menu handlers. A single
+            // LEFT click toggles minimize/restore; right click opens Show / Hide /
+            // Quit. Best-effort: `tray::init` never panics or blocks startup (a
+            // headless/session-0 shell simply gets no tray). The icon reuses the
+            // embedded sigil PNG (`load_app_icon`, re-decoded once). No-op off
+            // Windows. This is the tray's live creation call site — the wiring the
+            // whole feature depends on.
+            #[cfg(windows)]
+            {
+                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                if let Ok(handle) = cc.window_handle() {
+                    if let RawWindowHandle::Win32(w) = handle.as_raw() {
+                        tray::prime_hwnd(w.hwnd.get());
+                    }
+                }
+            }
+            // REPORT the answer to the app. `close_to_tray` hides the window
+            // instead of exiting, and hiding it with no icon to restore it from
+            // strands the process running and unreachable — so `close_action`
+            // exits unless a tray is proven to exist. Dropping this call would
+            // leave the field at its fail-safe `false` and silently make the
+            // whole close-to-tray preference inert.
+            let tray_available = match load_app_icon() {
+                Some(icon) => tray::init(&cc.egui_ctx, icon.rgba, icon.width, icon.height),
+                None => false,
+            };
+            app.set_tray_available(tray_available);
+            // Quake mode (drop-down terminal). Primed + armed HERE for the same
+            // reasons as the tray: the real HWND must exist and we must be on the
+            // event-loop thread, because `RegisterHotKey` targets that window's
+            // message queue and `quake` reads `WM_HOTKEY` off it via its own
+            // subclass. DEFAULT OFF — `quake::init` registers NOTHING unless
+            // `quake.enabled` is set in the config, and refuses an unparseable or
+            // modifier-less combo rather than claiming an unintended global hotkey.
+            // Applies at startup (a settings change takes effect on the next
+            // launch); best-effort — a busy combo logs a warning and never blocks.
+            #[cfg(windows)]
+            {
+                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                if let Ok(handle) = cc.window_handle() {
+                    if let RawWindowHandle::Win32(w) = handle.as_raw() {
+                        quake::prime_hwnd(w.hwnd.get());
+                    }
+                }
+            }
+            quake::init(&cc.egui_ctx, &launch_quake_config());
+            // Single-instance: mark THIS window as the primary and start
+            // accepting forwarded launches on it. Primed here, with the tray and
+            // quake, for the same reasons — the real HWND must exist and we must
+            // be on the event-loop thread, because the forward arrives as a
+            // `WM_COPYDATA` dispatched to that window's message queue. This is
+            // the live call site the whole forwarding path depends on: without
+            // it the mutex would still be claimed but no window would carry the
+            // marker property, so every later launch would fall back to opening
+            // its own window.
+            #[cfg(windows)]
+            {
+                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                if let Ok(handle) = cc.window_handle() {
+                    if let RawWindowHandle::Win32(w) = handle.as_raw() {
+                        single_instance::install(&cc.egui_ctx, w.hwnd.get());
+                    }
+                }
+            }
             // On-launch update check. Drives the SHARED in-app updater that powers
             // the persistent, dismissible NOTIFICATION BANNER (and the Settings →
             // Updates page): a found update surfaces a one-click "Update now" strip
@@ -308,6 +493,15 @@ fn launch_transparency_enabled() -> bool {
 /// the viewport can be created already at the always-on-top window level. Mirrors
 /// [`launch_gpu_preference`]: a missing / unreadable config yields `false` (the
 /// opt-in default), never a crash.
+/// The corner + backdrop pair the SHIPPING window asks the OS for.
+///
+/// The single decision helper shared by the eframe creation closure and the test
+/// that pins it: the call site passes this function's result verbatim, so there
+/// is no separate argument that could drift from what is asserted.
+fn shipping_window_material() -> (win_chrome::CornerStyle, win_chrome::BackdropStyle) {
+    win_chrome::desired_window_material(launch_transparency_enabled())
+}
+
 fn launch_always_on_top() -> bool {
     c0pl4nd_core::Config::default_path()
         .filter(|p| p.exists())
@@ -317,6 +511,22 @@ fn launch_always_on_top() -> bool {
                 .and_then(|s| c0pl4nd_core::Config::from_toml(&s, &p).ok())
         })
         .map(|c| c.always_on_top)
+        .unwrap_or_default()
+}
+
+/// The persisted quake-mode block, read from the on-disk config at startup.
+/// Mirrors [`launch_always_on_top`]: a missing / unreadable / malformed config
+/// yields [`QuakeConfig::default`] — which is `enabled: false` — so a config
+/// problem can never accidentally claim a global hotkey.
+fn launch_quake_config() -> c0pl4nd_core::config::QuakeConfig {
+    c0pl4nd_core::Config::default_path()
+        .filter(|p| p.exists())
+        .and_then(|p| {
+            std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|s| c0pl4nd_core::Config::from_toml(&s, &p).ok())
+        })
+        .map(|c| c.quake)
         .unwrap_or_default()
 }
 
@@ -611,6 +821,187 @@ fn load_app_icon() -> Option<egui::IconData> {
 #[cfg(test)]
 mod tests {
     use super::resolve_power_preference;
+
+    /// Reachability + correctness guard for the `win_chrome` Snap-Layouts wiring.
+    ///
+    /// `main` registers a begin-pass hook (`cc.egui_ctx.on_begin_pass(...)`) whose
+    /// body is `win_chrome::tick(ui.ctx())`, and `tick` calls
+    /// `win_chrome::publish_from_geometry(content_right, ppp)`. This test drives
+    /// that EXACT published-rect function (the one the shipping binary calls every
+    /// frame) and asserts it produces the maximize-button rect the un-editable
+    /// `chrome.rs` caption cluster paints — so the module is proven reachable from
+    /// egui_main and geometrically correct, not merely defined. The compiled live
+    /// call site above (plus `-D warnings` dead-code) is the wiring; this is its
+    /// behavioural assertion.
+    #[test]
+    fn win_chrome_publish_is_wired_and_matches_the_caption_layout() {
+        crate::win_chrome::publish_from_geometry(1100.0, 1.0);
+        let r = crate::win_chrome::published_rect()
+            .expect("the shipping-path publish must produce a non-empty maximize rect");
+        // right_edge = 1100 - 8 = 1092; maximize right = 1092 - 44 = 1048; left 1006.
+        assert_eq!(
+            (r.left, r.right),
+            (1006, 1048),
+            "maximize-button x mirrors chrome.rs"
+        );
+        // titlebar 40px, button 28px tall, centred → top 6, bottom 34.
+        assert_eq!(
+            (r.top, r.bottom),
+            (6, 34),
+            "maximize-button y mirrors chrome.rs"
+        );
+    }
+
+    /// The window MATERIAL the shipping call site actually asks for.
+    ///
+    /// `apply_window_material` is handed `launch_transparency_enabled()` from the
+    /// eframe creation closure, and that is unconditionally `true` (the window is
+    /// always created transparent-capable). So the shipped window must round its
+    /// corners AND decline the DWM system backdrop — leaving the backdrop on its
+    /// `Auto` default would paint a system material under the very surface the
+    /// `opacity` slider composites through.
+    ///
+    /// This pins the DECISION at the argument the call site passes. The OS effect
+    /// itself (`set_corner_preference` / `set_system_backdrop` actually changing
+    /// how DWM draws the window) needs a real Windows 11 window and is NOT covered
+    /// here — see the honest-limits note in `win_chrome`'s module docs.
+    #[test]
+    fn shipping_window_material_is_round_cornered_and_backdrop_free() {
+        use crate::win_chrome::{BackdropStyle, CornerStyle};
+        assert!(
+            super::launch_transparency_enabled(),
+            "precondition: the shipping window is always transparent-capable"
+        );
+        // The SAME helper the creation closure hands to `apply_window_material`.
+        let (corner, backdrop) = super::shipping_window_material();
+        assert_eq!(corner, CornerStyle::Round, "a frameless window must round");
+        assert_eq!(
+            backdrop,
+            BackdropStyle::None,
+            "the DWM material must be declined on the transparent surface"
+        );
+    }
+
+    /// Quake mode and the tray icon both toggle the SAME window, so they must
+    /// share one state model or they will fight: if quake kept a private "is it
+    /// dropped?" latch, a tray minimize would invalidate it and the next hotkey
+    /// press would retract an already-hidden window — the user presses the key and
+    /// nothing appears.
+    ///
+    /// Both decide from the live OS state instead. This pins the contract across
+    /// all eight `(visible, minimized, foreground)` combinations: whenever quake
+    /// reads the window as out-of-view it drops it DOWN (never retracts), and the
+    /// tray — fed the identical predicate — restores it. Only the one state where
+    /// the window is genuinely in view AND focused retracts, and the resulting
+    /// hidden window is exactly what the tray then reads as restorable.
+    ///
+    /// This is a genuine cross-module test: `quake` and `tray` are separate
+    /// `#[path]` modules that never import each other, so nothing but this
+    /// assertion keeps their state models aligned.
+    #[test]
+    fn quake_and_tray_agree_on_window_state() {
+        use crate::quake::{is_out_of_view, quake_action, QuakeAction};
+        use crate::tray::{toggle_action, ToggleAction};
+
+        for visible in [false, true] {
+            for minimized in [false, true] {
+                for foreground in [false, true] {
+                    // Derive the expectation INDEPENDENTLY rather than calling
+                    // `is_out_of_view` and feeding both sides from it — that would
+                    // make the test self-referential (cutting `is_out_of_view`
+                    // would move both sides together and the assertions would still
+                    // pass, proving nothing). Restating the predicate here is what
+                    // makes the check adversarial; the assert below then pins the
+                    // production function to this independent statement.
+                    let out = !visible || minimized;
+                    assert_eq!(
+                        is_out_of_view(visible, minimized),
+                        out,
+                        "the production out-of-view predicate must be `!visible || \
+                         minimized` ({visible},{minimized})"
+                    );
+                    let q = quake_action(visible, minimized, foreground);
+                    let t = toggle_action(out);
+                    if out {
+                        assert_eq!(
+                            q,
+                            QuakeAction::DropDown,
+                            "quake must SHOW an out-of-view window ({visible},{minimized},{foreground})"
+                        );
+                        assert_eq!(
+                            t,
+                            ToggleAction::Restore,
+                            "the tray must agree the window is out of view"
+                        );
+                    } else {
+                        assert_eq!(
+                            t,
+                            ToggleAction::Minimize,
+                            "the tray must agree the window is in view"
+                        );
+                        // In view: quake retracts only when it also has focus.
+                        let expected = if foreground {
+                            QuakeAction::Retract
+                        } else {
+                            QuakeAction::DropDown
+                        };
+                        assert_eq!(q, expected, "({visible},{minimized},{foreground})");
+                    }
+                }
+            }
+        }
+
+        // The hand-off itself: a quake retract HIDES the window (visible = false),
+        // and the tray's very next click must therefore restore it — the escape
+        // hatch stays correct after quake has run.
+        assert_eq!(quake_action(true, false, true), QuakeAction::Retract);
+        assert_eq!(
+            toggle_action(is_out_of_view(false, false)),
+            ToggleAction::Restore,
+            "after a quake retract the tray must restore, not minimize again"
+        );
+        // And symmetrically: after a tray minimize the next hotkey must drop down.
+        assert_eq!(toggle_action(false), ToggleAction::Minimize);
+        assert_eq!(quake_action(true, true, false), QuakeAction::DropDown);
+    }
+
+    /// Reachability + correctness guard for the quake wiring, mirroring the
+    /// `win_chrome` test above: `main` calls `quake::init(&ctx,
+    /// &launch_quake_config())`, so this drives that EXACT config reader and the
+    /// EXACT geometry function the hotkey path uses, and asserts the two
+    /// safety-critical properties — the shipped default claims no global hotkey,
+    /// and the drop-down rect the shipping path computes clears the taskbar.
+    #[test]
+    fn quake_launch_config_defaults_off_and_geometry_clears_the_taskbar() {
+        // `launch_quake_config` is what the live call site feeds `quake::init`. On
+        // a machine with no config (CI) it must yield the default; on a developer
+        // machine with one it must still not be *enabled* by accident, so assert
+        // the invariant that actually matters: a default-constructed block is off.
+        let def = c0pl4nd_core::config::QuakeConfig::default();
+        assert!(!def.enabled, "quake mode must ship OFF");
+        let launched = super::launch_quake_config();
+        // Reading it must never panic and must produce a usable fraction.
+        assert!(
+            (0.1..=1.0).contains(&launched.effective_height_fraction()),
+            "the launch-path height fraction must always be usable"
+        );
+
+        // The geometry the shipping hotkey path computes, on a 1920x1080 monitor
+        // with a 40px bottom taskbar.
+        let work = crate::quake::ScreenRect::new(0, 0, 1920, 1040);
+        let r = crate::quake::quake_rect(work, def.effective_height_fraction())
+            .expect("the shipping-path geometry must produce a rect for a real work area");
+        assert_eq!(r.top, 0, "anchored to the top of the work area");
+        assert_eq!(r.width(), 1920, "full work-area width");
+        assert!(
+            r.bottom <= work.bottom,
+            "the drop-down must never overlap the taskbar"
+        );
+        // The default combo the same path would register.
+        let spec =
+            crate::quake::parse_hotkey(&def.hotkey).expect("the shipped default combo must parse");
+        assert_ne!(spec.modifiers, 0, "the default combo carries a modifier");
+    }
 
     #[test]
     fn gpu_preference_maps_and_env_wins() {

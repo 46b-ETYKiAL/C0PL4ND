@@ -5,8 +5,81 @@ All notable changes to C0PL4ND are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Full per-release artifacts (signed binaries, SBOMs, provenance) are on the
-[GitHub Releases](https://github.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND/releases)
+[GitHub Releases](https://github.com/46b-ETYKiAL/C0PL4ND/releases)
 page.
+
+## [Unreleased]
+
+### Changed — config schema v2 → v3 (one-time, rewrites `config.toml`)
+
+- **The GitHub repository was renamed (`Itasha.Corp_C0PL4ND` → `C0PL4ND`), and a
+  one-time config migration re-points the stored issue-intake repository.** This
+  is user-visible because it rewrites state on disk, so the mechanism is worth
+  stating plainly:
+  - Every field of `config.toml` is `#[serde(default)]`, so a value *stored* in
+    your file always beats the source default. `Config::save_to` serializes every
+    field (there is no `skip_serializing_if`) and runs on ordinary actions such
+    as persisting window geometry — so essentially every existing user already
+    has the old repository name written into their file. Changing the compiled
+    default alone would therefore never have reached them, and their "Report an
+    issue" link would keep depending on GitHub's rename redirect indefinitely.
+  - On first load under this build, a config below schema v3 is stamped to v3 and
+    its `reporting.issue_intake.repo` is re-pointed **only when it is exactly the
+    old shipped default** `46b-ETYKiAL/Itasha.Corp_C0PL4ND`. **Any other value —
+    an operator pointing the issue form at their own fork — is preserved
+    verbatim.** The step is one-shot: once `schema_version` reaches 3 it never
+    runs again, so a value you set deliberately afterwards is never re-touched.
+  - Known and accepted limitation: a config that *deliberately* pins the old
+    name is byte-identical to one that merely persisted the old default, so it is
+    indistinguishable and will be re-pointed once. Re-set it after upgrading and
+    it will stick.
+  - Because a migration marks the config dirty, the next save rewrites the file.
+    Keys that this build no longer recognises (notably the retired
+    `transparency_enabled` / `window_mode` / `acrylic` transparency model,
+    collapsed into `opacity` in v0.4.21) are dropped from the file at that point.
+    They were already inert on load; the rewrite is when they stop being stored.
+- **A config written by a *newer* build is left alone.** A `schema_version` ahead
+  of this build's is never lowered and never migrated down.
+
+### Fixed
+
+- **The one-line installer died silently when a release asset was missing.**
+  `packaging/linux/install.sh` fetched the release archive with no failure
+  handler, so under `set -eu` a 404 killed the script immediately after printing
+  `Downloading …` — no cause, no next step, indistinguishable from a hang. (The
+  checksum and signature downloads beside it always had that handler; the archive
+  download did not.) It now names the URL and says what to check. This is the
+  failure shape that made an earlier asset-contract change look like a hung
+  terminal rather than a broken install.
+- **The Homebrew cask pointed at DMG assets that never existed.** The formula
+  asked for `c0pl4nd-<tag>-aarch64-apple-darwin.dmg`, but the release workflow
+  publishes `c0pl4nd-<tag>-aarch64.dmg` (arch, not the full target triple), so
+  both URLs 404'd — verified against the live release. A correct repository name
+  pointing at a nonexistent asset is the same broken install in a new place.
+- **The release-drift check could fail without saying why, and could pass
+  without checking.** Two defects in one step: (a) under `set -euo pipefail`, a
+  `Cargo.toml` with no top-level `version` line made `grep` exit non-zero and the
+  failing command substitution killed the step *on the assignment* — before the
+  explicit "could not read the workspace version" error could run, so the step
+  exited 1 having printed nothing at all and the guard was unreachable code;
+  (b) `gh release view … 2>/dev/null || true` collapsed *every* failure mode
+  (expired auth, rate limit, network, egress policy, `gh` absent) into the
+  "no releases published yet, nothing to compare" vacuous pass. Since the job
+  runs on a schedule, a persistent auth fault would have made it silently inert
+  while still logging a green premise that was false. Release-query failures now
+  fail loudly, matching the tag-existence probe in the same file, which already
+  failed closed.
+
+### Added
+
+- **An end-to-end installer check (`installer-e2e.yml`).** It runs the real
+  `install.sh` against the real latest published release on a clean runner and
+  then executes the installed binary, because verifying that release *assets*
+  exist and verify — which `post-release-verify.yml` already does — cannot catch
+  an installer that is unable to consume them. It carries a permanent negative
+  control that asserts the installer refuses a nonexistent release *with a
+  diagnosis*, so the job proves it can fail on every run rather than on the day
+  someone checked by hand.
 
 ## [0.4.25]
 
@@ -586,7 +659,7 @@ the complete issue-finding tool sweep).
 Earlier releases (0.1.0 – 0.4.3) predate this changelog; see the GitHub Releases
 page for their notes and signed artifacts.
 
-[0.4.6]: https://github.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND/releases/tag/v0.4.6
-[0.4.5]: https://github.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND/releases/tag/v0.4.5
-[0.4.4]: https://github.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND/releases/tag/v0.4.4
-[0.4.3]: https://github.com/46b-ETYKiAL/Itasha.Corp_C0PL4ND/releases/tag/v0.4.3
+[0.4.6]: https://github.com/46b-ETYKiAL/C0PL4ND/releases/tag/v0.4.6
+[0.4.5]: https://github.com/46b-ETYKiAL/C0PL4ND/releases/tag/v0.4.5
+[0.4.4]: https://github.com/46b-ETYKiAL/C0PL4ND/releases/tag/v0.4.4
+[0.4.3]: https://github.com/46b-ETYKiAL/C0PL4ND/releases/tag/v0.4.3

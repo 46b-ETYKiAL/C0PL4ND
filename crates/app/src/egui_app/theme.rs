@@ -31,6 +31,117 @@ pub fn is_light(c: Color32) -> bool {
     luminance(c) > 0.5
 }
 
+/// The opaque sRGB triple of an egui colour, in the `(u8, u8, u8)` vocabulary
+/// the core WCAG helpers take. `Color32::to_array` yields `[r, g, b, a]`; the
+/// alpha is dropped because a contrast ratio is only defined between opaque
+/// colours (every colour these helpers are called with — surfaces, text, the
+/// close-red, the focus ring — is opaque).
+fn rgb_triple(c: Color32) -> (u8, u8, u8) {
+    let [r, g, b, _] = c.to_array();
+    (r, g, b)
+}
+
+/// WCAG contrast ratio between two opaque colours — `1.0` (identical) up to
+/// `21.0` (black on white). WCAG 2.4.11 / 2.4.13 require **>= 3:1** for a focus
+/// indicator against BOTH the focused control and its surroundings, which is the
+/// floor [`focus_ring_color`] is built to guarantee.
+///
+/// A thin `Color32` ADAPTER over [`c0pl4nd_core::theme::contrast_ratio`], not a
+/// second implementation. This module used to carry its own `relative_luminance`
+/// (the sRGB linearisation + the 0.2126/0.7152/0.0722 weights) plus its own ratio
+/// arithmetic, duplicating `c0pl4nd_core::theme::color_model` — which the
+/// terminal renderer's minimum-contrast clamp uses. Two private copies of one
+/// standard, and the local test only ever checked this copy against hard-coded
+/// literals, so the two could have drifted apart with nothing failing. Both now
+/// resolve to the single core implementation; the app-side
+/// `relative_luminance` wrapper went with them, having existed only to feed this
+/// function (nothing else called it). Callers wanting the raw WCAG luminance use
+/// [`c0pl4nd_core::theme::relative_luminance`]; [`luminance`] remains the cheap
+/// Rec.601 approximation used for the light/dark polarity pivot, which is a
+/// deliberately different thing — polarity only needs a rough split, whereas a
+/// ratio that claims WCAG conformance must use the WCAG formula.
+pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    c0pl4nd_core::theme::contrast_ratio(rgb_triple(a), rgb_triple(b))
+}
+
+/// The Windows-standard destructive close-red (`#E81123`) — the hover fill of
+/// the caption ✕ and the tab ×. Lives here (next to [`focus_ring_color`], which
+/// must contrast against it) so the ring's guarantee is computed against the real
+/// value rather than a copy that could drift.
+pub const CLOSE_RED: Color32 = Color32::from_rgb(0xE8, 0x11, 0x23);
+
+/// The pressed shade of [`CLOSE_RED`] — visibly darker so a held ✕ is never the
+/// same pixel as a merely-hovered one.
+pub const CLOSE_RED_PRESSED: Color32 = Color32::from_rgb(0xA3, 0x0C, 0x18);
+
+/// The keyboard-focus ring colour for the flat chrome buttons.
+///
+/// egui 0.34 has **no** dedicated focus-ring style (there is no `focus_stroke`
+/// field); [`egui::Style::interact`] merely returns the *active* visuals for a
+/// focused widget, so a keyboard-focused chrome button otherwise looks
+/// permanently PRESSED and is indistinguishable from hover. The chrome therefore
+/// paints its own ring, and this picks its colour.
+///
+/// The ring must clear the WCAG 2.4.11/2.4.13 **3:1** floor against every surface
+/// it can land on: the titlebar `panel`, the window `bg`, and the ✕'s
+/// [`CLOSE_RED`] hover fill. The theme `accent` is preferred (brand-consistent)
+/// and only falls back to the higher-contrast monochrome pole when it does not
+/// clear the floor against all three — and one of white/black always does, so the
+/// guarantee holds for ANY theme.
+pub fn focus_ring_color(colors: ChromeColors) -> Color32 {
+    let against = [colors.panel, colors.bg, CLOSE_RED];
+    let worst = |c: Color32| {
+        against
+            .iter()
+            .map(|s| contrast_ratio(c, *s))
+            .fold(f32::INFINITY, f32::min)
+    };
+    let accent_score = worst(colors.accent);
+    if accent_score >= FOCUS_RING_MIN_CONTRAST {
+        return colors.accent;
+    }
+    let (white, black) = (worst(Color32::WHITE), worst(Color32::BLACK));
+    if white >= black {
+        Color32::WHITE
+    } else {
+        Color32::BLACK
+    }
+}
+
+/// The WCAG 2.4.11 non-text contrast floor a focus indicator must clear.
+pub const FOCUS_RING_MIN_CONTRAST: f32 = 3.0;
+
+/// The WCAG 2.2 **1.4.3 AA** contrast floor for normal-size body TEXT.
+///
+/// Distinct from [`FOCUS_RING_MIN_CONTRAST`] on purpose: 3:1 is the *non-text*
+/// floor for indicators and graphical objects (1.4.11), and applying it to text
+/// would sign off on a hint nobody can read.
+pub const TEXT_MIN_CONTRAST: f32 = 4.5;
+
+/// [`ChromeColors::accent`] made legible AS TEXT on `surface`.
+///
+/// `accent` is derived from the theme's `selection_background` — a colour chosen
+/// to sit BEHIND text as a wash, where being close to the background is the
+/// point. Painting it as a foreground has no contrast guarantee whatsoever, and
+/// the shipped `void` theme proves it: its selection colour `#33106b` on the
+/// status bar's `#202020` panel is **1.11:1** against a 4.5:1 floor, which
+/// rendered the pane counter and the welcome toast as near-invisible dark purple
+/// on dark grey.
+///
+/// This is the TEXT analogue of [`focus_ring_color`]: the theme's own hue is
+/// preferred and returned untouched when it already clears the floor, and only a
+/// failing accent is lifted — via the core clamp, which blends toward whichever
+/// monochrome pole has the headroom, so the accent keeps as much chroma as
+/// legibility allows instead of snapping to white.
+pub fn accent_text_color(accent: Color32, surface: Color32) -> Color32 {
+    let (r, g, b) = c0pl4nd_core::theme::enforce_min_contrast(
+        rgb_triple(accent),
+        rgb_triple(surface),
+        TEXT_MIN_CONTRAST,
+    );
+    Color32::from_rgb(r, g, b)
+}
+
 /// Parse a `c0pl4nd_core::Theme` `#rrggbb` field into an egui `Color32`, falling
 /// back to `fallback` when the field is empty or unparseable (e.g. the optional
 /// `selection_background` slot a minimal theme omits).
@@ -153,6 +264,21 @@ pub fn visuals_from_theme(theme: &c0pl4nd_core::Theme) -> Visuals {
     v.widgets.active.bg_stroke = Stroke::new(1.0f32, press); // press accent
     v.widgets.active.fg_stroke = Stroke::new(1.0f32, fg);
 
+    // Pointing-hand cursor over interactive controls. egui's default is
+    // `interact_cursor: None` (style.rs:1538) and `Button` only calls
+    // `set_cursor_icon` when it is `Some` (widgets/button.rs:374-378) — so with
+    // the default NO button, tab, or toolbar control anywhere in the app changed
+    // the mouse cursor, which reads as "not clickable". This is set on the
+    // Visuals (not per-widget) so every button in the app inherits it from ONE
+    // place.
+    //
+    // It does not fight the two explicit `set_cursor_icon` call-sites: the
+    // frameless resize edges run BEFORE the panels and sit on the window border
+    // where no button lives, and the terminal grid is not a `Button` (it is a
+    // bare `interact` rect), so its I-beam / link hand are unaffected — a widget
+    // only inherits this cursor by being a `Button`.
+    v.interact_cursor = Some(egui::CursorIcon::PointingHand);
+
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0f32, bezel); // separators
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0f32, fg);
     v.weak_text_color = Some(muted);
@@ -182,7 +308,15 @@ pub struct ChromeColors {
     pub muted: Color32,
     /// Live/selected accent (from the theme selection colour; brand green when
     /// the theme omits it). Used for the focused tab, status accent, headings.
+    ///
+    /// This is the raw theme colour and carries NO contrast guarantee — it is
+    /// for FILLS and strokes. Anything that paints it as TEXT on
+    /// [`Self::panel`] must use [`Self::accent_text`] instead.
     pub accent: Color32,
+    /// [`Self::accent`] made legible as TEXT on [`Self::panel`] (WCAG AA
+    /// [`TEXT_MIN_CONTRAST`]). Identical to `accent` for any theme whose
+    /// selection colour already clears the floor.
+    pub accent_text: Color32,
     /// First tone of the two-tone C0PL4ND wordmark ("C0PL"). Derived from the
     /// theme's BRIGHT magenta (echoing the brand purple) and guaranteed both
     /// readable and bright against the titlebar surface, so it tints with the
@@ -218,6 +352,7 @@ impl ChromeColors {
             fg,
             muted: fg.lerp_to_gamma(bg, 0.55),
             accent,
+            accent_text: accent_text_color(accent, panel),
             logo_a,
             logo_b,
         }
@@ -301,6 +436,275 @@ mod tests {
             &c0pl4nd_core::Theme::builtin_named("ghost-paper").expect("ghost-paper embedded"),
         );
         assert!(is_light(light.bg) && is_light(light.panel));
+    }
+
+    /// Every builtin theme this app ships, so the theme-wide guarantees below
+    /// (focus-ring contrast) are asserted against the real fleet, not one theme.
+    const ALL_BUILTIN_THEMES: [&str; 13] = [
+        "ghost-paper",
+        "dialup-glow",
+        "present-day",
+        "thermoptic",
+        "capsule-mono",
+        "jet-age",
+        "packet-trace",
+        "cockpit-amber",
+        "nerv-magi",
+        "colony-drift",
+        "kanjo-loop",
+        "yaksha-ink",
+        "datamosh-haze",
+    ];
+
+    fn every_builtin_palette() -> Vec<(&'static str, ChromeColors)> {
+        std::iter::once((
+            "void",
+            ChromeColors::from_theme(&c0pl4nd_core::Theme::builtin_void()),
+        ))
+        .chain(ALL_BUILTIN_THEMES.iter().map(|name| {
+            let t = c0pl4nd_core::Theme::builtin_named(name)
+                .unwrap_or_else(|| panic!("{name} embedded"));
+            (*name, ChromeColors::from_theme(&t))
+        }))
+        .collect()
+    }
+
+    #[test]
+    fn contrast_ratio_matches_the_wcag_reference_points() {
+        // The two anchors of the WCAG scale: identical colours are 1:1, and
+        // black-on-white is the 21:1 maximum.
+        assert!((contrast_ratio(Color32::WHITE, Color32::WHITE) - 1.0).abs() < 0.01);
+        assert!((contrast_ratio(Color32::BLACK, Color32::WHITE) - 21.0).abs() < 0.05);
+        // Symmetric in its arguments.
+        let (a, b) = (
+            Color32::from_rgb(0x12, 0x34, 0x56),
+            Color32::from_rgb(0xab, 0xcd, 0xef),
+        );
+        assert!((contrast_ratio(a, b) - contrast_ratio(b, a)).abs() < 1e-4);
+    }
+
+    /// [`contrast_ratio`] is an ADAPTER over the core implementation
+    /// (`c0pl4nd_core::theme`), not a second copy of the formula — the state this
+    /// replaced, where `contrast_ratio_matches_the_wcag_reference_points` only
+    /// ever compared the app's private copy against literals, so the two copies
+    /// could drift apart with nothing failing.
+    ///
+    /// This pins the adapter to core across a spread of colours, including
+    /// channel-ASYMMETRIC ones (the WCAG weights are 0.2126/0.7152/0.0722, so a
+    /// swapped or dropped channel moves the answer) and probes either side of the
+    /// 0.04045 linear-segment knee. Re-inlining a local copy of the maths fails
+    /// here the moment it disagrees by more than float noise, and the final block
+    /// pins [`rgb_triple`] — the one piece of the conversion this module still
+    /// owns — against the literal triples the probes were built from.
+    #[test]
+    fn wcag_helpers_are_adapters_over_the_core_implementation() {
+        const PROBES: [(u8, u8, u8); 10] = [
+            (0, 0, 0),
+            (255, 255, 255),
+            (255, 0, 0),  // asymmetric: R is weighted 0.2126…
+            (0, 255, 0),  // …G 0.7152…
+            (0, 0, 255),  // …B 0.0722 — a channel swap moves all three
+            (10, 10, 10), // below the 0.04045 knee (the `/ 12.92` segment)
+            (11, 11, 11), // just above it (the `powf(2.4)` segment)
+            (0x12, 0x34, 0x56),
+            (0xab, 0xcd, 0xef),
+            (0xE8, 0x11, 0x23), // CLOSE_RED, a real call-site colour
+        ];
+        let as_color = |(r, g, b): (u8, u8, u8)| Color32::from_rgb(r, g, b);
+
+        for (i, a) in PROBES.iter().enumerate() {
+            for b in PROBES.iter().skip(i) {
+                let app = contrast_ratio(as_color(*a), as_color(*b));
+                let core = c0pl4nd_core::theme::contrast_ratio(*a, *b);
+                assert!(
+                    (app - core).abs() < 1e-6,
+                    "contrast_ratio drifted for {a:?} vs {b:?}: app {app} vs core {core}"
+                );
+            }
+        }
+
+        // The equality above would also hold if BOTH sides were constant, so
+        // prove the probe set actually exercises the scale: the luminances must
+        // span it, and the ratios must reach the 21:1 maximum.
+        let mut lums: Vec<f32> = PROBES
+            .iter()
+            .map(|p| c0pl4nd_core::theme::relative_luminance(*p))
+            .collect();
+        lums.sort_by(f32::total_cmp);
+        let span = lums.last().unwrap() - lums.first().unwrap();
+        assert!(
+            span > 0.9,
+            "probe set does not span the luminance scale: {span}"
+        );
+        assert!(
+            (contrast_ratio(Color32::BLACK, Color32::WHITE) - 21.0).abs() < 0.05,
+            "the adapter must still reach the 21:1 WCAG maximum"
+        );
+
+        // The `Color32 -> (u8, u8, u8)` step is the only thing this module still
+        // owns, so pin it directly: a swapped or dropped channel in `rgb_triple`
+        // would leave every equality above intact if both sides were fed the same
+        // wrong triple, but it CANNOT survive being compared against the literal
+        // triple the colour was built from.
+        for probe in PROBES {
+            assert_eq!(
+                rgb_triple(as_color(probe)),
+                probe,
+                "rgb_triple must preserve channel order and drop only alpha"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_ring_clears_the_wcag_floor_against_every_surface_on_every_theme() {
+        // WCAG 2.4.11/2.4.13: a focus indicator needs >= 3:1 against BOTH the
+        // control and its surroundings. The ring can land on the titlebar panel,
+        // the window background, or the ✕'s close-red hover fill — so all three
+        // must clear the floor, for every shipped theme.
+        for (name, colors) in every_builtin_palette() {
+            let ring = focus_ring_color(colors);
+            for (label, surface) in [
+                ("panel", colors.panel),
+                ("bg", colors.bg),
+                ("close-red", CLOSE_RED),
+            ] {
+                let ratio = contrast_ratio(ring, surface);
+                assert!(
+                    ratio >= FOCUS_RING_MIN_CONTRAST,
+                    "{name}: focus ring {ring:?} only reaches {ratio:.2}:1 against {label} \
+                     (WCAG floor is {FOCUS_RING_MIN_CONTRAST}:1)"
+                );
+            }
+        }
+    }
+
+    /// THE STATUS-BAR LEGIBILITY GATE. Every colour the status bar paints TEXT
+    /// with must clear the WCAG 2.2 AA 1.4.3 floor against the surface it is
+    /// painted on, for every shipped theme. A failing pair breaks the build.
+    ///
+    /// It regressed exactly the way `bright.black` did, one tier up: the status
+    /// bar draws its pane counter and its toast in `colors.accent`, which is the
+    /// theme's `selection_background` — a colour designed to sit BEHIND text.
+    /// On the default `void` theme that is `#33106b` on the `#202020` panel:
+    /// **1.11:1**, a quarter of the floor. Rendered, the welcome toast and the
+    /// "1/6 panes" counter were dark purple on dark grey — present in the frame,
+    /// invisible to a reader.
+    ///
+    /// Asserted against the real WCAG formula rather than a hardcoded hex, so it
+    /// still means something when a palette is re-tuned, and asserted over the
+    /// WHOLE builtin fleet so a newly-embedded theme cannot slip a 1.11:1 pair
+    /// back in.
+    #[test]
+    fn every_status_bar_text_colour_meets_wcag_aa_on_its_surface() {
+        for (name, colors) in every_builtin_palette() {
+            // (label, text colour, surface) — the status bar paints on `panel`.
+            for (label, text) in [
+                ("accent_text (pane counter, toast)", colors.accent_text),
+                ("fg (the hint labels)", colors.fg),
+            ] {
+                let ratio = contrast_ratio(text, colors.panel);
+                assert!(
+                    ratio >= TEXT_MIN_CONTRAST,
+                    "{name}: status-bar {label} {text:?} on panel {:?} is only \
+                     {ratio:.2}:1 — below the WCAG AA text floor of \
+                     {TEXT_MIN_CONTRAST}:1. Text this close to its background is \
+                     painted but unreadable.",
+                    colors.panel,
+                );
+            }
+        }
+    }
+
+    /// [`accent_text_color`] must be a REAL clamp, not a pass-through: it leaves
+    /// an already-legible accent untouched (so a vivid theme keeps its hue) and
+    /// lifts a failing one until it clears the floor.
+    ///
+    /// Without the first half, "returns white always" would satisfy the gate
+    /// above while destroying every theme's accent; without the second, a
+    /// pass-through would satisfy the first half while fixing nothing.
+    #[test]
+    fn accent_text_color_lifts_only_what_fails_the_floor() {
+        let panel = Color32::from_rgb(0x20, 0x20, 0x20);
+
+        // The real defect: void's selection colour is unreadable as text.
+        let void = Color32::from_rgb(0x33, 0x10, 0x6b);
+        let before = contrast_ratio(void, panel);
+        assert!(
+            before < TEXT_MIN_CONTRAST,
+            "the regression fixture must actually be a failing pair, got \
+             {before:.2}:1"
+        );
+        let lifted = accent_text_color(void, panel);
+        assert_ne!(lifted, void, "a failing accent must be lifted");
+        assert!(
+            contrast_ratio(lifted, panel) >= TEXT_MIN_CONTRAST,
+            "the lift must clear the floor, got {:.2}:1",
+            contrast_ratio(lifted, panel)
+        );
+
+        // An accent that already clears the floor keeps its exact hue.
+        let bright = brand::GREEN;
+        assert!(contrast_ratio(bright, panel) >= TEXT_MIN_CONTRAST);
+        assert_eq!(
+            accent_text_color(bright, panel),
+            bright,
+            "a legible accent must be returned untouched, not washed to a pole"
+        );
+    }
+
+    /// The clamp must be wired into `ChromeColors`, not merely defined. Cutting
+    /// `accent_text: accent_text_color(accent, panel)` back to `accent` leaves
+    /// `every_status_bar_text_colour_meets_wcag_aa_on_its_surface` failing, but
+    /// this names the wire directly.
+    #[test]
+    fn chrome_colors_derives_accent_text_from_the_clamp() {
+        for (name, colors) in every_builtin_palette() {
+            assert_eq!(
+                colors.accent_text,
+                accent_text_color(colors.accent, colors.panel),
+                "{name}: accent_text must be the clamped accent"
+            );
+        }
+        // And on the default theme it must genuinely DIFFER from the raw accent —
+        // otherwise the field could be a rename of `accent` and every assertion
+        // above would still hold.
+        let void = ChromeColors::from_theme(&c0pl4nd_core::Theme::builtin_void());
+        assert_ne!(
+            void.accent_text, void.accent,
+            "void's accent #33106b fails the text floor, so its accent_text must \
+             differ from it"
+        );
+    }
+
+    #[test]
+    fn focus_ring_prefers_the_brand_accent_but_falls_back_when_it_cannot_contrast() {
+        // A palette whose accent is nearly the panel colour cannot be the ring —
+        // the fallback pole is chosen instead (proving the guarantee is not
+        // satisfied by luck of the theme).
+        let mut colors = ChromeColors::from_theme(&c0pl4nd_core::Theme::builtin_void());
+        colors.accent = colors.panel;
+        let ring = focus_ring_color(colors);
+        assert_ne!(
+            ring, colors.accent,
+            "an accent that cannot contrast must not be used"
+        );
+        assert!(contrast_ratio(ring, colors.panel) >= FOCUS_RING_MIN_CONTRAST);
+    }
+
+    #[test]
+    fn visuals_set_a_pointing_hand_interact_cursor() {
+        // D2: egui's default is None, so nothing in the app changed the cursor.
+        // Asserted on both polarities — it is set unconditionally.
+        for theme in [
+            c0pl4nd_core::Theme::builtin_void(),
+            c0pl4nd_core::Theme::builtin_named("ghost-paper").expect("ghost-paper embedded"),
+        ] {
+            assert_eq!(
+                visuals_from_theme(&theme).interact_cursor,
+                Some(egui::CursorIcon::PointingHand),
+                "buttons must show a pointing hand on hover"
+            );
+        }
     }
 
     #[test]

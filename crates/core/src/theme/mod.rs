@@ -4,7 +4,41 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+mod color_model;
 mod itermcolors;
+
+pub use color_model::{
+    contrast_ratio, dim_foreground, enforce_min_contrast, relative_luminance, ColorOptions,
+    ContrastScope, IntenseTextStyle, CONTRAST_RATIO_MAX, CONTRAST_RATIO_MIN,
+};
+
+/// Remap an *indexed* foreground 0-7 to its bright twin 8-15 (the bold-as-bright
+/// rule). Every other colour — an already-bright index, an extended 16-255
+/// index, a 24-bit RGB, or the theme default — is returned untouched.
+///
+/// Returning the input unchanged for `Rgb` is the load-bearing half of this
+/// function: remapping a 24-bit colour would silently rewrite a colour the
+/// program asked for exactly.
+fn brighten_indexed(color: crate::grid::Color) -> crate::grid::Color {
+    match color {
+        crate::grid::Color::Indexed(i) if i < 8 => crate::grid::Color::Indexed(i + 8),
+        other => other,
+    }
+}
+
+/// Whether the minimum-contrast clamp may touch a cell whose *original*
+/// foreground was `color`, under `scope`.
+///
+/// Under [`ContrastScope::IndexedOnly`] both `Indexed` and `Default` qualify:
+/// each is palette-derived, so the clamp is adjusting a theme choice rather
+/// than an explicit 24-bit colour the program picked.
+fn contrast_clamp_applies(color: crate::grid::Color, scope: ContrastScope) -> bool {
+    match scope {
+        ContrastScope::Never => false,
+        ContrastScope::Always => true,
+        ContrastScope::IndexedOnly => !matches!(color, crate::grid::Color::Rgb(..)),
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ThemeError {
@@ -127,7 +161,18 @@ impl Theme {
         Ok(())
     }
 
-    /// Resolve an ANSI index (0-15) to an `(r,g,b)` triple.
+    /// Resolve a 256-colour palette index to an `(r,g,b)` triple.
+    ///
+    /// * `0..=15` — the theme's own `normal` (0-7) and `bright` (8-15) rows, so
+    ///   a user theme always wins for the ANSI 16.
+    /// * `16..=231` — the standard xterm 6×6×6 colour cube.
+    /// * `232..=255` — the standard xterm 24-step greyscale ramp.
+    ///
+    /// The extended range is resolved through [`crate::term::palette`], the
+    /// single source of truth shared with the OSC 4 query/reset baseline —
+    /// there is deliberately no second copy of the cube/ramp table. Before this,
+    /// `ansi` folded every index through `index % 8`, so `\e[38;5;208m`
+    /// (orange) rendered as an unrelated ANSI slot.
     ///
     /// # Examples
     ///
@@ -138,8 +183,16 @@ impl Theme {
     /// // Index 0..8 read the `normal` row; 8..16 read the `bright` row.
     /// assert_eq!(t.ansi(0), parse_hex(&t.normal.black).unwrap());
     /// assert_eq!(t.ansi(9), parse_hex(&t.bright.red).unwrap());
+    /// // 16.. come from the fixed xterm cube: 208 is the canonical orange.
+    /// assert_eq!(t.ansi(208), (255, 135, 0));
+    /// // …and 232.. from the greyscale ramp.
+    /// assert_eq!(t.ansi(232), (8, 8, 8));
     /// ```
     pub fn ansi(&self, index: u8) -> (u8, u8, u8) {
+        if let Some(rgb) = crate::term::palette::extended_entry(index) {
+            return rgb;
+        }
+        // 0-15 only: the theme's two ANSI rows.
         let row = if index < 8 {
             &self.normal
         } else {
@@ -175,13 +228,18 @@ impl Theme {
         }
     }
 
-    /// Resolve a cell's effective `(foreground, Option<background>)` RGB,
-    /// applying SGR inverse/reverse video. The background is `None` when it
-    /// should use the window default (so the renderer can skip painting a quad
-    /// for the common case). For an inverse cell, the effective foreground is
-    /// the cell's background and vice-versa — matching every mainstream terminal
-    /// (selections, `\e[7m`, cursor-on-cell all rely on this). `default_fg` /
-    /// `default_bg` are the effective defaults (already swapped under DECSCNM).
+    /// Resolve a cell's effective `(foreground, Option<background>)` RGB under
+    /// the DEFAULT colour options ([`ColorOptions::default`], which reproduce
+    /// Windows Terminal's defaults: bold-as-bright ON, contrast clamp OFF).
+    ///
+    /// The background is `None` when it should use the window default (so the
+    /// renderer can skip painting a quad for the common case). For an inverse
+    /// cell, the effective foreground is the cell's background and vice-versa —
+    /// matching every mainstream terminal (selections, `\e[7m`, cursor-on-cell
+    /// all rely on this). `default_fg` / `default_bg` are the effective defaults
+    /// (already swapped under DECSCNM).
+    ///
+    /// Use [`Theme::cell_colors_with`] to supply non-default options.
     #[allow(clippy::type_complexity)]
     pub fn cell_colors(
         &self,
@@ -189,17 +247,72 @@ impl Theme {
         default_fg: (u8, u8, u8),
         default_bg: (u8, u8, u8),
     ) -> ((u8, u8, u8), Option<(u8, u8, u8)>) {
-        let fg = self.resolve_color(cell.fg, default_fg);
+        self.cell_colors_with(cell, default_fg, default_bg, &ColorOptions::default())
+    }
+
+    /// [`Theme::cell_colors`] with an explicit colour model.
+    ///
+    /// The pipeline, in order — the order is load-bearing:
+    ///
+    /// 1. **Bold-as-bright** — under [`IntenseTextStyle::Bright`] / `All`, a
+    ///    bold cell whose foreground is *indexed 0-7* is remapped to its bright
+    ///    twin 8-15. A 24-bit [`crate::grid::Color::Rgb`] foreground is NEVER
+    ///    remapped, and neither is an already-bright or extended index.
+    /// 2. **Resolve** indexed/default colours to RGB through this theme.
+    /// 3. **Reverse video** — swap fg and bg for an inverse cell.
+    /// 4. **Dim** (SGR 2) — blend the resulting foreground toward its effective
+    ///    background by `options.dim_blend`.
+    /// 5. **Conceal** (SGR 8) — collapse the foreground onto the background.
+    /// 6. **Minimum contrast** — applied LAST, over the post-reverse-video
+    ///    colours, so a selected/inverted cell is judged on what is actually
+    ///    painted. Governed by `options.contrast_scope`; the default
+    ///    [`ContrastScope::IndexedOnly`] leaves 24-bit foregrounds alone so
+    ///    gradient TUIs survive, and the default threshold disables it outright.
+    #[allow(clippy::type_complexity)]
+    pub fn cell_colors_with(
+        &self,
+        cell: &crate::grid::Cell,
+        default_fg: (u8, u8, u8),
+        default_bg: (u8, u8, u8),
+        options: &ColorOptions,
+    ) -> ((u8, u8, u8), Option<(u8, u8, u8)>) {
+        // (1) Bold-as-bright, on the INDEX, before any RGB resolution.
+        let cell_fg = if cell.flags.bold && options.intense_text_style.remaps_to_bright() {
+            brighten_indexed(cell.fg)
+        } else {
+            cell.fg
+        };
+        // (2) Resolve.
+        let fg = self.resolve_color(cell_fg, default_fg);
         let bg = match cell.bg {
             crate::grid::Color::Default => None,
             other => Some(self.resolve_color(other, default_bg)),
         };
-        if cell.flags.inverse {
-            let eff_bg = bg.unwrap_or(default_bg);
-            (eff_bg, Some(fg))
+        // (3) Reverse video.
+        let (mut eff_fg, eff_bg) = if cell.flags.inverse {
+            (bg.unwrap_or(default_bg), Some(fg))
         } else {
             (fg, bg)
+        };
+        // The concrete colour actually behind the glyph, for the blend/clamp
+        // stages: an absent bg means the window default is painted there.
+        let painted_bg = eff_bg.unwrap_or(default_bg);
+        // (4) Dim.
+        if cell.flags.dim {
+            eff_fg = dim_foreground(eff_fg, painted_bg, options.dim_blend);
         }
+        // (5) Conceal — after dim (dimming an invisible glyph is a no-op) and
+        // before the clamp, which must never "rescue" deliberately hidden text.
+        if cell.flags.conceal {
+            return (painted_bg, eff_bg);
+        }
+        // (6) Minimum contrast.
+        if options.contrast_clamp_active()
+            && contrast_clamp_applies(cell_fg, options.contrast_scope)
+        {
+            eff_fg = enforce_min_contrast(eff_fg, painted_bg, options.min_contrast_ratio);
+        }
+        (eff_fg, eff_bg)
     }
 
     /// Imports an iTerm2 `.itermcolors` plist XML document into a [`Theme`].
@@ -252,7 +365,16 @@ impl Theme {
                 white: "#e8e6f0".into(),
             },
             bright: AnsiRow {
-                black: "#4a4366".into(),
+                // Bright-black is the conventional slot for DIMMED / secondary text —
+                // git hashes, code comments, `ls` metadata, prompt segments. The former
+                // `#4a4366` scored only 2.04:1 against the `#121212` background, well
+                // under the WCAG AA 4.5:1 floor, which is a large part of the reported
+                // "some text is hard to see". This value scores 4.73:1 while keeping the
+                // theme's violet cast (B > R > G) rather than falling back to a neutral
+                // grey. For reference, Windows Terminal's Campbell `#767676` reaches only
+                // 4.12:1 against this darker background, so this clears WT too.
+                // Pinned by `bright_black_meets_wcag_aa_against_background`.
+                black: "#837b9f".into(),
                 red: "#ff6f88".into(),
                 green: "#5cffb4".into(),
                 yellow: "#ffd57a".into(),
@@ -437,6 +559,48 @@ impl Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bright-black (ANSI 8) is the conventional slot for DIMMED / secondary text —
+    /// git hashes, code comments, `ls` metadata, prompt segments. It therefore has to
+    /// stay legible against the window background, and it is the one palette slot
+    /// where a "tasteful" dark value is indistinguishable from a bug.
+    ///
+    /// It regressed exactly that way: `#4a4366` scored **2.04:1**, less than half the
+    /// WCAG AA 4.5:1 floor, and was a large part of the reported "some text is hard to
+    /// see". This pins the fix so a future palette edit cannot quietly undo it.
+    ///
+    /// Deliberately asserted against the REAL WCAG formula rather than a hardcoded
+    /// expected hex, so the test still means something if the colour is re-tuned.
+    #[test]
+    fn bright_black_meets_wcag_aa_against_background() {
+        /// WCAG 2.2 AA contrast floor for normal-size body text.
+        const WCAG_AA: f32 = 4.5;
+
+        let theme = Theme::builtin_void();
+        let bg = parse_hex(&theme.background).expect("background must parse");
+        let dim = parse_hex(&theme.bright.black).expect("bright.black must parse");
+        let ratio = color_model::contrast_ratio(dim, bg);
+
+        assert!(
+            ratio >= WCAG_AA,
+            "bright.black {} on background {} is {ratio:.2}:1 — below the WCAG AA \
+             floor of {WCAG_AA}:1. This slot carries dimmed/secondary text; a value \
+             this dark makes git hashes, comments and `ls` metadata unreadable.",
+            theme.bright.black,
+            theme.background,
+        );
+
+        // Guard the other direction too: bright-black must stay RECESSED relative to
+        // primary foreground, or "dim" text stops reading as dim and the tier
+        // collapses. Raising contrast must not turn secondary text into body text.
+        let fg = parse_hex(&theme.foreground).expect("foreground must parse");
+        assert!(
+            color_model::relative_luminance(dim) < color_model::relative_luminance(fg),
+            "bright.black {} must remain dimmer than the primary foreground {}",
+            theme.bright.black,
+            theme.foreground,
+        );
+    }
 
     #[test]
     fn parse_hex_works() {
@@ -661,11 +825,67 @@ white = "#ffffff"
         assert_eq!(t.ansi(15), parse_hex(&t.bright.white).unwrap());
     }
 
+    /// The regression that motivated the 256-colour `ansi()`: index 16+ used to
+    /// fold through `index % 8` into an unrelated ANSI slot, so every 256-colour
+    /// program (`ls --color`, bat, delta, fzf, powerlevel10k) rendered wrong.
+    /// These are EXACT expected cube/ramp values, not "not black" smoke checks.
     #[test]
-    fn ansi_index_above_15_wraps_via_modulo() {
+    fn ansi_resolves_the_full_256_cube_and_ramp() {
         let t = Theme::builtin_void();
-        // index 16 → bright row (>=8), 16 % 8 == 0 → bright.black.
-        assert_eq!(t.ansi(16), parse_hex(&t.bright.black).unwrap());
+
+        // --- cube boundaries (16..=231) ---
+        // 16 is the cube origin: r=g=b=level[0] → pure black.
+        assert_eq!(t.ansi(16), (0, 0, 0));
+        // 231 is the cube terminus: r=g=b=level[5] → pure white.
+        assert_eq!(t.ansi(231), (255, 255, 255));
+        // Blue varies fastest: 16+5 = 21 → (0, 0, 255).
+        assert_eq!(t.ansi(21), (0, 0, 255));
+        // Then green (stride 6): 16+6 = 22 → (0, 95, 0).
+        assert_eq!(t.ansi(22), (0, 95, 0));
+        // Then red (stride 36): 16+36 = 52 → (95, 0, 0).
+        assert_eq!(t.ansi(52), (95, 0, 0));
+        // The headline case from the bug report: 208 is xterm orange.
+        // i = 208-16 = 192 → r=level[192/36 % 6 = 5]=255,
+        // g=level[192/6 % 6 = 2]=135, b=level[192 % 6 = 0]=0.
+        assert_eq!(t.ansi(208), (255, 135, 0));
+        // …and it is emphatically NOT the old `% 8` answer.
+        assert_ne!(t.ansi(208), parse_hex(&t.bright.black).unwrap());
+
+        // --- greyscale ramp boundaries (232..=255) ---
+        assert_eq!(t.ansi(232), (8, 8, 8), "ramp starts at 8, not 0");
+        assert_eq!(t.ansi(255), (238, 238, 238), "ramp ends at 238, not 255");
+        assert_eq!(t.ansi(233), (18, 18, 18), "ramp step is exactly 10");
+        assert_eq!(t.ansi(254), (228, 228, 228));
+
+        // The extended range is theme-INDEPENDENT: it is the fixed xterm table,
+        // so two different themes agree on every index >= 16.
+        let other = Theme::builtin_named("ghost-paper").expect("ghost-paper embedded");
+        for i in 16u8..=255 {
+            assert_eq!(
+                t.ansi(i),
+                other.ansi(i),
+                "index {i} must be theme-independent"
+            );
+        }
+        // …while 0-15 still follow the theme (the user's palette wins).
+        assert_eq!(t.ansi(1), parse_hex(&t.normal.red).unwrap());
+        assert_eq!(t.ansi(9), parse_hex(&t.bright.red).unwrap());
+    }
+
+    /// `ansi()` must agree exactly with the OSC-4 default palette on the
+    /// extended range — proving the render path and the query path share ONE
+    /// table rather than two copies that can drift.
+    #[test]
+    fn ansi_extended_range_matches_the_osc_default_palette() {
+        let t = Theme::builtin_void();
+        let osc = crate::term::palette::build_default_palette();
+        for i in 16u8..=255 {
+            assert_eq!(
+                t.ansi(i),
+                osc[i as usize],
+                "index {i}: render path and OSC-4 baseline disagree"
+            );
+        }
     }
 
     #[test]
@@ -756,6 +976,325 @@ white = "#ffffff"
         let (fg, bg) = t.cell_colors(&cell, (1, 1, 1), (9, 8, 7));
         assert_eq!(fg, (9, 8, 7), "inverse fg falls back to default_bg");
         assert_eq!(bg, Some((200, 100, 50)), "inverse bg = the cell's fg");
+    }
+
+    // --- colour model: bold-as-bright ------------------------------------
+
+    fn bold_cell(fg: Color) -> Cell {
+        Cell {
+            fg,
+            bg: Color::Default,
+            flags: CellFlags {
+                bold: true,
+                ..CellFlags::empty()
+            },
+            ..Cell::default()
+        }
+    }
+
+    use crate::grid::{Cell, CellFlags, Color};
+
+    /// The single largest visible difference vs Windows Terminal: WT defaults
+    /// `intenseTextStyle` to `bright`, so bold + indexed 0-7 renders from the
+    /// BRIGHT row. Pinned per-index, so a mutant that changes the `+ 8` or the
+    /// `< 8` guard is caught.
+    #[test]
+    fn bold_remaps_indexed_0_to_7_into_the_bright_row() {
+        let t = Theme::builtin_void();
+        for i in 0u8..8 {
+            let (fg, _) = t.cell_colors(&bold_cell(Color::Indexed(i)), (0, 0, 0), (0, 0, 0));
+            assert_eq!(
+                fg,
+                t.ansi(i + 8),
+                "bold + indexed {i} must render as bright slot {}",
+                i + 8
+            );
+            assert_ne!(
+                fg,
+                t.ansi(i),
+                "bold + indexed {i} must NOT stay on the normal row"
+            );
+        }
+        // The headline case: bold + indexed 3 (yellow) → slot 11 (bright yellow).
+        let (fg, _) = t.cell_colors(&bold_cell(Color::Indexed(3)), (0, 0, 0), (0, 0, 0));
+        assert_eq!(fg, parse_hex(&t.bright.yellow).unwrap());
+    }
+
+    /// The other half of the rule, and the one that protects gradient output:
+    /// bold must NEVER touch a 24-bit colour, an already-bright index, or an
+    /// extended (16-255) index.
+    #[test]
+    fn bold_never_remaps_rgb_bright_or_extended_colors() {
+        let t = Theme::builtin_void();
+        // 24-bit RGB passes through byte-identical.
+        let (fg, _) = t.cell_colors(&bold_cell(Color::Rgb(200, 100, 50)), (0, 0, 0), (0, 0, 0));
+        assert_eq!(fg, (200, 100, 50), "bold must not rewrite a 24-bit colour");
+        // Already-bright indices 8-15 stay put (no wrap into the cube).
+        for i in 8u8..16 {
+            let (fg, _) = t.cell_colors(&bold_cell(Color::Indexed(i)), (0, 0, 0), (0, 0, 0));
+            assert_eq!(fg, t.ansi(i), "bold + already-bright {i} must be unchanged");
+        }
+        // Extended indices are untouched (208 must stay orange, not become 216).
+        let (fg, _) = t.cell_colors(&bold_cell(Color::Indexed(208)), (0, 0, 0), (0, 0, 0));
+        assert_eq!(fg, (255, 135, 0));
+        // A Default foreground is untouched.
+        let (fg, _) = t.cell_colors(&bold_cell(Color::Default), (11, 22, 33), (0, 0, 0));
+        assert_eq!(fg, (11, 22, 33));
+    }
+
+    /// The remap is a POLICY, not a hard-coded behaviour: each
+    /// `IntenseTextStyle` must produce its documented result.
+    #[test]
+    fn intense_text_style_governs_the_remap() {
+        let t = Theme::builtin_void();
+        let cell = bold_cell(Color::Indexed(1));
+        let with = |s: IntenseTextStyle| {
+            let opts = ColorOptions {
+                intense_text_style: s,
+                ..ColorOptions::default()
+            };
+            t.cell_colors_with(&cell, (0, 0, 0), (0, 0, 0), &opts).0
+        };
+        assert_eq!(with(IntenseTextStyle::Bright), t.ansi(9));
+        assert_eq!(with(IntenseTextStyle::All), t.ansi(9));
+        assert_eq!(with(IntenseTextStyle::Bold), t.ansi(1), "Bold = face only");
+        assert_eq!(with(IntenseTextStyle::None), t.ansi(1), "None = no remap");
+    }
+
+    /// A NON-bold cell must never be brightened, whatever the style.
+    #[test]
+    fn non_bold_cells_are_never_brightened() {
+        let t = Theme::builtin_void();
+        let cell = Cell {
+            fg: Color::Indexed(2),
+            ..Cell::default()
+        };
+        for s in [
+            IntenseTextStyle::Bright,
+            IntenseTextStyle::Bold,
+            IntenseTextStyle::All,
+            IntenseTextStyle::None,
+        ] {
+            let opts = ColorOptions {
+                intense_text_style: s,
+                ..ColorOptions::default()
+            };
+            assert_eq!(
+                t.cell_colors_with(&cell, (0, 0, 0), (0, 0, 0), &opts).0,
+                t.ansi(2)
+            );
+        }
+    }
+
+    // --- colour model: SGR 39 / 49 ----------------------------------------
+
+    /// SGR 39/49 reset to the THEME defaults, not to palette slots 7/0 — the
+    /// classic bug where "default foreground" silently becomes ANSI white.
+    #[test]
+    fn default_fg_and_bg_resolve_to_theme_defaults_not_palette_slots() {
+        // MINIMAL_TOML deliberately gives foreground (#ffffff) / background
+        // (#000000) values DISTINCT from ANSI slots 7 (#cccccc) / 0 (#101010),
+        // so the assertions below can actually fail if the mapping regresses.
+        // (`builtin_void` sets foreground == normal.white, which would make the
+        // non-vacuity guard at the end of this test trivially true.)
+        let t = Theme::from_toml(MINIMAL_TOML).expect("parse minimal theme");
+        let theme_fg = parse_hex(&t.foreground).unwrap();
+        let theme_bg = parse_hex(&t.background).unwrap();
+        let cell = Cell::default(); // what SGR 39 + 49 leaves behind
+        let (fg, bg) = t.cell_colors(&cell, theme_fg, theme_bg);
+        assert_eq!(fg, theme_fg, "SGR 39 must yield the theme foreground");
+        assert_eq!(bg, None, "SGR 49 must yield the window default, not a quad");
+        // And the theme default is genuinely distinct from slots 7 / 0 here, so
+        // the assertion above could actually fail if the mapping regressed.
+        assert_ne!(theme_fg, t.ansi(7));
+        assert_ne!(theme_bg, t.ansi(0));
+    }
+
+    // --- colour model: dim / conceal ---------------------------------------
+
+    #[test]
+    fn dim_blends_the_foreground_toward_the_painted_background() {
+        let t = Theme::builtin_void();
+        let cell = Cell {
+            fg: Color::Rgb(255, 255, 255),
+            bg: Color::Rgb(0, 0, 0),
+            flags: CellFlags {
+                dim: true,
+                ..CellFlags::empty()
+            },
+            ..Cell::default()
+        };
+        let (fg, bg) = t.cell_colors(&cell, (0, 0, 0), (0, 0, 0));
+        assert_eq!(fg, (128, 128, 128), "dim = halfway to the background");
+        assert_eq!(bg, Some((0, 0, 0)), "dim must not touch the background");
+        // With a Default background, the blend target is the window default.
+        let cell = Cell {
+            fg: Color::Rgb(255, 255, 255),
+            bg: Color::Default,
+            flags: CellFlags {
+                dim: true,
+                ..CellFlags::empty()
+            },
+            ..Cell::default()
+        };
+        let (fg, _) = t.cell_colors(&cell, (0, 0, 0), (0, 0, 0));
+        assert_eq!(fg, (128, 128, 128));
+    }
+
+    #[test]
+    fn conceal_paints_the_glyph_in_the_background_color() {
+        let t = Theme::builtin_void();
+        let cell = Cell {
+            fg: Color::Rgb(255, 0, 0),
+            bg: Color::Rgb(20, 30, 40),
+            flags: CellFlags {
+                conceal: true,
+                ..CellFlags::empty()
+            },
+            ..Cell::default()
+        };
+        let (fg, bg) = t.cell_colors(&cell, (0, 0, 0), (9, 9, 9));
+        assert_eq!(fg, (20, 30, 40), "concealed fg == its own background");
+        assert_eq!(bg, Some((20, 30, 40)));
+        // Even with the clamp switched ON, concealed text stays concealed —
+        // the clamp must never "rescue" deliberately hidden text.
+        let opts = ColorOptions {
+            min_contrast_ratio: 7.0,
+            contrast_scope: ContrastScope::Always,
+            ..ColorOptions::default()
+        };
+        let (fg, _) = t.cell_colors_with(&cell, (0, 0, 0), (9, 9, 9), &opts);
+        assert_eq!(fg, (20, 30, 40), "the clamp must not un-conceal");
+    }
+
+    // --- colour model: minimum contrast ------------------------------------
+
+    #[test]
+    fn contrast_clamp_is_off_by_default() {
+        let t = Theme::builtin_void();
+        // Near-invisible dark grey on black: untouched under the defaults.
+        let cell = Cell {
+            fg: Color::Indexed(0),
+            bg: Color::Rgb(0, 0, 0),
+            ..Cell::default()
+        };
+        let (fg, _) = t.cell_colors(&cell, (0, 0, 0), (0, 0, 0));
+        assert_eq!(fg, t.ansi(0), "the default build must not rewrite colours");
+    }
+
+    #[test]
+    fn contrast_clamp_lifts_indexed_but_spares_rgb_by_default() {
+        let t = Theme::builtin_void();
+        let opts = ColorOptions {
+            min_contrast_ratio: 7.0,
+            ..ColorOptions::default() // scope: IndexedOnly
+        };
+        // Indexed near-black on black IS lifted to meet the target.
+        let indexed = Cell {
+            fg: Color::Indexed(0),
+            bg: Color::Rgb(0, 0, 0),
+            ..Cell::default()
+        };
+        let (fg, _) = t.cell_colors_with(&indexed, (0, 0, 0), (0, 0, 0), &opts);
+        assert!(
+            contrast_ratio(fg, (0, 0, 0)) >= 7.0,
+            "indexed fg must be lifted"
+        );
+        assert_ne!(fg, t.ansi(0));
+
+        // The SAME illegible colour as 24-bit RGB is left alone — this is what
+        // keeps gradient TUIs intact.
+        let rgb = Cell {
+            fg: Color::Rgb(28, 28, 28),
+            bg: Color::Rgb(0, 0, 0),
+            ..Cell::default()
+        };
+        let (fg, _) = t.cell_colors_with(&rgb, (0, 0, 0), (0, 0, 0), &opts);
+        assert_eq!(
+            fg,
+            (28, 28, 28),
+            "IndexedOnly must spare 24-bit foregrounds"
+        );
+
+        // …until the operator opts into ContrastScope::Always.
+        let all = ColorOptions {
+            contrast_scope: ContrastScope::Always,
+            ..opts
+        };
+        let (fg, _) = t.cell_colors_with(&rgb, (0, 0, 0), (0, 0, 0), &all);
+        assert!(contrast_ratio(fg, (0, 0, 0)) >= 7.0);
+    }
+
+    /// The clamp runs AFTER reverse video, so it must judge the colours that are
+    /// actually painted — not the pre-swap pair.
+    #[test]
+    fn contrast_clamp_runs_after_reverse_video() {
+        let t = Theme::builtin_void();
+        let opts = ColorOptions {
+            min_contrast_ratio: 7.0,
+            contrast_scope: ContrastScope::Always,
+            ..ColorOptions::default()
+        };
+        // Pre-swap this pair is legible (white on near-black). After the swap
+        // the painted pair is near-black text on white — still legible — so the
+        // clamp must leave it alone rather than "fixing" the wrong pair.
+        let cell = Cell {
+            fg: Color::Rgb(255, 255, 255),
+            bg: Color::Rgb(10, 10, 10),
+            flags: CellFlags {
+                inverse: true,
+                ..CellFlags::empty()
+            },
+            ..Cell::default()
+        };
+        let (fg, bg) = t.cell_colors_with(&cell, (0, 0, 0), (0, 0, 0), &opts);
+        assert_eq!(fg, (10, 10, 10), "post-swap pair already passes");
+        assert_eq!(bg, Some((255, 255, 255)));
+
+        // Now an inverse cell whose PAINTED pair is illegible: near-black text
+        // on a near-black background. The clamp must fire on the swapped pair.
+        let bad = Cell {
+            fg: Color::Rgb(2, 2, 2),
+            bg: Color::Rgb(12, 12, 12),
+            flags: CellFlags {
+                inverse: true,
+                ..CellFlags::empty()
+            },
+            ..Cell::default()
+        };
+        let (fg, bg) = t.cell_colors_with(&bad, (0, 0, 0), (0, 0, 0), &opts);
+        assert_eq!(bg, Some((2, 2, 2)), "the background is never clamped");
+        assert!(
+            contrast_ratio(fg, (2, 2, 2)) >= 7.0,
+            "clamp judged the painted pair"
+        );
+    }
+
+    /// Cells store a TAGGED colour, never pre-resolved RGB — so switching the
+    /// theme re-resolves the same cell to the new palette.
+    #[test]
+    fn cells_store_tagged_colors_so_theme_switching_re_resolves() {
+        let a = Theme::builtin_void();
+        let b = Theme::builtin_named("ghost-paper").expect("ghost-paper embedded");
+        let cell = Cell {
+            fg: Color::Indexed(1),
+            ..Cell::default()
+        };
+        // The SAME cell resolves differently under two themes.
+        assert_ne!(
+            a.cell_colors(&cell, (0, 0, 0), (0, 0, 0)).0,
+            b.cell_colors(&cell, (0, 0, 0), (0, 0, 0)).0,
+            "an indexed cell must re-resolve when the theme changes"
+        );
+        // An RGB cell is theme-independent by construction.
+        let rgb = Cell {
+            fg: Color::Rgb(1, 2, 3),
+            ..Cell::default()
+        };
+        assert_eq!(
+            a.cell_colors(&rgb, (0, 0, 0), (0, 0, 0)).0,
+            b.cell_colors(&rgb, (0, 0, 0), (0, 0, 0)).0
+        );
     }
 
     #[test]

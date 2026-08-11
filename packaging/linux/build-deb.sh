@@ -49,6 +49,12 @@ mkdir -p "${PKG_ROOT}/usr/share/icons/hicolor/256x256/apps"
 mkdir -p "${PKG_ROOT}/usr/share/doc/${BIN}"
 mkdir -p "${PKG_ROOT}/usr/share/man/man1"
 
+# License texts. The binary embeds ~21 OFL-1.1 / Apache-2.0 typefaces via
+# include_bytes!; OFL-1.1 s2 requires the license text to accompany every copy,
+# so this is mandatory and fails the build when incomplete.
+sh "${SCRIPT_DIR}/../collect-licenses.sh" "${SCRIPT_DIR}/../.." \
+	"${PKG_ROOT}/usr/share/doc/${BIN}"
+
 install -m 0755 "${BIN_PATH}" "${PKG_ROOT}/usr/bin/${BIN}"
 install -m 0644 "${DESKTOP}" "${PKG_ROOT}/usr/share/applications/c0pl4nd.desktop"
 if [ -f "${ICON}" ]; then
@@ -81,7 +87,7 @@ Priority: optional
 Architecture: ${ARCH}
 Maintainer: Itasha.Corp <support@itasha.example>
 Installed-Size: ${INSTALLED_SIZE}
-Homepage: https://github.com/itasha-corp/c0pl4nd
+Homepage: https://github.com/46b-ETYKiAL/C0PL4ND
 Description: Fast, cross-platform terminal emulator
  C0PL4ND is a cross-platform terminal emulator written in Rust. It provides
  a fast rendering pipeline and runs on Windows, Linux, and macOS.

@@ -189,10 +189,10 @@ impl ReportOutcome {
 }
 
 /// Log a report outcome counts/enums only (no PII — the `Failed` reason is
-/// NEVER inlined). Honours `S4F3_DISABLE_TELEMETRY=1` by emitting nothing.
+/// NEVER inlined). Honours `C0PL4ND_DISABLE_TELEMETRY=1` by emitting nothing.
 /// Best-effort; never blocks.
 fn log_outcome(outcome: &ReportOutcome) {
-    if std::env::var_os("S4F3_DISABLE_TELEMETRY").is_some() {
+    if std::env::var_os("C0PL4ND_DISABLE_TELEMETRY").is_some() {
         return;
     }
     // A transport FAILURE escalates to WARN and carries a coarse, privacy-safe
@@ -397,9 +397,9 @@ fn send_over_tor_in(
 }
 
 /// Log the transport CLASS (counts/enums only — never the endpoint or onion
-/// address, which could be fingerprints). Honours `S4F3_DISABLE_TELEMETRY=1`.
+/// address, which could be fingerprints). Honours `C0PL4ND_DISABLE_TELEMETRY=1`.
 fn log_transport_choice(choice: &TransportChoice) {
-    if std::env::var_os("S4F3_DISABLE_TELEMETRY").is_some() {
+    if std::env::var_os("C0PL4ND_DISABLE_TELEMETRY").is_some() {
         return;
     }
     tracing::info!(target: "c0pl4nd::report", transport = choice.class());
@@ -1485,7 +1485,7 @@ mod tests {
         // Disabled: the early-return branch is taken (no emit). We assert it does
         // not panic and is a no-op for every variant.
         {
-            let _g = EnvGuard::set("S4F3_DISABLE_TELEMETRY", "1");
+            let _g = EnvGuard::set("C0PL4ND_DISABLE_TELEMETRY", "1");
             log_outcome(&ReportOutcome::Spooled);
             log_outcome(&ReportOutcome::Sent);
             log_outcome(&ReportOutcome::RefusedNoEndpoint);
@@ -1494,7 +1494,7 @@ mod tests {
         // Enabled: the emit branch is taken (the tracing call runs even with no
         // subscriber installed — it is a no-op sink, but the line is executed).
         {
-            let _g = EnvGuard::unset("S4F3_DISABLE_TELEMETRY");
+            let _g = EnvGuard::unset("C0PL4ND_DISABLE_TELEMETRY");
             log_outcome(&ReportOutcome::Sent);
         }
     }
@@ -1506,11 +1506,11 @@ mod tests {
             onion: VALID_V3_ONION.to_string(),
         };
         {
-            let _g = EnvGuard::set("S4F3_DISABLE_TELEMETRY", "1");
+            let _g = EnvGuard::set("C0PL4ND_DISABLE_TELEMETRY", "1");
             log_transport_choice(&tor); // suppressed branch
         }
         {
-            let _g = EnvGuard::unset("S4F3_DISABLE_TELEMETRY");
+            let _g = EnvGuard::unset("C0PL4ND_DISABLE_TELEMETRY");
             log_transport_choice(&tor); // emit branch
             log_transport_choice(&TransportChoice::Clearnet { endpoint: None });
         }
@@ -1653,7 +1653,7 @@ mod tests {
         // actually run (a no-op sink subscriber still drives the emit branch).
         // This covers the macro's enabled/emit arm, not just the early-return.
         let _lock = ENDPOINT_LOCK.lock().unwrap();
-        let _g = EnvGuard::unset("S4F3_DISABLE_TELEMETRY");
+        let _g = EnvGuard::unset("C0PL4ND_DISABLE_TELEMETRY");
         let subscriber = tracing_subscriber::fmt()
             .with_writer(std::io::sink)
             .with_max_level(tracing::Level::TRACE)

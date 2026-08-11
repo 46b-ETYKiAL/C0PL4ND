@@ -287,9 +287,9 @@ pub fn open_mailto(alias: &str, subject: &str, body: &str) -> IntakeOutcome {
 
 /// Record the intake outcome counts/enums only (the stable `log_detail`, NEVER
 /// the body text, the URL, the repo, or any persistent identifier). Honours
-/// `S4F3_DISABLE_TELEMETRY=1` by emitting nothing. Best-effort; never blocks.
+/// `C0PL4ND_DISABLE_TELEMETRY=1` by emitting nothing. Best-effort; never blocks.
 pub fn log_outcome(outcome: &IntakeOutcome) {
-    if std::env::var_os("S4F3_DISABLE_TELEMETRY").is_some() {
+    if std::env::var_os("C0PL4ND_DISABLE_TELEMETRY").is_some() {
         return;
     }
     tracing::info!(target: "c0pl4nd::issue_intake", detail = outcome.log_detail());

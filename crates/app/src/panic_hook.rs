@@ -278,6 +278,69 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// The boxed hook shape `std::panic::take_hook` hands back / `set_hook` takes.
+    type BoxedPanicHook = Box<dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static>;
+
+    /// Swap `hook` in as the process-global panic hook and hand back the one it
+    /// displaced. The caller MUST already hold [`PANIC_HOOK_TEST_GUARD`].
+    fn swap_panic_hook(hook: BoxedPanicHook) -> BoxedPanicHook {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(hook);
+        previous
+    }
+
+    /// Hands the displaced panic hook back — and releases
+    /// [`PANIC_HOOK_TEST_GUARD`] — when it drops.
+    ///
+    /// Field order is load-bearing: `previous` is declared before `_guard`, so
+    /// the restoring `set_hook` in [`Drop::drop`] runs while the guard is STILL
+    /// held. A section that dies early (a failed assert, an unexpected panic)
+    /// therefore still restores instead of leaving its own sink installed
+    /// process-wide for every later test to write into.
+    ///
+    /// `_guard` is an `Option` so
+    /// `dropping_a_restore_puts_the_displaced_hook_back` can exercise the REAL
+    /// [`Drop`] impl while already holding the (non-reentrant) guard itself.
+    /// `install_temporary_panic_hook` always fills it.
+    struct PanicHookRestore {
+        previous: Option<BoxedPanicHook>,
+        _guard: Option<std::sync::MutexGuard<'static, ()>>,
+    }
+
+    impl Drop for PanicHookRestore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::panic::set_hook(previous);
+            }
+        }
+    }
+
+    /// Install `hook` as the process-GLOBAL panic hook for the lifetime of the
+    /// returned [`PanicHookRestore`]. The ONLY sanctioned way this module's tests
+    /// may touch `std::panic::set_hook`.
+    ///
+    /// `set_hook`/`take_hook` mutate PROCESS state, so two tests doing it
+    /// concurrently (cargo's default) interleave: B's `take_hook` captures A's
+    /// still-installed sink, B's `set_hook` clobbers it, and A's panic is then
+    /// delivered to B's hook — A's sink stays empty and A fails spuriously.
+    /// `w1tn3ss_capture_spools_a_static_message_panic` used to install a hook
+    /// WITHOUT taking the guard and failed exactly that way, intermittently.
+    ///
+    /// Funnelling every install through one helper that takes the guard ITSELF
+    /// (rather than trusting each call site to remember) makes "forgot to lock"
+    /// unrepresentable instead of merely discouraged; the exclusivity it buys is
+    /// asserted by `temporary_panic_hooks_are_mutually_exclusive_across_threads`.
+    fn install_temporary_panic_hook<H>(hook: H) -> PanicHookRestore
+    where
+        H: Fn(&PanicHookInfo<'_>) + Sync + Send + 'static,
+    {
+        let guard = lock_panic_hook_tests();
+        PanicHookRestore {
+            previous: Some(swap_panic_hook(Box::new(hook))),
+            _guard: Some(guard),
+        }
+    }
+
     /// Build a synthetic `PanicHookInfo` is not constructible outside std, so the
     /// writer + formatter are tested via their public, info-free seams: the pure
     /// report shape is exercised by writing a known report string and reading it
@@ -352,17 +415,16 @@ mod tests {
         // the hook receives a genuine info. We assert the report names version,
         // os/arch, the panic message, and a backtrace section — without aborting
         // the test process.
-        let _guard = lock_panic_hook_tests();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let sink = captured.clone();
-        // Install a temporary hook that formats into the sink, then restore.
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
+        // Install a temporary hook that formats into the sink; the returned guard
+        // holds PANIC_HOOK_TEST_GUARD and restores the previous hook on drop.
+        let restore = install_temporary_panic_hook(move |info| {
             let bt = Backtrace::disabled();
             *sink.lock().unwrap() = format_crash_report(info, &bt);
-        }));
+        });
         let _ = std::panic::catch_unwind(|| panic!("synthetic boom 42"));
-        std::panic::set_hook(previous);
+        drop(restore);
 
         let report = captured.lock().unwrap().clone();
         assert!(report.contains("C0PL4ND crash report"), "header: {report}");
@@ -380,23 +442,22 @@ mod tests {
     /// Drive a real panic of a given payload through a temporary hook and return
     /// the formatted report. The hook is restored before returning.
     ///
-    /// Takes [`PANIC_HOOK_TEST_GUARD`] like every other hook-mutating test: this
-    /// helper installs the same process-GLOBAL hook, so without the guard its
-    /// callers raced `format_crash_report_includes_key_fields` (which does lock)
-    /// and each other -- the loser's `set_hook` was clobbered before its
-    /// `catch_unwind` fired, leaving the sink empty and failing the assert. The
-    /// guard is acquired HERE rather than in each caller so no caller can forget
-    /// it; callers must not lock again (the mutex is not reentrant).
+    /// Goes through [`install_temporary_panic_hook`] like every other
+    /// hook-mutating site here, so it holds [`PANIC_HOOK_TEST_GUARD`] for the
+    /// whole install/panic/restore window: this helper installs the same
+    /// process-GLOBAL hook, so without the guard its callers raced
+    /// `format_crash_report_includes_key_fields` and each other -- the loser's
+    /// `set_hook` was clobbered before its `catch_unwind` fired, leaving the sink
+    /// empty and failing the assert. Callers must not lock again (the mutex is
+    /// not reentrant).
     fn report_for_panic<F: FnOnce() + std::panic::UnwindSafe>(f: F) -> String {
-        let _guard = lock_panic_hook_tests();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let sink = captured.clone();
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
+        let restore = install_temporary_panic_hook(move |info| {
             *sink.lock().unwrap() = format_crash_report(info, &Backtrace::disabled());
-        }));
+        });
         let _ = std::panic::catch_unwind(f);
-        std::panic::set_hook(previous);
+        drop(restore);
         let report = captured.lock().unwrap().clone();
         report
     }
@@ -439,19 +500,150 @@ mod tests {
         // capture_panic uses the GLOBAL config dir; here we only assert the
         // static-message EXTRACTION path executes without re-panicking inside
         // the already-panicking thread.
+        //
+        // Routed through `install_temporary_panic_hook` (which takes
+        // PANIC_HOOK_TEST_GUARD) because this test previously installed the
+        // process-GLOBAL hook WITHOUT the guard: when a sibling hook-mutating
+        // test won the race, its `set_hook` replaced this one before the panic
+        // below fired, `flag` was never stored, and this assert failed — the
+        // intermittent failure this routing removes.
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = ran.clone();
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
+        let restore = install_temporary_panic_hook(move |info| {
             // Exercise the static-message extraction exactly as the hook does.
             capture_panic_w1tn3ss(info);
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        }));
+        });
         let _ = std::panic::catch_unwind(|| panic!("a static literal message"));
-        std::panic::set_hook(previous);
+        drop(restore);
         assert!(
             ran.load(std::sync::atomic::Ordering::SeqCst),
             "the W1TN3SS capture path ran inside the panic hook without re-panicking"
+        );
+    }
+
+    /// [`PanicHookRestore`]'s [`Drop`] must actually put the DISPLACED hook back,
+    /// not merely drop its own.
+    ///
+    /// Nothing else in this module notices if it does not: every install captures
+    /// whatever hook happens to be set at the time, so a chain of installs that
+    /// never restore still hands each test its own sink and each one still passes.
+    /// The leak only bites AFTER the last hook-mutating test, when a real panic
+    /// elsewhere in the binary is swallowed by a dead test sink instead of
+    /// reaching the default hook — which is exactly why the restore needs its own
+    /// assertion rather than riding on the other tests.
+    ///
+    /// The guard is taken ONCE for the whole test and the inner `PanicHookRestore`
+    /// is built with `_guard: None`: the mutex is not reentrant, so the inner
+    /// install must not try to take it again.
+    #[test]
+    fn dropping_a_restore_puts_the_displaced_hook_back() {
+        let _guard = lock_panic_hook_tests();
+
+        // Stand in for "the hook that was already installed" — in a real run the
+        // default hook, or an outer test's.
+        let sentinel = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sentinel_sink = sentinel.clone();
+        let original = swap_panic_hook(Box::new(move |info| {
+            *sentinel_sink.lock().unwrap() = format!("sentinel:{}", panic_payload_str(info));
+        }));
+
+        // Stack a temporary hook on top of the sentinel exactly as
+        // `install_temporary_panic_hook` does, then let the REAL Drop run.
+        let inner = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let inner_sink = inner.clone();
+        let restore = PanicHookRestore {
+            previous: Some(swap_panic_hook(Box::new(move |info| {
+                *inner_sink.lock().unwrap() = format!("inner:{}", panic_payload_str(info));
+            }))),
+            _guard: None,
+        };
+
+        let _ = std::panic::catch_unwind(|| panic!("while stacked"));
+        assert_eq!(
+            *inner.lock().unwrap(),
+            "inner:while stacked",
+            "the stacked hook must receive the panic while it is installed"
+        );
+        assert!(
+            sentinel.lock().unwrap().is_empty(),
+            "the displaced hook must NOT receive panics while it is displaced"
+        );
+
+        drop(restore);
+
+        let _ = std::panic::catch_unwind(|| panic!("after restore"));
+        assert_eq!(
+            *sentinel.lock().unwrap(),
+            "sentinel:after restore",
+            "dropping the restore must reinstate the DISPLACED hook, not leave the \
+             stacked one (or nothing) installed"
+        );
+        assert_eq!(
+            *inner.lock().unwrap(),
+            "inner:while stacked",
+            "the dropped hook must stop receiving panics"
+        );
+
+        // Leave the process exactly as we found it.
+        std::panic::set_hook(original);
+    }
+
+    /// The isolation regression guard for [`install_temporary_panic_hook`].
+    ///
+    /// Every hook-mutating test here installs a PROCESS-GLOBAL hook and then
+    /// asserts on what its OWN sink received — sound only while no other thread
+    /// can install a hook in between. So drive the helper from several threads at
+    /// once and require every single install to observe exclusively its own
+    /// panic, identified by a per-install token.
+    ///
+    /// Remove the shared guard from the helper and the installs interleave: one
+    /// thread's panic is delivered to another thread's still-installed hook, so
+    /// the loser's sink holds the WRONG token (or none) and `crosstalk` is
+    /// non-empty. That is the deterministic form of the failure that used to
+    /// surface as a rare flaky run of
+    /// `w1tn3ss_capture_spools_a_static_message_panic`, which is why this test
+    /// asserts on token IDENTITY rather than merely "the hook ran".
+    #[test]
+    fn temporary_panic_hooks_are_mutually_exclusive_across_threads() {
+        const THREADS: usize = 4;
+        const ROUNDS: usize = 30;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    let mut foreign: Vec<String> = Vec::new();
+                    for round in 0..ROUNDS {
+                        let token = format!("hook-thread-{t}-round-{round}");
+                        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+                        let sink = seen.clone();
+                        let restore = install_temporary_panic_hook(move |info| {
+                            *sink.lock().unwrap() = panic_payload_str(info);
+                        });
+                        let boom = token.clone();
+                        let _ = std::panic::catch_unwind(move || panic!("{boom}"));
+                        drop(restore);
+                        let got = seen.lock().unwrap().clone();
+                        if got != token {
+                            foreign.push(format!("expected {token:?}, hook saw {got:?}"));
+                        }
+                    }
+                    foreign
+                })
+            })
+            .collect();
+
+        let mut crosstalk: Vec<String> = Vec::new();
+        for h in handles {
+            crosstalk.extend(h.join().expect("a hook thread must not itself panic"));
+        }
+        assert!(
+            crosstalk.is_empty(),
+            "the global panic hook was not exclusive: {} of {} installs saw a \
+             foreign panic (first few: {:?})",
+            crosstalk.len(),
+            THREADS * ROUNDS,
+            &crosstalk[..crosstalk.len().min(5)]
         );
     }
 

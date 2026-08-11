@@ -254,9 +254,24 @@ const CLAMP_STEPS: u32 = 32;
 /// toward whichever monochrome pole (black or white) is further from `bg`.
 ///
 /// Returns `fg` unchanged when it already meets `target`. When even the pole
-/// cannot reach `target` (a mid-grey background caps out around 10.4:1) the
-/// pole itself is returned — the most legible colour available — rather than
-/// failing or leaving the unreadable original.
+/// cannot reach `target` the pole itself is returned — the most legible colour
+/// available — rather than failing or leaving the unreadable original.
+///
+/// That fallthrough is far more reachable than it looks, and this doc used to
+/// say so wrongly: it claimed a mid-grey background "caps out around 10.4:1",
+/// which overstates the real ceiling by ~2.3x. Measured over the whole sRGB
+/// cube on this toolchain, the best ratio ANY foreground can reach is
+/// **4.6075:1** against grey 117, and the floor across all 16 777 216
+/// backgrounds is **4.5826:1** at `(3, 137, 1)`. So a 7.0 target is unreachable
+/// for the 59 greys `90..=148`, and a 21.0 target is unreachable for EVERY
+/// background — including pure black, because `contrast_ratio(white, black)` is
+/// 20.999998f32, not 21.0f32.
+///
+/// The practical consequence is that a caller must NOT assume the returned
+/// colour meets `target`; on this branch, by design, it does not. The same
+/// mistake shows up in test design: a greyscale sweep run only at 4.5 never
+/// enters this branch at all (measured over the full 256x256 grid: 20 042
+/// no-op, 45 494 lift, **0** unreachable).
 ///
 /// # Examples
 ///
@@ -277,9 +292,17 @@ pub fn enforce_min_contrast(fg: (u8, u8, u8), bg: (u8, u8, u8), target: f32) -> 
         return fg;
     }
     // Move away from the background: toward white if the background is dark,
-    // toward black if it is light. The 0.1791 pivot is the luminance at which
-    // black and white contrast equally against a colour ((1.05/0.05).sqrt()
-    // solved for L), so this always picks the higher-headroom pole.
+    // toward black if it is light. 0.1791 is the luminance at which black and
+    // white contrast equally against a colour ((1.05/0.05).sqrt() solved for L),
+    // TRUNCATED to four decimals: the exact root is 0.17912878474779198, so the
+    // literal sits 2.878e-5 below it. "Always picks the higher-headroom pole" is
+    // therefore not quite true, and this comment used to claim it was — for the
+    // 1004 sRGB colours whose luminance lands in [0.1791, 0.17912878) the `else`
+    // branch is taken and BLACK is chosen while white is fractionally better.
+    // The difference is under 1.2e-3 of contrast: invisible, not worth widening
+    // the literal for, but a property NOT to assert in a test. Pin the
+    // documented pivot; a sweep asserting "the better pole" fails on 1004 of
+    // 16 777 216 inputs and reads as a bug.
     let pole = if relative_luminance(bg) < 0.1791 {
         (255, 255, 255)
     } else {
@@ -398,12 +421,74 @@ mod tests {
         assert!(contrast_ratio(on_light, light_bg) < contrast_ratio((0, 0, 0), light_bg));
     }
 
+    /// The `>= target` EARLY RETURN, exercised on the path it is named for.
+    ///
+    /// RIGHT OUTCOME, WRONG REASON. This test used to open with
+    /// `enforce(white, black, 21.0) == white`. `contrast_ratio(white, black)` is
+    /// 20.999998f32, strictly BELOW the 21.0 ceiling, so the early return never
+    /// fired: the call walked all 32 blend steps, failed every one, and fell
+    /// through to `pole` — which for a black background happens to BE white. The
+    /// expected colour arrived down the UNREACHABLE path, so the assertion could
+    /// not observe the no-op gate at all. That case is a genuine unreachable
+    /// fixture and now lives with the other unreachable ones.
+    ///
+    /// Two things make the replacement able to fail:
+    ///
+    /// 1. `fg` is deliberately NOT a pole. Against a pole foreground every blend
+    ///    step is a no-change, so a pole `fg` cannot distinguish the early return
+    ///    from a scan that succeeds on step 1 — the same blind spot in a
+    ///    different costume.
+    /// 2. `fg == bg` at `CONTRAST_RATIO_MIN`. `contrast_ratio(x, x)` is EXACTLY
+    ///    1.0f32, which is the only way to reach `>=` AT equality and therefore
+    ///    the only way to observe it widened to `>`. The `(10,10,10)`-on-black
+    ///    fixture below is 1.0607:1 — strictly greater, so it never touches the
+    ///    boundary. Measured: with `>=` mutated to `>`, this test used to pass.
     #[test]
     fn clamp_is_a_no_op_when_the_pair_already_passes() {
-        let fg = (255, 255, 255);
-        assert_eq!(enforce_min_contrast(fg, (0, 0, 0), 21.0), fg);
-        // A target at or below the structural minimum can never trigger.
+        // (1) A non-pole foreground that comfortably clears the target (12.55:1)
+        // must come back BYTE-IDENTICAL, not merely still-passing: a lift toward
+        // white would also "still pass" while silently rewriting the colour.
+        let bright = (200, 200, 200);
+        assert!(
+            (contrast_ratio(bright, (0, 0, 0)) - 12.5522).abs() < 1e-3,
+            "premise: {bright:?} on black is 12.5522:1, comfortably over 4.5 — \
+             stated as a value rather than an inequality so a luminance \
+             regression shows up here instead of silently keeping the premise \
+             true, got {}",
+            contrast_ratio(bright, (0, 0, 0))
+        );
+        assert_eq!(
+            enforce_min_contrast(bright, (0, 0, 0), 4.5),
+            bright,
+            "an already-passing pair must be returned unchanged"
+        );
+
+        // (2) The equality boundary, the sole killer of a `>=` widened to `>`.
+        for same in [(0, 0, 0), (128, 128, 128), (200, 30, 90), (255, 255, 255)] {
+            assert_eq!(
+                contrast_ratio(same, same),
+                CONTRAST_RATIO_MIN,
+                "premise: a colour against itself is exactly 1.0:1"
+            );
+            assert_eq!(
+                enforce_min_contrast(same, same, CONTRAST_RATIO_MIN),
+                same,
+                "the floor is met AT equality, so {same:?} must survive untouched"
+            );
+        }
+
+        // A target at or below the structural minimum can never trigger. This
+        // fixture is kept for that, NOT as an equality-boundary case: its ratio
+        // is 1.0607:1, strictly above 1.0, which is exactly why it cannot see
+        // the `>=` widened to `>` and why the loop above exists. Pinning the
+        // value keeps that reasoning checkable rather than asserted in prose.
         let dull = (10, 10, 10);
+        assert!(
+            (contrast_ratio(dull, (0, 0, 0)) - 1.0607).abs() < 1e-3,
+            "premise: {dull:?} on black is 1.0607:1 — near the floor but NOT at \
+             it, got {}",
+            contrast_ratio(dull, (0, 0, 0))
+        );
         assert_eq!(enforce_min_contrast(dull, (0, 0, 0), 1.0), dull);
         assert_eq!(enforce_min_contrast(dull, (0, 0, 0), 0.0), dull);
     }
@@ -443,12 +528,19 @@ mod tests {
     #[test]
     fn the_clamp_lifts_the_minimum_distance_not_all_the_way_to_the_pole() {
         // Cases chosen so a genuine minimal lift lands well short of the pole.
+        // Measured, they land on steps 12, 17, 13, 20, 14 and 1.
         for &(fg, bg, target) in &[
             ((40, 40, 40), (0, 0, 0), 4.5_f32),
             ((30, 30, 40), (0, 0, 0), 7.0),
             ((60, 20, 20), (0, 0, 0), 4.5),
             ((230, 230, 220), (255, 255, 255), 7.0),
             ((200, 210, 200), (255, 255, 255), 4.5),
+            // The step-1 boundary. Grey 116 on black is 4.4929:1 — it misses
+            // 4.5 by 0.007 — so the FIRST blend step already clears the target
+            // and `previous` is `fg` itself. Without this the `step == 1` arm
+            // below is never executed by any fixture, and the narrowest
+            // possible "the predecessor really does fail" margin is untested.
+            ((116, 116, 116), (0, 0, 0), 4.5),
         ] {
             let out = enforce_min_contrast(fg, bg, target);
             let pole = if relative_luminance(bg) < 0.1791 {
@@ -480,11 +572,26 @@ mod tests {
             let step = (1..=CLAMP_STEPS)
                 .find(|&s| blend(fg, pole, s as f32 / CLAMP_STEPS as f32) == out)
                 .expect("the result must be one of the blend steps");
-            assert!(
-                step >= 1,
-                "a returned colour must come from a real lift step"
-            );
-            let previous = blend(fg, pole, (step - 1) as f32 / CLAMP_STEPS as f32);
+            // `assert!(step >= 1, "a returned colour must come from a real lift
+            // step")` used to sit here. It was VACUOUS BY CONSTRUCTION: `step`
+            // is bound by `find` over `1..=CLAMP_STEPS`, so the range's own
+            // lower bound already guarantees it and no mutation of this
+            // function could make it fire. The `.expect` above is the assertion
+            // that carries that weight — it fails when `out` is not on the
+            // fg->pole segment at all.
+            //
+            // The predecessor of step 1 is `fg` itself. Spelling that out beats
+            // `blend(fg, pole, 0.0)`: the two agree, but the explicit form says
+            // what is meant and keeps minimality from depending on `blend`
+            // being exact at t = 0 (which `dim_blend_endpoints_and_midpoint_are_exact`
+            // pins directly, where it belongs). The grey-116 fixture exists to
+            // drive this arm — without it no fixture reaches step 1 and the
+            // branch would be dead weight dressed as care.
+            let previous = if step == 1 {
+                fg
+            } else {
+                blend(fg, pole, (step - 1) as f32 / CLAMP_STEPS as f32)
+            };
             assert!(
                 contrast_ratio(previous, bg) < target,
                 "NOT MINIMAL: step {step} was returned for fg={fg:?} bg={bg:?} \
@@ -496,26 +603,150 @@ mod tests {
         }
     }
 
+    /// An unreachable target returns THE chosen pole — not "a" pole.
+    ///
+    /// TWO REPAIRS, both of the same kind: an assertion that could not observe
+    /// the thing its name promised.
+    ///
+    /// 1. This test used to assert `out == (0,0,0) || out == (255,255,255)`.
+    ///    That disjunction is satisfied by EITHER pole, so it cannot detect a
+    ///    pole-selection inversion — which is precisely what "picks the best
+    ///    available pole" claims to check. `assert_eq!(out, pole)` can. Its
+    ///    companion `contrast_ratio(out, bg) > contrast_ratio(fg, bg)` compared
+    ///    against a 1.0143:1 baseline that both poles clear by 4.5x, so it was
+    ///    no help either.
+    /// 2. The old comment claimed "a mid-grey background caps out near 10.4:1".
+    ///    That is wrong by ~2.3x and it is the same falsehood the function's own
+    ///    docstring carried. Measured over the whole sRGB cube on this
+    ///    toolchain: the worst grey is 117 at 4.6075:1, and the floor over all
+    ///    16 777 216 backgrounds is 4.5826:1 at `(3, 137, 1)`. The consequence
+    ///    is not cosmetic — it is why a 7.0 target is unreachable for 59 greys
+    ///    and why this branch is reached far more often than the number implied.
+    ///
+    /// The file also had only ONE polarity: every unreachable fixture drove the
+    /// BLACK pole. A pole inversion would have been invisible on the white side.
+    /// Both polarities are pinned below.
     #[test]
     fn clamp_returns_the_best_available_pole_when_the_target_is_unreachable() {
-        // A mid-grey background caps out near 10.4:1 against either pole, so a
-        // 21:1 demand is unreachable — the clamp must still return the most
-        // legible colour, never the unreadable original and never a panic.
-        let bg = (119, 119, 119);
-        let out = enforce_min_contrast((120, 120, 120), bg, 21.0);
-        assert!(out == (0, 0, 0) || out == (255, 255, 255));
-        assert!(contrast_ratio(out, bg) > contrast_ratio((120, 120, 120), bg));
+        // The 21.0 ceiling is unreachable for EVERY background in sRGB,
+        // including pure black — this is the fact that made the no-op test's
+        // old opening assertion blind, so it is asserted rather than assumed.
+        assert!(
+            contrast_ratio((255, 255, 255), (0, 0, 0)) < CONTRAST_RATIO_MAX,
+            "premise: the best pair in sRGB is 20.999998:1, strictly under 21.0"
+        );
+
+        for &(fg, bg, target, pole) in &[
+            // Black pole: a near-grey pair demanding 21:1.
+            ((120, 120, 120), (119, 119, 119), 21.0_f32, (0, 0, 0)),
+            // White pole: grey 117 is the WORST background in sRGB (4.6075:1
+            // best available), so 7.0 is unreachable and the clamp must go all
+            // the way to white. This polarity had no fixture anywhere.
+            ((128, 128, 128), (117, 117, 117), 7.0, (255, 255, 255)),
+            // Relocated from `clamp_is_a_no_op_when_the_pair_already_passes`,
+            // where it masqueraded as a no-op case. White on black at 21.0 is
+            // unreachable, so it exits down THIS path. Note it cannot kill a
+            // `pole` -> `fg` mutant on the fallthrough — here the pole IS `fg` —
+            // which is why the two fixtures above exist.
+            ((255, 255, 255), (0, 0, 0), 21.0, (255, 255, 255)),
+        ] {
+            // Premise: unreachable really is unreachable, or `out == pole` would
+            // be pinning a lift that merely happened to land on the pole.
+            assert!(
+                contrast_ratio(pole, bg) < target,
+                "premise: target {target} must be UNREACHABLE for bg={bg:?} \
+                 (best available is {:.4})",
+                contrast_ratio(pole, bg)
+            );
+            let out = enforce_min_contrast(fg, bg, target);
+            assert_eq!(
+                out, pole,
+                "an unreachable target must return the CHOSEN pole exactly: \
+                 fg={fg:?} bg={bg:?} target={target}"
+            );
+            if fg != pole {
+                assert!(
+                    contrast_ratio(out, bg) > contrast_ratio(fg, bg),
+                    "unreachable must still beat the unreadable original: \
+                     fg={fg:?} bg={bg:?} got {:.4} vs {:.4}",
+                    contrast_ratio(out, bg),
+                    contrast_ratio(fg, bg)
+                );
+            }
+        }
     }
 
+    /// Out-of-range targets, asserted on the output they actually produce.
+    ///
+    /// REPLACES A TEST NO INPUT COULD FALSIFY. This was
+    /// `clamp_target_is_clamped_into_the_legal_ratio_range`, and its whole body
+    /// was `enforce(fg, bg, 1000.0) == enforce(fg, bg, 21.0)`, offered as a
+    /// check on `target.clamp(CONTRAST_RATIO_MIN, CONTRAST_RATIO_MAX)`. It
+    /// checked nothing. `contrast_ratio` is total on `[1.0, 20.999998]`, so a
+    /// target outside `[1.0, 21.0]` cannot flip a single `>=` in this function:
+    /// remove the `.clamp` entirely and both sides still agree; clamp to either
+    /// bound alone and both sides STILL agree — including the 1000.0-vs-21.0
+    /// pair, which under `clamp -> CONTRAST_RATIO_MIN` becomes `(30,30,30)` on
+    /// both sides instead of `(255,255,255)` on both. Measured across 14 792
+    /// probes in both clamp directions: zero observable differences. The clamp
+    /// is a defensive no-op; a mutant on it is equivalent, and an equality
+    /// between two values that move together is decoration, not a test.
+    ///
+    /// What IS observable is the behaviour at the two saturation ends, and that
+    /// is what this asserts instead. Both arms are falsifiable:
+    ///
+    /// * At or below 1.0, every pair already passes (a contrast ratio is never
+    ///   below 1.0), so `fg` comes back byte-identical however illegible it is.
+    ///   Widen the early return's `>=` to `<` and this arm fails.
+    /// * At or above 21.0, NO pair passes — not even white on black, at
+    ///   20.999998f32 — so the scan always exhausts and the fallthrough returns
+    ///   the pole. Change that `pole` to `fg` and this arm fails.
+    ///
+    /// The two arms bracket the function's entire legal target range, so they
+    /// also document the honest contract: outside `[1.0, 21.0]` the caller gets
+    /// saturation, never a panic and never a nonsense colour.
     #[test]
-    fn clamp_target_is_clamped_into_the_legal_ratio_range() {
-        // A caller passing a nonsense target must not produce a nonsense colour:
-        // 1000.0 behaves exactly like the 21.0 ceiling.
-        let bg = (0, 0, 0);
-        assert_eq!(
-            enforce_min_contrast((30, 30, 30), bg, 1000.0),
-            enforce_min_contrast((30, 30, 30), bg, CONTRAST_RATIO_MAX)
+    fn out_of_range_targets_saturate_at_the_two_structural_bounds() {
+        let illegible = (30, 30, 30);
+        let dark_bg = (0, 0, 0);
+        let light_bg = (255, 255, 255);
+
+        // Premise for the lower arm: the pair genuinely fails a real target, so
+        // "returned unchanged" is a statement about the target and not about an
+        // already-legible colour that nothing would have touched anyway.
+        assert!(
+            contrast_ratio(illegible, dark_bg) < 4.5,
+            "premise: {illegible:?} on black must FAIL a real target"
         );
+        for target in [f32::NEG_INFINITY, -5.0, 0.0, CONTRAST_RATIO_MIN] {
+            assert_eq!(
+                enforce_min_contrast(illegible, dark_bg, target),
+                illegible,
+                "target {target} is at or below the 1.0 floor, which every pair \
+                 already meets, so the colour must come back untouched"
+            );
+        }
+
+        // Premise for the upper arm: 21.0 is unreachable everywhere, so these
+        // calls exercise the fallthrough rather than a lift that succeeded.
+        assert!(
+            contrast_ratio(light_bg, dark_bg) < CONTRAST_RATIO_MAX,
+            "premise: even white on black is 20.999998:1, under the ceiling"
+        );
+        for target in [CONTRAST_RATIO_MAX, 1000.0, f32::INFINITY] {
+            assert_eq!(
+                enforce_min_contrast(illegible, dark_bg, target),
+                light_bg,
+                "target {target} is at or above the unreachable ceiling, so the \
+                 scan must exhaust and return the WHITE pole"
+            );
+            assert_eq!(
+                enforce_min_contrast((230, 230, 230), light_bg, target),
+                dark_bg,
+                "the same on the opposite polarity: target {target} must exhaust \
+                 to the BLACK pole"
+            );
+        }
     }
 
     #[test]

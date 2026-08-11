@@ -502,6 +502,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+          # The identity guard walks a commit RANGE, so the shallow default
+          # clone is not enough: `git rev-list base..head` cannot resolve a
+          # base that was never fetched, and the guard would silently drop to
+          # its fallback on every run.
+          fetch-depth: 0
 
       - name: Set up Python
         # actions/setup-python@v7.0.0
@@ -514,8 +519,22 @@ jobs:
         # something would otherwise report a clean tree and look like success.
         run: python3 tests/test_content_safety_audit.py
 
+      - name: Falsify the author-identity guard
+        # Same reason: an allowlist with no rejection cases is
+        # indistinguishable from one that accepts everything.
+        run: python3 tests/test_author_identity_guard.py
+
       - name: Audit tracked files for internal references / identity / secrets
         run: python3 tests/content_safety_audit.py
+
+      - name: Reject non-allowlisted commit identities in the push range
+        # Scoped to the push/PR range: historical commits carry mailboxes that
+        # only a history rewrite can clear, and a gate that is permanently red
+        # for something no PR can fix trains people to ignore it.
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tests/author_identity_guard.py --base "$BASE" --head "$HEAD"
 
   # Credential-shape scan over the full history. Complements content-safety.
   gitleaks:

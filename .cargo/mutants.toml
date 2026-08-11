@@ -83,4 +83,42 @@ exclude_globs = [
 # the reliable filter for a single un-testable-on-Linux function.
 exclude_re = [
     "no_console_window",
+    # PROVABLY EQUIVALENT, not merely hard to kill. `push_decrqss_byte` caps the
+    # DECRQSS selector buffer at 64 bytes; widening `<` to `<=` caps it at 65.
+    # `put` writes nothing else on that branch, and the buffer's ONLY consumer
+    # (`unhook` -> `report_decrqss`) matches it against exactly `b"m"`, `b"r"`
+    # and `b" q"` — lengths 1, 1 and 2. Both a 64- and a 65-byte buffer are
+    # therefore unrecognised and produce the identical invalid reply, so no
+    # input can distinguish the two programs.
+    #
+    # !! Scoped to the EXTRACTED HELPER on purpose, and the narrowness is
+    # MEASURED rather than asserted. `cargo mutants --list -f crates/core/src/term.rs`
+    # selects 3259 mutants; of the helper's four only `< -> <=` is filtered out,
+    # and BOTH `< -> <=` mutants inside `put` (2504:26 sixel, 2509:26 XTGETTCAP)
+    # remain selected. Those two still share ONE description string —
+    # `replace < with <= in <impl Perform for Screen>::put` — which is exactly
+    # why a description-based exclusion written against `put` could never be
+    # surgical: it cannot name one of them without taking the other.
+    #
+    # The XTGETTCAP cap is the one that must not be pardoned. Its off-by-one is
+    # observable: a >=4097-byte payload is truncated to 4096 (even -> decodes ->
+    # the reply quotes back a 4096-char hex name) versus 4097 (odd ->
+    # `hex_decode_bytes` returns `None` -> the reply is the BARE unknown form).
+    # Two different byte strings on the wire (4103 bytes vs 7). Measured on this
+    # tree, applying `buf.len() <= 4096` at 2509 USED TO leave the whole core lib
+    # suite GREEN (931 passed) — so it was not merely a hole that would open "the
+    # day the line enters a diff", it was a live, reachable, uncaught mutant, and
+    # the broad regex would have pardoned it permanently and silently. It is now
+    # KILLED by `xtgettcap_payload_cap_truncates_on_an_even_hex_boundary`, which
+    # drives a 5000-byte name and asserts the quoted-back reply byte-for-byte.
+    # Nothing here is deferred: the DECRQSS cap is pardoned because it is provably
+    # equivalent, and this one is killed because it provably is not.
+    #
+    # The helper's other THREE mutants stay live and are all verified killed by
+    # the DECRQSS reply tests (6 failures each): `replace < with ==`,
+    # `replace < with >` (both leave `buf.len()` never below the cap on the
+    # first byte, so the buffer stays empty) and `replace push_decrqss_byte
+    # with ()`. Only `< -> <=` is excluded, and it survives the full suite
+    # (931 passed) as the equivalence argument above predicts.
+    "replace < with <= in push_decrqss_byte",
 ]

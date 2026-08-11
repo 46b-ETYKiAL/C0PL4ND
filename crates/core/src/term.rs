@@ -263,6 +263,31 @@ fn push_sgr_color(out: &mut String, color: Color, base: u16, bright: u16, ext: u
     }
 }
 
+/// Append one DECRQSS selector byte, bounded against a hostile stream.
+///
+/// DECRQSS setting selectors are 1-2 bytes; anything longer is not a setting we
+/// know. Truncating past the cap can only ever turn the request into an
+/// unrecognised one, which is answered with the DEC "invalid request" form —
+/// never with silence.
+///
+/// Named separately from the sixel and XTGETTCAP caps in [`Perform::put`]
+/// specifically so the off-by-one on THIS bound can be excluded from mutation
+/// testing on its own. It is provably unobservable: `put` writes nothing but
+/// `decrqss_accum`, whose sole consumer (`unhook` -> `report_decrqss`) matches
+/// the payload against exactly `b"m"`, `b"r"` and `b" q"` — lengths 1, 1 and 2.
+/// A 64-byte and a 65-byte buffer are therefore BOTH unrecognised and both
+/// produce the identical invalid reply, so no test can distinguish `<` from
+/// `<=` here. The XTGETTCAP cap next door is NOT equivalent — its off-by-one
+/// flips hex-string parity, so `hex_decode_bytes` succeeds in one case and
+/// returns `None` in the other — and the three caps generate the SAME mutant
+/// description while they share a function, so a name-based exclusion could not
+/// pardon one without silently pardoning all three.
+fn push_decrqss_byte(buf: &mut Vec<u8>, byte: u8) {
+    if buf.len() < DECRQSS_PAYLOAD_MAX {
+        buf.push(byte);
+    }
+}
+
 /// Encode bytes as uppercase ASCII-hex (for XTGETTCAP replies).
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -2485,13 +2510,7 @@ impl Perform for Screen {
                 buf.push(byte);
             }
         } else if let Some(buf) = &mut self.decrqss_accum {
-            // DECRQSS setting selectors are 1-2 bytes; anything longer is not a
-            // setting we know. Truncating past the cap can only ever turn the
-            // request into an unrecognised one, which is answered with the
-            // DEC "invalid request" form — never with silence.
-            if buf.len() < DECRQSS_PAYLOAD_MAX {
-                buf.push(byte);
-            }
+            push_decrqss_byte(buf, byte);
         }
     }
 

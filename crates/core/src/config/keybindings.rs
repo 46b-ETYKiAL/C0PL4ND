@@ -587,16 +587,35 @@ mod tests {
         assert_eq!(canonical_key_token("Zoom"), "zoom");
     }
 
-    /// The canonical token for each punctuation arm, with every alias that must
-    /// fold onto it — the GLYPH first, because the glyph is the only spelling
-    /// that actually proves the arm is there.
-    const PUNCTUATION_ARMS: [(&str, &[&str]); 6] = [
+    /// The canonical token for every punctuation arm of `canonical_key_token`
+    /// that behaves like an ORDINARY key, with each alias that must fold onto
+    /// it — the GLYPH first, because the glyph is the only spelling that
+    /// actually proves the arm is there.
+    ///
+    /// `plus` is the one punctuation arm deliberately absent, and it is absent
+    /// for a REASON rather than an oversight: `+` is the shifted form of `=`, so
+    /// `matches` special-cases it to ignore Shift entirely
+    /// (`self.key == "plus" || self.shift == shift`). It therefore cannot
+    /// satisfy this table's second consumer, which requires every entry to stay
+    /// distinct from its Shift variant. `the_plus_key_collapses_equals_and_folds_shift`
+    /// covers that arm end-to-end instead, including via the `=` glyph — which
+    /// is what makes the assertion non-tautological there.
+    ///
+    /// Every OTHER punctuation arm belongs here. `minus` was missing for a long
+    /// time while this comment claimed the table held them all: the only
+    /// spelling ever asserted anywhere was `"minus"`, which the `_ =>` fallback
+    /// returns unchanged even with the whole arm deleted, so `Ctrl+-` typed as
+    /// the glyph could quietly stop matching a binding spelled `mod+minus` with
+    /// the entire suite green. A table that declares completeness it does not
+    /// have is the exact trap the test below warns about, turned on itself.
+    const PUNCTUATION_ARMS: [(&str, &[&str]); 7] = [
         ("period", &[".", "period", "dot"]),
         ("slash", &["/", "slash"]),
         ("backslash", &["\\", "backslash"]),
         ("semicolon", &[";", "semicolon"]),
         ("quote", &["'", "quote", "apostrophe"]),
         ("backtick", &["`", "backtick", "grave"]),
+        ("minus", &["-", "minus", "dash", "hyphen"]),
     ];
 
     #[test]

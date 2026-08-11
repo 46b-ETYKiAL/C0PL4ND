@@ -2809,6 +2809,94 @@ fn xtgettcap_advertises_setulc_underline_colour() {
     assert_eq!(t.take_pty_response(), expected.as_bytes());
 }
 
+/// The terminal NAME capability, under both spellings that share its arm.
+///
+/// The block above queries `Co`, an unknown name, a non-UTF-8 name, a malformed
+/// hex name, `Smulx` and `Setulc` — but never `TN`, `name` or `RGB`, so those
+/// two arms could be deleted with the whole suite green. That failure is
+/// invisible from INSIDE the terminal: a terminfo-probing app simply reads the
+/// unknown form and downgrades, and nothing anywhere reports an error.
+///
+/// Both spellings are asserted because they SHARE one arm — asserting only
+/// `TN` would leave `name` unpinned if the arm were ever split.
+#[test]
+fn xtgettcap_reports_the_terminal_name_under_both_spellings() {
+    // "TN" hex = 544E.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP+q544E\x1b\\");
+    let expected = format!("\x1bP1+r544E={}\x1b\\", hex_encode(b"xterm-256color"));
+    assert_eq!(t.take_pty_response(), expected.as_bytes());
+
+    // "name" hex = 6E616D65 — the long spelling of the same capability.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP+q6E616D65\x1b\\");
+    let expected = format!("\x1bP1+r6E616D65={}\x1b\\", hex_encode(b"xterm-256color"));
+    assert_eq!(t.take_pty_response(), expected.as_bytes());
+}
+
+/// `RGB` is how an application decides truecolor is available.
+///
+/// It is a BOOLEAN capability, so the reply is the VALID form with NO
+/// `=<value>` — `DCS 1 + r <name> ST`. Dropping the arm yields the UNKNOWN form
+/// (`0+r`), a single-byte difference that silently makes every probing app fall
+/// back to 256 colours, so the reply is asserted byte-for-byte.
+#[test]
+fn xtgettcap_advertises_rgb_truecolor_as_a_boolean_capability() {
+    // "RGB" hex = 524742.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1bP+q524742\x1b\\");
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1+r524742\x1b\\");
+}
+
+/// The XTGETTCAP payload cap truncates on an EVEN hex boundary, and that parity
+/// is load-bearing.
+///
+/// `put` caps the accumulator at 4096 bytes. Widening `<` to `<=` caps it at
+/// 4097 instead — a one-byte change that flips the parity of a hex string, and
+/// `hex_decode_bytes` rejects an ODD-length name outright. So the off-by-one
+/// decides between two DIFFERENT replies: 4096 bytes decode and the terminal
+/// quotes the normalised name back (`DCS 0 + r <4096 hex> ST`, 4103 bytes),
+/// while 4097 bytes fail to decode and the terminal answers the BARE unknown
+/// form (`DCS 0 + r ST`, 7 bytes).
+///
+/// This is deliberately NOT covered by the `push_decrqss_byte` exclusion in
+/// `.cargo/mutants.toml`. Both this cap and the sixel cap next door generate the
+/// identical mutant description `replace < with <= in <impl Perform for
+/// Screen>::put`, so an exclusion written against `put` could not pardon the
+/// DECRQSS cap without silently pardoning THIS one too — which is why the
+/// DECRQSS cap was extracted into its own named helper. Measured before this
+/// test existed: applying `<=` here left the whole core lib suite green
+/// (931 passed), so the mutant was live, reachable and uncaught.
+#[test]
+fn xtgettcap_payload_cap_truncates_on_an_even_hex_boundary() {
+    // 'A' is a valid hex digit, so an over-long run of it is a WELL-FORMED name
+    // once truncated to an even length — which is what makes the parity, rather
+    // than the hex validity, the thing under test.
+    const OVERLONG: [u8; 5000] = [b'A'; 5000];
+    const CAPPED: [u8; 4096] = [b'A'; 4096];
+
+    let mut t = Terminal::new(4, 20);
+    let mut req = Vec::from(&b"\x1bP+q"[..]);
+    req.extend_from_slice(&OVERLONG);
+    req.extend_from_slice(b"\x1b\\");
+    t.advance(&req);
+
+    // 4096 'A's decode to 2048 x 0xAA, which is not valid UTF-8 and so matches
+    // no capability — the UNKNOWN form, but with the name quoted back.
+    let mut expected = Vec::from(&b"\x1bP0+r"[..]);
+    expected.extend_from_slice(&CAPPED);
+    expected.extend_from_slice(b"\x1b\\");
+
+    let got = t.take_pty_response();
+    assert_eq!(
+        got.len(),
+        4103,
+        "a 4096-byte (even) payload must decode and be quoted back; a 4097-byte \
+         (odd) one would fail to decode and collapse to the 7-byte bare form"
+    );
+    assert_eq!(got, expected);
+}
+
 #[test]
 fn smulx_advertisement_is_backed_by_real_support() {
     // TRUTHFULNESS: advertising `Smulx` promises that the sequence its template
@@ -2943,6 +3031,50 @@ fn decrqss_reports_extended_sgr_colors_and_underline_style() {
     assert_eq!(
         t.take_pty_response().as_slice(),
         b"\x1bP1$r0;4:3;38;2;10;20;30;101m\x1b\\"
+    );
+}
+
+/// The 8 / 16 colour-index BOUNDARIES of the DECRQSS SGR report.
+///
+/// `push_sgr_color` has three arms — `0..=7` (base 30/40), `8..=15` (aixterm
+/// bright 90/100, offset by 8) and `16..` (extended `38;5;n`). The extended-SGR
+/// test above is the only test in the workspace that drives an INDEXED colour
+/// through it, and it picks index 9 — the MIDDLE of the bright arm. Index 9 is
+/// invariant under every boundary mutation: `n < 8` widened to `n <= 8` still
+/// misses it, `n < 16` widened to `n <= 16` still catches it, and replacing the
+/// `n < 16` guard with `true` changes nothing because it already matched. So
+/// both guards went unasserted while looking covered.
+///
+/// The reply is documented as a self-contained sequence a client can replay
+/// verbatim, which is why index 8 matters most: `30 + 8` is `38`, the
+/// EXTENDED-COLOUR INTRODUCER, so a client replaying a mis-reported index 8
+/// mis-parses every parameter after it rather than merely painting one cell in
+/// the wrong colour.
+#[test]
+fn decrqss_sgr_report_pins_the_8_and_16_colour_index_boundaries() {
+    // Index 8 is the FIRST bright colour: aixterm `90`, never `30 + 8 == 38`.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[38;5;8m");
+    t.advance(b"\x1bP$qm\x1b\\");
+    assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1$r0;90m\x1b\\");
+
+    // Index 16 is the FIRST extended colour: `38;5;16`, never `90 + 16 - 8`.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[38;5;16m");
+    t.advance(b"\x1bP$qm\x1b\\");
+    assert_eq!(
+        t.take_pty_response().as_slice(),
+        b"\x1bP1$r0;38;5;16m\x1b\\"
+    );
+
+    // And a high index proves the bright arm is not swallowing the whole range:
+    // with the `n < 16` guard replaced by `true`, 255 reports as `;347`.
+    let mut t = Terminal::new(4, 20);
+    t.advance(b"\x1b[48;5;255m");
+    t.advance(b"\x1bP$qm\x1b\\");
+    assert_eq!(
+        t.take_pty_response().as_slice(),
+        b"\x1bP1$r0;48;5;255m\x1b\\"
     );
 }
 

@@ -53,20 +53,126 @@
 //!     for) plus an explicit `DWMSBT_NONE` backdrop, both through winit's TYPED
 //!     `WindowExtWindows` extension rather than raw `DwmSetWindowAttribute`.
 //!
-//! ## Honest limits (what the tests do NOT cover)
+//! # THE WINDOW-CHROME COVERAGE BOUNDARY
+//!
+//! This is the map of where window-chrome coverage STOPS being achievable, and
+//! why. It exists so that an untested region is never mistaken for a tested one,
+//! and so the next person does not re-derive the same dead end. It spans the
+//! whole chrome surface, not just this module, because the boundary does.
+//!
+//! There are THREE reasons a chrome behaviour is not covered, and they are not
+//! interchangeable — the third is the one that hides.
+//!
+//! ## Tier 1 — driven headlessly today (no boundary here)
+//!
+//! Every DECISION this module makes is extracted into a pure function and
+//! exhaustively unit-tested on every host: `hit_code`, `sc_for_toggle`,
+//! `clamped_max_info`, `caption_menu_allowed`, `right_button_action`,
+//! `system_menu_item_states`, `desired_window_material`,
+//! `titlebar_strip_bottom_px`, `maximize_button_logical_rect`,
+//! `logical_rect_to_physical`, `split_lparam`. The message-routing tables are
+//! asserted, and the Windows-only constant pins tie `HT_*`/`SC_*` to the
+//! `windows` crate.
+//!
+//! [`tick`]'s publish half runs against a REAL (headless) `egui::Context` —
+//! `tick_publishes_both_the_maximize_rect_and_the_caption_gate` and
+//! `the_gate_opens_over_inert_titlebar_space_and_closes_over_a_widget` — because
+//! it reads only `content_rect()` and `pixels_per_point()`, and those are exactly
+//! the two things `egui_kittest` DOES supply (see Tier 3). Outside this module,
+//! the caption-cluster clicks, the F11/Esc/palette fullscreen surfaces, the
+//! titlebar layout, and the accessible names are all driven through the real
+//! `frame_tick` by the `egui_kittest` suites.
+//!
+//! ## Tier 2 — needs a real OS window (the honest limits)
+//!
+//! A real HWND and an OS message pump. Cross-references elsewhere in the crate
+//! to "the honest-limits note in `win_chrome`'s module docs" mean this section.
 //!
 //! Everything inside `imp::subclass_proc` needs a real HWND and an OS message
-//! pump, so it cannot be driven headlessly. The DECISIONS it makes are extracted
-//! into pure functions that ARE exhaustively tested (`hit_code`,
-//! `sc_for_toggle`, `clamped_max_info`, `caption_menu_allowed`,
-//! `right_button_action`, `system_menu_item_states`, `desired_window_material`),
-//! and the message-routing tables are asserted — but the arms that call them,
-//! `show_system_menu`'s `TrackPopupMenu` round-trip, and whether
-//! `set_corner_preference` / `set_system_backdrop` actually change how DWM draws
-//! the window all need a real Windows 11 window to confirm. So does whether
-//! `GetSystemMenu` still returns a live handle after `caption_close` has cleared
-//! `WS_SYSMENU` — the code treats an invalid handle as a quiet decline either
-//! way, which is the only outcome that is safe under both answers.
+//! pump, so it cannot be driven headlessly. The pure decisions above ARE tested —
+//! but the arms that call them, `show_system_menu`'s `TrackPopupMenu` round-trip,
+//! and whether `set_corner_preference` / `set_system_backdrop` actually change how
+//! DWM draws the window all need a real Windows 11 window to confirm. So does
+//! whether `GetSystemMenu` still returns a live handle after `caption_close` has
+//! cleared `WS_SYSMENU` — the code treats an invalid handle as a quiet decline
+//! either way, which is the only outcome that is safe under both answers. Also
+//! here: the `WM_GETMINMAXINFO` clamp being honoured by the OS, the
+//! `SC_MAXIMIZE`/`SC_RESTORE` post taking effect, and `win_foreground`'s
+//! `AttachThreadInput` raise (which is doubly out of reach headlessly — its call
+//! site is gated on `self.live_window`, and `C0pl4ndApp::bootstrap()` leaves that
+//! false).
+//!
+//! A SUBSET of Tier 2 is not merely un-automated but genuinely un-assertable:
+//! only a human on a real Windows 11 desktop can confirm that the Snap Layouts
+//! flyout actually renders over the maximize button, that the rounded corners and
+//! the suppressed backdrop look right, that the restored snap bits do not
+//! re-admit a doubled native caption button on a transparent window, and that
+//! `StartDrag` moves the window. Those are eyes-on checks by construction; no
+//! harness makes them green. `docs/control-test-ledger.md` marks that class 🟡.
+//!
+//! ## Tier 3 — unreachable because the harness never publishes the state
+//!
+//! This is the category that hides, because the code compiles, the test runs, and
+//! nothing is red — the branch simply never executes.
+//!
+//! `egui_kittest` (0.34.3, `src/lib.rs:130-135`) seeds exactly two things into
+//! `RawInput`: `screen_rect`, and `viewports[ROOT].native_pixels_per_point`.
+//! **Every other `ViewportInfo` field stays at `Default` — i.e. `None`.** So any
+//! branch guarded by `if let Some(x) = i.viewport().x` never matches, and any
+//! `i.viewport().x.unwrap_or(fallback)` is pinned to the fallback forever. The
+//! affected chrome branches, with what it would take to reach each:
+//!
+//! | field | what is dead without it | to reach it |
+//! |---|---|---|
+//! | `fullscreen` | the OS-reconcile branch (`mod.rs`, `frame_tick`) | DONE — see the worked example below |
+//! | `maximized` | the "restore" glyph + its `"restore"` accessible label (`chrome.rs`); titlebar double-click; the caption `◻`; and therefore the ENTIRE restore arm of `toggle_maximize` (`Maximized(false)` + `InnerSize`) | publish `Some(true)` and drive the `◻` |
+//! | `monitor_size` | the re-centre-on-restore `OuterPosition` inside `toggle_maximize` | publish it AND `maximized` (it is downstream) |
+//! | `outer_rect` | 5 of the 8 frameless-resize directions — anything with a west or north component (`West`, `North`, `NorthWest`, `NorthEast`, `SouthWest`) returns early rather than let the window drift. `East`/`South`/`SouthEast` do run | publish an outer rect and drag an edge |
+//! | `inner_rect` | the `restore_size` capture | publish it AND drive `ui()` (see below) |
+//! | `focused` | the DEC ?1004 focus-in/out edge that tells the pane's program | publish it and flip it across a frame |
+//!
+//! Note the resize row in particular: the apply half is NOT an OS-level operation
+//! (the shipping code sends `InnerSize`/`OuterPosition` itself — `BeginResize` was
+//! removed because it hung the window), so it is not Tier 2. It is pure Tier 3:
+//! headless-testable in principle, blocked only by an unpublished field.
+//!
+//! ### The worked example: `viewport().fullscreen`
+//!
+//! `frame_tick` mirrors the OS fullscreen state back each frame, skipped on a
+//! frame that just commanded a change. Because `egui_kittest` leaves
+//! `viewports[ROOT].fullscreen` at `None`, `if let Some(os)` had NEVER matched in
+//! any test in this repo — the guard was reviewed as "plausible but unproven"
+//! precisely because no test could say anything about it.
+//!
+//! `crates/app/tests/egui_fullscreen_paths.rs`'s `FakeOs` is what armed it, and
+//! the SHAPE of that fix is the reusable part: it publishes the field from what
+//! the app COMMANDED (the emitted `ViewportCommand::Fullscreen`), never from the
+//! app's own `self.fullscreen` mirror. Reading the mirror back would make the
+//! test agree with itself and prove nothing. Anything that arms a Tier-3 branch
+//! must derive its published value from an independent source the same way.
+//!
+//! ### The second, independent axis: `fn ui` is never entered
+//!
+//! Every `egui_kittest` harness in this crate is built as
+//! `Harness::new(|ctx| app.frame_tick(ctx))`, which enters at `frame_tick` and
+//! BYPASSES `impl eframe::App::ui` entirely. The only tests that go through `ui`
+//! are the `build_eframe` ones, and all of them are `#[ignore]`d (they need a real
+//! GPU). So the work `ui` does before it calls `frame_tick` —
+//! `caption_close::ensure_close_button_stripped()` and the `restore_size` capture —
+//! is unexecuted by a default `cargo test`, independently of Tier 3.
+//!
+//! ## A fourth trap: covered ACTION, uncovered EFFECT
+//!
+//! The caption `—` and `◻` clicks are driven by real `egui_kittest` tests, but
+//! those tests assert `C0pl4ndApp::last_window_cmd()`, which `frame_tick` sets
+//! BEFORE it calls `send_viewport_cmd`. No test in this crate asserts the emitted
+//! `ViewportCommand::Minimized`/`Maximized` at all (only `RequestUserAttention`
+//! and `Fullscreen` are ever read back out of `viewport_output`). That is
+//! measured, not inferred: deleting the `send_viewport_cmd` for minimize outright
+//! leaves `clicking_minimize_caption_issues_a_minimize_command` passing. The click
+//! is proven; the OS command it is supposed to issue is not. Read the ledger's
+//! caption rows with that in mind — the boundary there is assertion strength, not
+//! the harness, and it is reachable: assert `h.output().viewport_output`.
 //!
 //! ## unsafe
 //!

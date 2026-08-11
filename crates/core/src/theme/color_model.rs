@@ -254,9 +254,24 @@ const CLAMP_STEPS: u32 = 32;
 /// toward whichever monochrome pole (black or white) is further from `bg`.
 ///
 /// Returns `fg` unchanged when it already meets `target`. When even the pole
-/// cannot reach `target` (a mid-grey background caps out around 10.4:1) the
-/// pole itself is returned — the most legible colour available — rather than
-/// failing or leaving the unreadable original.
+/// cannot reach `target` the pole itself is returned — the most legible colour
+/// available — rather than failing or leaving the unreadable original.
+///
+/// That fallthrough is far more reachable than it looks, and this doc used to
+/// say so wrongly: it claimed a mid-grey background "caps out around 10.4:1",
+/// which overstates the real ceiling by ~2.3x. Measured over the whole sRGB
+/// cube on this toolchain, the best ratio ANY foreground can reach is
+/// **4.6075:1** against grey 117, and the floor across all 16 777 216
+/// backgrounds is **4.5826:1** at `(3, 137, 1)`. So a 7.0 target is unreachable
+/// for the 59 greys `90..=148`, and a 21.0 target is unreachable for EVERY
+/// background — including pure black, because `contrast_ratio(white, black)` is
+/// 20.999998f32, not 21.0f32.
+///
+/// The practical consequence is that a caller must NOT assume the returned
+/// colour meets `target`; on this branch, by design, it does not. The same
+/// mistake shows up in test design: a greyscale sweep run only at 4.5 never
+/// enters this branch at all (measured over the full 256x256 grid: 20 042
+/// no-op, 45 494 lift, **0** unreachable).
 ///
 /// # Examples
 ///
@@ -277,9 +292,17 @@ pub fn enforce_min_contrast(fg: (u8, u8, u8), bg: (u8, u8, u8), target: f32) -> 
         return fg;
     }
     // Move away from the background: toward white if the background is dark,
-    // toward black if it is light. The 0.1791 pivot is the luminance at which
-    // black and white contrast equally against a colour ((1.05/0.05).sqrt()
-    // solved for L), so this always picks the higher-headroom pole.
+    // toward black if it is light. 0.1791 is the luminance at which black and
+    // white contrast equally against a colour ((1.05/0.05).sqrt() solved for L),
+    // TRUNCATED to four decimals: the exact root is 0.17912878474779198, so the
+    // literal sits 2.878e-5 below it. "Always picks the higher-headroom pole" is
+    // therefore not quite true, and this comment used to claim it was — for the
+    // 1004 sRGB colours whose luminance lands in [0.1791, 0.17912878) the `else`
+    // branch is taken and BLACK is chosen while white is fractionally better.
+    // The difference is under 1.2e-3 of contrast: invisible, not worth widening
+    // the literal for, but a property NOT to assert in a test. Pin the
+    // documented pivot; a sweep asserting "the better pole" fails on 1004 of
+    // 16 777 216 inputs and reads as a bug.
     let pole = if relative_luminance(bg) < 0.1791 {
         (255, 255, 255)
     } else {
@@ -398,10 +421,59 @@ mod tests {
         assert!(contrast_ratio(on_light, light_bg) < contrast_ratio((0, 0, 0), light_bg));
     }
 
+    /// The `>= target` EARLY RETURN, exercised on the path it is named for.
+    ///
+    /// RIGHT OUTCOME, WRONG REASON. This test used to open with
+    /// `enforce(white, black, 21.0) == white`. `contrast_ratio(white, black)` is
+    /// 20.999998f32, strictly BELOW the 21.0 ceiling, so the early return never
+    /// fired: the call walked all 32 blend steps, failed every one, and fell
+    /// through to `pole` — which for a black background happens to BE white. The
+    /// expected colour arrived down the UNREACHABLE path, so the assertion could
+    /// not observe the no-op gate at all. That case is a genuine unreachable
+    /// fixture and now lives with the other unreachable ones.
+    ///
+    /// Two things make the replacement able to fail:
+    ///
+    /// 1. `fg` is deliberately NOT a pole. Against a pole foreground every blend
+    ///    step is a no-change, so a pole `fg` cannot distinguish the early return
+    ///    from a scan that succeeds on step 1 — the same blind spot in a
+    ///    different costume.
+    /// 2. `fg == bg` at `CONTRAST_RATIO_MIN`. `contrast_ratio(x, x)` is EXACTLY
+    ///    1.0f32, which is the only way to reach `>=` AT equality and therefore
+    ///    the only way to observe it widened to `>`. The `(10,10,10)`-on-black
+    ///    fixture below is 1.0607:1 — strictly greater, so it never touches the
+    ///    boundary. Measured: with `>=` mutated to `>`, this test used to pass.
     #[test]
     fn clamp_is_a_no_op_when_the_pair_already_passes() {
-        let fg = (255, 255, 255);
-        assert_eq!(enforce_min_contrast(fg, (0, 0, 0), 21.0), fg);
+        // (1) A non-pole foreground that comfortably clears the target (12.55:1)
+        // must come back BYTE-IDENTICAL, not merely still-passing: a lift toward
+        // white would also "still pass" while silently rewriting the colour.
+        let bright = (200, 200, 200);
+        assert!(
+            contrast_ratio(bright, (0, 0, 0)) >= 4.5,
+            "premise: {bright:?} on black must already pass 4.5 for this to be \
+             a no-op case at all"
+        );
+        assert_eq!(
+            enforce_min_contrast(bright, (0, 0, 0), 4.5),
+            bright,
+            "an already-passing pair must be returned unchanged"
+        );
+
+        // (2) The equality boundary, the sole killer of a `>=` widened to `>`.
+        for same in [(0, 0, 0), (128, 128, 128), (200, 30, 90), (255, 255, 255)] {
+            assert_eq!(
+                contrast_ratio(same, same),
+                CONTRAST_RATIO_MIN,
+                "premise: a colour against itself is exactly 1.0:1"
+            );
+            assert_eq!(
+                enforce_min_contrast(same, same, CONTRAST_RATIO_MIN),
+                same,
+                "the floor is met AT equality, so {same:?} must survive untouched"
+            );
+        }
+
         // A target at or below the structural minimum can never trigger.
         let dull = (10, 10, 10);
         assert_eq!(enforce_min_contrast(dull, (0, 0, 0), 1.0), dull);

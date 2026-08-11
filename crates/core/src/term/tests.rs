@@ -1867,6 +1867,48 @@ fn buffer_text_skips_the_wide_glyph_continuation_spacer() {
 }
 
 #[test]
+fn screen_text_skips_the_wide_glyph_continuation_spacer() {
+    // REGRESSION: `screen_text` is what the app presents as "what is on screen"
+    // — it feeds the AccessKit screen-reader node, the in-terminal search
+    // corpus, the command-history echo gate and the headless render fallback.
+    // It used to be the raw `Grid::to_text` per-cell dump, which EMITS the blank
+    // continuation cell after a width-2 glyph, so a CJK line came back as
+    // "\u{65e5} \u{672c} \u{8a9e}": substring search could not find it, CJK
+    // commands were never recorded in history, and a screen reader announced a
+    // phantom space between every wide glyph.
+    let mut t = Terminal::new(2, 8);
+    t.advance("\u{65e5}\u{672c}\u{8a9e}".as_bytes());
+    let text = t.screen_text();
+    assert!(
+        text.contains("\u{65e5}\u{672c}\u{8a9e}"),
+        "the visible screen must read as the drawn glyphs, got {text:?}"
+    );
+    assert!(
+        !text.contains("\u{65e5} "),
+        "no stray continuation spacer after a wide glyph, got {text:?}"
+    );
+    // One line per grid row, each newline-terminated (unchanged from to_text).
+    assert_eq!(
+        text.matches('\n').count(),
+        2,
+        "one trailing newline per grid row"
+    );
+}
+
+#[test]
+fn screen_text_and_to_text_agree_on_pure_ascii() {
+    // The fix must change NOTHING for ASCII: the spacer skip only fires after a
+    // width-2 glyph, so an ASCII screen is byte-identical to the raw dump.
+    let mut t = Terminal::new(2, 8);
+    t.advance(b"hi there");
+    assert_eq!(
+        t.screen_text(),
+        t.grid().to_text(),
+        "ASCII screens are unaffected by the wide-glyph convention"
+    );
+}
+
+#[test]
 fn el_mode1_erases_bol_to_cursor() {
     let mut t = Terminal::new(2, 5);
     t.advance(b"abcde");

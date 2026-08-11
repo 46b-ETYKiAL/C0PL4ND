@@ -582,10 +582,15 @@ fn pane_keeps_its_content_after_adding_a_terminal() {
         }
         std::thread::sleep(Duration::from_millis(40));
     }
-    if !seen {
-        eprintln!("token never reached pane 0 (no PTY echo); skipping");
-        return;
-    }
+    // The echo NOT arriving is the very regression this test exists to catch
+    // ("the existing terminal goes black"), so it must FAIL, never skip — an
+    // early return here converts a genuine dead/blank pane into a pass.
+    assert!(
+        seen,
+        "pre-condition: `echo {TOKEN}` never reached pane 0 grid within 10s: \
+         the pane produced no PTY echo at all, which is itself the blank-pane \
+         regression this test guards"
+    );
 
     // Add a terminal → splits + resizes pane 0. Run several frames so the
     // debounced resize + reflow settle.

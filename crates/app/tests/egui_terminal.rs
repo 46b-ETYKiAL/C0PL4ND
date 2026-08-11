@@ -60,6 +60,32 @@ fn press_enter(h: &mut Harness<'_>) {
     h.step();
 }
 
+/// Click `pane`'s tab (the real chrome path) until focus ACTUALLY lands on it;
+/// returns whether it did. The tab's accessible label tracks the pane's LIVE OSC
+/// window title, which arrives ASYNCHRONOUSLY from the PTY reader thread — so
+/// (a) re-derive the lookup key from the SAME post-`h.run()` state each
+/// iteration, and (b) a title landing also RESIZES the tab strip, shifting the
+/// tab's rect between capture and hit-test, so a single click can miss.
+/// Verifying the effect (`focused_pane == pane`) and re-clicking closes both
+/// races. (egui_chrome's `click_tab_control_until` is the shared form;
+/// integration test binaries don't share helpers, so it is inlined here.)
+fn click_tab_until_focused(h: &mut Harness<'_>, app: &RefCell<C0pl4ndApp>, pane: PaneId) -> bool {
+    for _ in 0..240 {
+        h.run();
+        let Some(label) = app.borrow().tab_label_for_pane(pane) else {
+            continue;
+        };
+        if let Some(node) = h.query_by_label(label.as_str()) {
+            node.click();
+            h.run();
+            if app.borrow().focused_pane() == pane {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Poll the focused pane's grid for `needle`, stepping frames + sleeping (the
 /// PTY echoes/executes asynchronously, exactly like `e2e_terminal.rs` polls).
 fn poll_focused_contains(
@@ -103,6 +129,9 @@ fn poll_focused_contains(
 #[test]
 fn opening_a_new_terminal_does_not_blank_the_first_pane() {
     let app = RefCell::new(C0pl4ndApp::bootstrap());
+    let mut h = harness(&app);
+    // Guard AFTER the harness: `bootstrap_with` defers every PTY spawn to the
+    // first frame, so before `harness(..)` has run one this is ALWAYS `None`.
     {
         let a = app.borrow();
         let focused = a.focused_pane();
@@ -111,7 +140,6 @@ fn opening_a_new_terminal_does_not_blank_the_first_pane() {
             return;
         }
     }
-    let mut h = harness(&app);
 
     let first = app.borrow().focused_pane();
 
@@ -151,8 +179,10 @@ fn opening_a_new_terminal_does_not_blank_the_first_pane() {
 #[test]
 fn typing_a_command_reaches_the_pty_and_updates_the_grid() {
     let app = RefCell::new(C0pl4ndApp::bootstrap());
+    let mut h = harness(&app);
     // Skip cleanly if the platform shell could not spawn (no PTY on this box) —
-    // never a false green: assert the pane is live before driving it.
+    // never a false green. Guard AFTER the harness: `bootstrap_with` defers every
+    // PTY spawn to the first frame, so before it this is ALWAYS `None`.
     {
         let a = app.borrow();
         let focused = a.focused_pane();
@@ -161,7 +191,6 @@ fn typing_a_command_reaches_the_pty_and_updates_the_grid() {
             return;
         }
     }
-    let mut h = harness(&app);
 
     // A token that cannot pre-exist on the prompt line. `echo` it so the shell
     // prints it back (works on cmd.exe and POSIX sh — the default shells).
@@ -177,48 +206,55 @@ fn typing_a_command_reaches_the_pty_and_updates_the_grid() {
     );
 }
 
-/// Pane focus: bootstrap opens two panes. Click pane 1's tab to focus it, type a
-/// token, and assert it lands in pane 1's grid and NOT in pane 0's. This proves
-/// input routes to the clicked pane (and away from the other).
+/// SECURITY-adjacent (keystroke leak): open a second pane, click pane 1's tab to
+/// focus it, type a token, and assert it lands in pane 1's grid and NOT in pane
+/// 0's. This proves input routes to the clicked pane and does not leak into the
+/// unfocused shell.
+///
+/// The second pane is opened HERE. This test used to say "bootstrap opens two
+/// panes" and guard on `pane_grid_text(PaneId(1))` — but `INITIAL_PANES` is 1,
+/// so pane 1 never existed and the guard returned early on every platform, every
+/// run. The doc was stale; the pane is now created explicitly.
 #[test]
 fn clicking_a_pane_routes_typed_input_to_that_pane_only() {
     let app = RefCell::new(C0pl4ndApp::bootstrap());
+    let mut h = harness(&app);
+    assert_eq!(
+        app.borrow().focused_pane(),
+        PaneId(0),
+        "bootstrap focuses pane 0"
+    );
+
+    // Open the SECOND pane (the "+" path) — bootstrap only opens one.
+    app.borrow_mut().new_terminal();
+    for _ in 0..8 {
+        h.run();
+    }
+
+    // Guard AFTER the harness AND the split: `bootstrap_with` defers every PTY
+    // spawn to the first frame the pane's rect is known, so a pane only becomes
+    // live once frames have run. Before that this is ALWAYS `None`.
     {
         let a = app.borrow();
         if a.pane_grid_text(PaneId(0)).is_none() || a.pane_grid_text(PaneId(1)).is_none() {
             eprintln!("no live PTY on this platform; skipping focus routing");
             return;
         }
-        assert_eq!(a.focused_pane(), PaneId(0), "pane 0 focused at start");
     }
-    let mut h = harness(&app);
 
-    // Focus pane 1 by clicking its tab (the real chrome path), retrying until
-    // focus ACTUALLY lands on pane 1. The tab's accessible label tracks the
-    // pane's LIVE OSC window title, which lands ASYNCHRONOUSLY from the PTY reader
-    // thread — so (a) re-derive the lookup key from the SAME post-`h.run()` state
-    // each iteration, and (b) a title landing also RESIZES the tab strip, shifting
-    // the tab's rect between capture and hit-test, so a single click can miss.
-    // Verifying the effect (focused_pane == 1) and re-clicking closes both races.
-    // (egui_chrome's click_tab_control_until is the shared form; integration test
-    // binaries don't share helpers, so it's inlined here.)
-    let mut focused = false;
-    for _ in 0..240 {
-        h.run();
-        let label = app
-            .borrow()
-            .tab_label_for_pane(PaneId(1))
-            .expect("pane 1 must have a tab label");
-        if let Some(node) = h.query_by_label(label.as_str()) {
-            node.click();
-            h.run();
-            if app.borrow().focused_pane() == PaneId(1) {
-                focused = true;
-                break;
-            }
-        }
-    }
-    assert!(focused, "clicking pane 1's tab never moved focus to pane 1");
+    // `new_terminal` focuses the NEW pane, so click BACK to pane 0 first —
+    // otherwise "clicking pane 1's tab moves focus to pane 1" is vacuously true
+    // because focus was already there.
+    assert!(
+        click_tab_until_focused(&mut h, &app, PaneId(0)),
+        "could not return focus to pane 0 before the routing check"
+    );
+
+    // Now focus pane 1 by clicking ITS tab (the real chrome path).
+    assert!(
+        click_tab_until_focused(&mut h, &app, PaneId(1)),
+        "clicking pane 1's tab never moved focus to pane 1"
+    );
 
     // Type a unique token; it must land in pane 1's grid.
     let token = "c0pl4nd_pane1_only";
@@ -247,6 +283,9 @@ fn clicking_a_pane_routes_typed_input_to_that_pane_only() {
 #[test]
 fn shrinking_the_window_resizes_the_pane_pty() {
     let app = RefCell::new(C0pl4ndApp::bootstrap());
+    let mut h = harness(&app);
+    // Guard AFTER the harness: `bootstrap_with` defers every PTY spawn to the
+    // first frame, so before `harness(..)` has run one this is ALWAYS `None`.
     {
         let a = app.borrow();
         if a.pane_grid_text(a.focused_pane()).is_none() {
@@ -254,7 +293,6 @@ fn shrinking_the_window_resizes_the_pane_pty() {
             return;
         }
     }
-    let mut h = harness(&app);
     h.set_size(egui::vec2(1200.0, 800.0));
     h.run();
     h.run();
@@ -571,6 +609,9 @@ fn incognito_blocks_history_and_clear_empties_it() {
 #[test]
 fn grid_text_is_exposed_to_accesskit_screen_readers() {
     let app = RefCell::new(C0pl4ndApp::bootstrap());
+    let mut h = harness(&app);
+    // Guard AFTER the harness: `bootstrap_with` defers every PTY spawn to the
+    // first frame, so before `harness(..)` has run one this is ALWAYS `None`.
     {
         let a = app.borrow();
         let focused = a.focused_pane();
@@ -579,7 +620,6 @@ fn grid_text_is_exposed_to_accesskit_screen_readers() {
             return;
         }
     }
-    let mut h = harness(&app);
 
     let token = "c0pl4nd_a11y_marker";
     type_text(&mut h, &format!("echo {token}"));
@@ -612,6 +652,9 @@ fn grid_text_is_exposed_to_accesskit_screen_readers() {
 #[test]
 fn ime_commit_reaches_the_pty_and_updates_the_grid() {
     let app = RefCell::new(C0pl4ndApp::bootstrap());
+    let mut h = harness(&app);
+    // Guard AFTER the harness: `bootstrap_with` defers every PTY spawn to the
+    // first frame, so before `harness(..)` has run one this is ALWAYS `None`.
     {
         let a = app.borrow();
         let focused = a.focused_pane();
@@ -620,7 +663,6 @@ fn ime_commit_reaches_the_pty_and_updates_the_grid() {
             return;
         }
     }
-    let mut h = harness(&app);
 
     // A CJK composition the user finished composing: the IME delivers the final
     // result as a single `Commit`. (A real session would also see one or more

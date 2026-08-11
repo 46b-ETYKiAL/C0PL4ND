@@ -23,6 +23,7 @@
 
 use crate::egui_app::grid::PaneId;
 use crate::egui_app::pane_term::PaneTerm;
+use crate::egui_app::pty_gate::expect_live_pty;
 use crate::egui_app::C0pl4ndApp;
 
 /// Drive one real frame with a known focus state and return the root viewport's
@@ -55,9 +56,7 @@ fn pump_frame(app: &mut C0pl4ndApp, focused: Option<bool>) -> Vec<egui::Viewport
 fn app_with_osc(osc: &[u8]) -> C0pl4ndApp {
     let mut app = C0pl4ndApp::bootstrap();
     let pane = PaneTerm::spawn(app.theme.clone(), 80, 24);
-    let term = pane
-        .terminal_for_test()
-        .expect("PTY spawn must succeed — a skipped wiring test proves nothing");
+    let term = expect_live_pty(&pane);
     term.lock().unwrap().advance(osc);
     app.terms.insert(PaneId(0), pane);
     app

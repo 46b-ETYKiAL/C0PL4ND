@@ -42,6 +42,22 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
+    env:
+      # Arms the live-PTY guard in `egui_app::pty_gate`. Eighteen `pane_term`
+      # tests — two of them the OSC 52 clipboard-read security gates — are
+      # guarded on `terminal_for_test()`, which returns `None` for exactly one
+      # reason: the PTY spawn failed. That keys the guard on the very subsystem
+      # the tests protect, so a regression in shell resolution, ConPTY/openpty
+      # setup, or the job-object assignment would turn all eighteen green having
+      # asserted nothing.
+      #
+      # The platform default shell exists on all three runners, so there is no
+      # legitimate skip here and this is set for every OS leg. With it, an
+      # absent PTY is a hard, actionable failure instead of a quiet pass. Only
+      # the literal `1` arms it (see `pty_gate::env_arms_requirement`), so a
+      # typo cannot silently disarm the lane the way the dead `C0PL4ND_HEADLESS`
+      # did.
+      C0PL4ND_REQUIRE_PTY: "1"
     steps:
       - name: Harden the runner (egress audit)
         # step-security/harden-runner@v2.19.4

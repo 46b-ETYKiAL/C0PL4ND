@@ -22,6 +22,8 @@
 
 use super::*;
 
+use crate::egui_app::pty_gate::expect_live_pty;
+
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
@@ -131,9 +133,7 @@ fn wait_for_grid(pane: &PaneTerm, needle: &str, timeout: Duration) -> String {
 /// green on a host where it proved nothing.
 fn attach_busy_pane(app: &mut C0pl4ndApp) -> PaneId {
     let pane = PaneTerm::spawn(app.theme.clone(), 80, 24);
-    let term = pane
-        .terminal_for_test()
-        .expect("the platform default shell must spawn for this test to mean anything");
+    let term = expect_live_pty(&pane);
     term.lock().unwrap().advance(b"\x1b]133;C\x07");
     let pid = app.pane_alloc.alloc();
     app.terms.insert(pid, pane);

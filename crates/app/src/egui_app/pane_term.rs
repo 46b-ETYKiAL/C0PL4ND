@@ -1555,12 +1555,20 @@ impl PaneTerm {
     }
 
     /// The visible grid as plain text (used by tests to assert PTY output landed
-    /// on screen, and as a headless render fallback). `None` for a dead session.
+    /// on screen, by the AccessKit screen-reader node, by the in-terminal search
+    /// corpus and the history echo gate, and as a headless render fallback).
+    /// `None` for a dead session.
+    ///
+    /// Uses [`Terminal::screen_text`], NOT the raw `Grid::to_text` dump: the
+    /// latter emits the blank continuation cell after a width-2 glyph, so a CJK
+    /// line came back as `"日 本 語"` — which broke substring search, hid CJK
+    /// commands from history, and made a screen reader announce a phantom space
+    /// between every wide glyph.
     pub fn grid_text(&self) -> Option<String> {
         let session = self.session.as_ref()?;
         let term = session.terminal();
         let guard = term.lock().ok()?;
-        Some(guard.grid().to_text())
+        Some(guard.screen_text())
     }
 
     /// The active theme's default background as an `(r,g,b)` triple — the colour
@@ -1603,6 +1611,7 @@ impl PaneTerm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egui_app::pty_gate::{require_live_pty, require_live_spawn};
 
     fn void_theme() -> Theme {
         Theme::builtin_void()
@@ -1671,7 +1680,9 @@ mod tests {
             "a fresh pane must not claim a running command"
         );
         // No shell on this box → the None default above is the assertion.
-        let Some(term) = pane.terminal_for_test() else {
+        // Under C0PL4ND_REQUIRE_PTY=1 (CI) a failed spawn is a hard failure
+        // instead, so this cannot become a body that never runs.
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         // The shell announces a command's output starts here (`OSC 133 ; C`).
@@ -1796,9 +1807,10 @@ mod tests {
             .to_string();
         let (program, args) = print_cwd_program();
         let pane = PaneTerm::spawn_program_in(void_theme(), program, &args, 80, 24, dir.to_str());
-        if pane.error().is_some() {
+        if !require_live_spawn(&pane) {
             // No shell available on this host: nothing to observe. Not a pass
-            // for the behaviour — just an absent platform.
+            // for the behaviour — just an absent platform. Under
+            // C0PL4ND_REQUIRE_PTY=1 (CI) this is a hard failure instead.
             let _ = std::fs::remove_dir_all(&dir);
             return;
         }
@@ -1844,7 +1856,8 @@ mod tests {
         };
         let (program, args) = print_cwd_program();
         let pane = PaneTerm::spawn_program(void_theme(), program, &args, 80, 24);
-        if pane.error().is_some() {
+        // Absent platform → skip; under C0PL4ND_REQUIRE_PTY=1 (CI) → hard fail.
+        if !require_live_spawn(&pane) {
             return;
         }
         let grid = wait_for_grid(&pane, &home, std::time::Duration::from_secs(20));
@@ -2159,7 +2172,8 @@ mod tests {
         );
         // If the shell could not spawn on this box, there is no terminal to
         // drive; the Off default above is still the meaningful assertion.
-        let Some(term) = pane.terminal_for_test() else {
+        // Under C0PL4ND_REQUIRE_PTY=1 (CI) that is a hard failure, not a skip.
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         // App enables ?1000 (normal button tracking) — the badge-trigger state.
@@ -2197,8 +2211,9 @@ mod tests {
             "a press while mouse mode is Off must not be reported"
         );
         // If the shell could not spawn there is no terminal to enable ?1000 on;
-        // the Off assertion above is still the meaningful one.
-        let Some(term) = pane.terminal_for_test() else {
+        // the Off assertion above is still the meaningful one. Under
+        // C0PL4ND_REQUIRE_PTY=1 (CI) that is a hard failure, not a skip.
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         term.lock().unwrap().advance(b"\x1b[?1000h");
@@ -2223,7 +2238,7 @@ mod tests {
     #[test]
     fn pump_host_effects_drains_every_queue() {
         let pane = PaneTerm::spawn(void_theme(), 80, 24);
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         {
@@ -2291,7 +2306,7 @@ mod tests {
     #[test]
     fn pane_denies_clipboard_reads_until_told_otherwise() {
         let pane = PaneTerm::spawn(void_theme(), 80, 24);
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         let mut t = term.lock().unwrap();
@@ -2318,7 +2333,7 @@ mod tests {
     #[test]
     fn set_clipboard_read_allowed_moves_the_terminal_gate_both_ways() {
         let pane = PaneTerm::spawn(void_theme(), 80, 24);
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         assert!(!term.lock().unwrap().clipboard_read_enabled());
@@ -2348,7 +2363,7 @@ mod tests {
     #[test]
     fn pump_host_effects_serves_a_parked_clipboard_read() {
         let pane = PaneTerm::spawn(void_theme(), 80, 24);
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         pane.set_clipboard_read_allowed(true);
@@ -2385,7 +2400,7 @@ mod tests {
     #[test]
     fn scroll_view_moves_the_scrollback_offset() {
         let pane = PaneTerm::spawn(void_theme(), 80, 6);
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         // Produce many more lines than the 6-row screen so there is scrollback.
@@ -2430,7 +2445,7 @@ mod tests {
         );
         // If the shell could not spawn on this box there is no terminal to
         // drive; the None default above is still the meaningful assertion.
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         // The program sets its window title via OSC 0 (BEL-terminated).
@@ -2460,7 +2475,7 @@ mod tests {
         );
         // If the shell could not spawn on this box there is no terminal to
         // drive; the None default above is still the meaningful assertion.
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         // The shell reports a successful command end (`OSC 133 ; D ; 0`).
@@ -2499,7 +2514,7 @@ mod tests {
     fn grid_rows_is_damage_gated_and_content_correct() {
         let pane = PaneTerm::spawn(void_theme(), 80, 24);
         // If the shell could not spawn on this box there is no terminal to read.
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         term.lock().unwrap().advance(b"hello world");
@@ -2529,7 +2544,7 @@ mod tests {
     #[test]
     fn grid_rows_cache_invalidated_by_set_theme() {
         let mut pane = PaneTerm::spawn(void_theme(), 80, 24);
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         term.lock().unwrap().advance(b"x");
@@ -2549,7 +2564,7 @@ mod tests {
     #[test]
     fn report_focus_only_reports_when_armed() {
         let pane = PaneTerm::spawn(void_theme(), 80, 24);
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         let mut pane = pane;
@@ -2580,7 +2595,7 @@ mod tests {
     #[test]
     fn jump_to_prompt_scrolls_to_a_prompt_mark() {
         let pane = PaneTerm::spawn(void_theme(), 80, 3);
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         {
@@ -2609,7 +2624,7 @@ mod tests {
     #[test]
     fn selection_text_extracts_ordered_trimmed_rows() {
         let pane = PaneTerm::spawn(void_theme(), 80, 4);
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         {
@@ -2640,7 +2655,7 @@ mod tests {
     #[test]
     fn selection_text_block_mode_clips_every_row_to_the_column_range() {
         let pane = PaneTerm::spawn(void_theme(), 80, 4);
-        let Some(term) = pane.terminal_for_test() else {
+        let Some(term) = require_live_pty(&pane) else {
             return;
         };
         {

@@ -3884,24 +3884,8 @@ impl Terminal {
     /// empty bottom of the live grid) are dropped. Rows are joined with `\n` with
     /// no trailing newline.
     pub fn buffer_text(&self) -> Option<String> {
-        use unicode_width::UnicodeWidthChar;
-        let row_text = |cells: &[Cell]| -> String {
-            let mut s = String::new();
-            for (i, cell) in cells.iter().enumerate() {
-                // Skip the wide-glyph continuation spacer: a cell whose PREVIOUS
-                // cell is a width-2 glyph (the core writes the glyph then one
-                // blank cell), so no stray space is emitted around a CJK / emoji.
-                if i > 0 {
-                    if let Some(prev) = cells.get(i - 1) {
-                        if UnicodeWidthChar::width(prev.c).unwrap_or(1) >= 2 {
-                            continue;
-                        }
-                    }
-                }
-                s.push(cell.c);
-            }
-            s.trim_end().to_string()
-        };
+        let row_text =
+            |cells: &[Cell]| -> String { row_text_skipping_spacers(cells).trim_end().to_string() };
         let rows = self.screen.grid.rows();
         let mut lines: Vec<String> = Vec::with_capacity(self.screen.history.len() + rows);
         for row in self.screen.history.iter() {
@@ -3921,6 +3905,27 @@ impl Terminal {
         } else {
             Some(lines.join("\n"))
         }
+    }
+
+    /// The VISIBLE screen as plain text — one line per grid row, each terminated
+    /// by `\n` (so a 24-row grid yields 24 newlines), using the SAME wide-glyph
+    /// convention as [`Self::buffer_text`]: the blank continuation spacer written
+    /// after a width-2 glyph is skipped, so the text matches what is DRAWN.
+    ///
+    /// This is the accessor every "what is on screen right now" consumer wants —
+    /// the AccessKit screen-reader node, the in-terminal search corpus, the
+    /// command-history echo gate, and the headless render fallback. The raw
+    /// [`Grid::to_text`] dump is column-faithful instead of glyph-faithful, so it
+    /// emits a stray space inside every CJK / emoji run; use this instead.
+    pub fn screen_text(&self) -> String {
+        let grid = &self.screen.grid;
+        let rows = grid.rows();
+        let mut out = String::with_capacity(rows * (grid.cols() + 1));
+        for r in 0..rows {
+            out.push_str(&row_text_skipping_spacers(grid.row(r)));
+            out.push('\n');
+        }
+        out
     }
 
     /// Resize the terminal to `rows` × `cols` (each clamped to a minimum of 1),
@@ -3975,6 +3980,30 @@ impl Terminal {
             self.screen.clamp_scroll_region();
         }
     }
+}
+
+/// One row of cells as text using the terminal COPY convention: the blank
+/// continuation spacer the core writes after a wide (width-2) glyph is SKIPPED,
+/// so the emitted text matches the drawn text and no stray space appears inside
+/// a CJK / emoji run.
+///
+/// Single implementation shared by [`Terminal::buffer_text`] (copy-all) and
+/// [`Terminal::screen_text`] (the visible screen) so the convention can never
+/// drift between the two surfaces.
+fn row_text_skipping_spacers(cells: &[Cell]) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut s = String::with_capacity(cells.len());
+    for (i, cell) in cells.iter().enumerate() {
+        if i > 0 {
+            if let Some(prev) = cells.get(i - 1) {
+                if UnicodeWidthChar::width(prev.c).unwrap_or(1) >= 2 {
+                    continue;
+                }
+            }
+        }
+        s.push(cell.c);
+    }
+    s
 }
 
 #[cfg(test)]

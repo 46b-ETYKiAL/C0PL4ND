@@ -6865,6 +6865,8 @@ mod resize_tests {
 #[path = "close_path_tests.rs"]
 mod close_path_tests;
 #[cfg(test)]
+mod pty_gate;
+#[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;
 #[cfg(test)]

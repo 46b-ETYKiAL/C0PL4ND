@@ -2806,6 +2806,55 @@ fn xtgettcap_advertises_rgb_truecolor_as_a_boolean_capability() {
     assert_eq!(t.take_pty_response().as_slice(), b"\x1bP1+r524742\x1b\\");
 }
 
+/// The XTGETTCAP payload cap truncates on an EVEN hex boundary, and that parity
+/// is load-bearing.
+///
+/// `put` caps the accumulator at 4096 bytes. Widening `<` to `<=` caps it at
+/// 4097 instead — a one-byte change that flips the parity of a hex string, and
+/// `hex_decode_bytes` rejects an ODD-length name outright. So the off-by-one
+/// decides between two DIFFERENT replies: 4096 bytes decode and the terminal
+/// quotes the normalised name back (`DCS 0 + r <4096 hex> ST`, 4103 bytes),
+/// while 4097 bytes fail to decode and the terminal answers the BARE unknown
+/// form (`DCS 0 + r ST`, 7 bytes).
+///
+/// This is deliberately NOT covered by the `push_decrqss_byte` exclusion in
+/// `.cargo/mutants.toml`. Both this cap and the sixel cap next door generate the
+/// identical mutant description `replace < with <= in <impl Perform for
+/// Screen>::put`, so an exclusion written against `put` could not pardon the
+/// DECRQSS cap without silently pardoning THIS one too — which is why the
+/// DECRQSS cap was extracted into its own named helper. Measured before this
+/// test existed: applying `<=` here left the whole core lib suite green
+/// (931 passed), so the mutant was live, reachable and uncaught.
+#[test]
+fn xtgettcap_payload_cap_truncates_on_an_even_hex_boundary() {
+    // 'A' is a valid hex digit, so an over-long run of it is a WELL-FORMED name
+    // once truncated to an even length — which is what makes the parity, rather
+    // than the hex validity, the thing under test.
+    const OVERLONG: [u8; 5000] = [b'A'; 5000];
+    const CAPPED: [u8; 4096] = [b'A'; 4096];
+
+    let mut t = Terminal::new(4, 20);
+    let mut req = Vec::from(&b"\x1bP+q"[..]);
+    req.extend_from_slice(&OVERLONG);
+    req.extend_from_slice(b"\x1b\\");
+    t.advance(&req);
+
+    // 4096 'A's decode to 2048 x 0xAA, which is not valid UTF-8 and so matches
+    // no capability — the UNKNOWN form, but with the name quoted back.
+    let mut expected = Vec::from(&b"\x1bP0+r"[..]);
+    expected.extend_from_slice(&CAPPED);
+    expected.extend_from_slice(b"\x1b\\");
+
+    let got = t.take_pty_response();
+    assert_eq!(
+        got.len(),
+        4103,
+        "a 4096-byte (even) payload must decode and be quoted back; a 4097-byte \
+         (odd) one would fail to decode and collapse to the 7-byte bare form"
+    );
+    assert_eq!(got, expected);
+}
+
 #[test]
 fn smulx_advertisement_is_backed_by_real_support() {
     // TRUTHFULNESS: advertising `Smulx` promises that the sequence its template

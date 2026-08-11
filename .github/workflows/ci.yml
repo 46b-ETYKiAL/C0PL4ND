@@ -542,6 +542,20 @@ jobs:
         # as-quoted.
         run: python3 packaging/falsify_release_gates.py
 
+      - name: Control — re-introduce each defect and require the falsifier to catch it
+        # The step above reporting green means the gates failed on the bad
+        # inputs it chose. It does NOT establish that it would notice if a gate
+        # stopped working — a falsifier that passes with or without the fix is
+        # the same "cannot fail" defect one level up. This puts each original
+        # defect back, one at a time, and fails unless the falsifier goes red
+        # for the SPECIFIC checks that defect should break.
+        #
+        # It mutates the working tree and restores it (asserting the bytes
+        # changed and were restored). Safe here because the checkout is
+        # ephemeral, and it runs AFTER the plain falsification so a genuine gate
+        # regression is reported as itself rather than as a failed baseline.
+        run: python3 packaging/mutate_release_gates.py
+
   # Credential-shape scan over the full history. Complements content-safety.
   gitleaks:
     name: gitleaks

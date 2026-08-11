@@ -4776,7 +4776,6 @@ fn monospace_cell_metrics(
     }
 }
 
-/// Outcome of painting one terminal pane's body for a frame.
 /// A pane action requested from the right-click context menu that needs
 /// `&mut self` (it mutates the tiles tree), so it cannot run inside the
 /// egui_tiles render closure — it is queued in [`PaneBodyOutcome`] and applied
@@ -4800,6 +4799,7 @@ pub(crate) enum Direction {
     Down,
 }
 
+/// Outcome of painting one terminal pane's body for a frame.
 struct PaneBodyOutcome {
     /// Whether the pane reported it wants to begin an egui_tiles drag.
     drag_started: bool,

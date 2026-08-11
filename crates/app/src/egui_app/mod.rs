@@ -468,6 +468,16 @@ pub struct C0pl4ndApp {
     /// MANUAL theme pick sticks between OS-appearance changes (SCR1B3 parity).
     /// `None` when follow-OS is off / never observed. Never persisted.
     pub(crate) last_os_theme: Option<egui::Theme>,
+    /// Whether the OS reports forced-colors / high-contrast mode, sampled ONCE
+    /// at real-window construction (`c0pl4nd_core::forced_colors::forced_colors`).
+    ///
+    /// Held as state rather than re-queried per frame for two reasons: the OS
+    /// answer is process-cached anyway, and — more importantly — it makes the
+    /// accessibility precedence in [`Self::follow_os_theme_tick`] deterministic
+    /// under test. The headless `bootstrap_with` path leaves it `false`, so no
+    /// existing test's behaviour depends on the host machine's real
+    /// accessibility settings. Never persisted.
+    pub(crate) forced_colors: bool,
     /// True on the first frame the Settings window opens (a closed→open edge),
     /// so `settings::show` FORCES the window to its saved-or-centered position
     /// that frame instead of trusting egui's `default_pos` (which read a
@@ -738,16 +748,35 @@ impl C0pl4ndApp {
         // F5-2: load config AND capture any parse error, so a broken config file
         // surfaces as a visible toast instead of the silent fallback-to-defaults
         // that previously only `eprintln`'d (invisible to a GUI-launched user).
-        let (cfg, config_error) = load_config_with_status();
+        let (mut cfg, config_error) = load_config_with_status();
         // A `Some` error means a config file EXISTED and failed to read/parse
         // (an absent file is `None`), so `cfg` is defaults and every value the
         // user had set is gone from memory. Remember that: the first save of
         // this session must set their file aside instead of overwriting it.
         let unreadable = config_error.is_some();
+        // Accessibility: if the OS is in forced-colors / high-contrast mode and
+        // the user never picked a theme, start on the accessible one. An explicit
+        // theme choice always wins — see `apply_forced_colors_auto_theme`.
+        //
+        // This reads the theme out of `cfg` AFTER the load above, so the two
+        // fixes compose rather than race: an unreadable config leaves `cfg` at
+        // defaults, i.e. with no explicit theme, so high contrast correctly wins
+        // that case — while `unreadable` is already captured, so the set-aside
+        // on first save is unaffected by the theme we auto-pick here.
+        let forced_colors = c0pl4nd_core::forced_colors::forced_colors();
+        let auto_high_contrast = apply_forced_colors_auto_theme_with(&mut cfg, forced_colors);
         let mut app = Self::bootstrap_with(cfg);
         app.config_unreadable = unreadable;
+        app.forced_colors = forced_colors;
         if let Some(err) = config_error {
             app.toast = Some(err);
+        }
+        if auto_high_contrast && app.toast.is_none() {
+            app.toast = Some(
+                "High contrast is on in your OS settings — C0PL4ND started on the \
+                 accessible theme. Pick any theme in Settings to override it."
+                    .to_string(),
+            );
         }
         // Restore the persisted split-pane layout + per-pane cwd from a previous
         // run (eframe `persistence` storage). A missing, unreadable, or
@@ -995,6 +1024,9 @@ impl C0pl4ndApp {
             first_frame_time: None,
             foreground_done: false,
             last_os_theme: None,
+            // Headless/default: no OS accessibility request. The real-window
+            // constructor samples the OS and overwrites this.
+            forced_colors: false,
             settings_place_pending: false,
             settings_was_open: false,
             live_window: false,
@@ -3241,6 +3273,20 @@ impl C0pl4ndApp {
     /// observation still applies. Toggling the switch OFF forgets the tracked
     /// appearance so re-enabling re-applies on the next observed frame.
     fn follow_os_theme_tick(&mut self, ctx: &egui::Context) {
+        // Accessibility beats aesthetics: while the OS is in forced-colors /
+        // high-contrast mode, the dark/light follow must not swap the theme back
+        // to `itasha-corp`/`ghost-paper` and undo the high-contrast selection
+        // made at startup. Same precedence as SCR1B3's reduced-motion seam, where
+        // the accessibility preference wins over the user's own toggle.
+        //
+        // `last_os_theme` is deliberately left untouched here rather than
+        // cleared: if this returned via the `follow_os_theme == false` branch it
+        // would forget the tracked appearance, and turning high contrast off
+        // mid-session would then re-apply on the next observation. Returning
+        // early keeps the tracked value intact.
+        if self.forced_colors {
+            return;
+        }
         if !self.config.follow_os_theme {
             // Forget the tracked OS appearance so a later re-enable re-applies the
             // OS theme on its next observation instead of being suppressed by a
@@ -7019,5 +7065,131 @@ mod config_load_tests {
         let (cfg, err) = load_config_from(Some(path));
         assert_eq!(cfg.theme, "ghost-paper");
         assert!(err.is_none());
+    }
+}
+
+#[cfg(test)]
+mod forced_colors_wiring_tests {
+    //! The OS high-contrast auto-select, at the seam that actually MUTATES the
+    //! loaded config. `c0pl4nd_core::forced_colors` tests the precedence rule as
+    //! a pure function; these test that this crate applies that rule to a real
+    //! `Config` and to `follow_os_theme_tick`, which is where getting it
+    //! backwards would silently discard a user's deliberate theme choice.
+    use super::{apply_forced_colors_auto_theme_with, C0pl4ndApp};
+
+    /// THE precedence contract at the wiring layer: a config carrying an
+    /// explicit theme choice must come back UNCHANGED even while the OS is
+    /// asking for high contrast.
+    #[test]
+    fn an_explicit_theme_choice_survives_the_os_high_contrast_request() {
+        for chosen in ["phosphor-amber", "ghost-paper", "itasha-void-high-contrast"] {
+            let mut cfg = c0pl4nd_core::Config {
+                theme: chosen.to_string(),
+                ..Default::default()
+            };
+            let applied = apply_forced_colors_auto_theme_with(&mut cfg, true);
+            assert!(
+                !applied,
+                "{chosen:?} is an explicit choice — auto-select must not report a change"
+            );
+            assert_eq!(
+                cfg.theme, chosen,
+                "{chosen:?} must survive an OS high-contrast request"
+            );
+        }
+    }
+
+    /// The other half: an untouched default DOES follow the OS request.
+    #[test]
+    fn an_untouched_default_theme_follows_the_os_high_contrast_request() {
+        let mut cfg = c0pl4nd_core::Config::default();
+        let applied = apply_forced_colors_auto_theme_with(&mut cfg, true);
+        assert!(applied, "an unchosen theme must follow the OS request");
+        assert_eq!(cfg.theme, c0pl4nd_core::forced_colors::HIGH_CONTRAST_THEME);
+    }
+
+    /// No OS request → nothing is touched, whatever the theme is.
+    #[test]
+    fn without_an_os_request_the_theme_is_never_touched() {
+        let mut cfg = c0pl4nd_core::Config::default();
+        let default_theme = cfg.theme.clone();
+        assert!(!apply_forced_colors_auto_theme_with(&mut cfg, false));
+        assert_eq!(cfg.theme, default_theme);
+    }
+
+    /// The headless bootstrap must NOT inherit the host machine's real
+    /// accessibility settings, or every other test in this suite would behave
+    /// differently on a developer running High Contrast.
+    #[test]
+    fn the_headless_bootstrap_reports_no_forced_colors() {
+        assert!(
+            !C0pl4ndApp::bootstrap().forced_colors,
+            "bootstrap must not sample the host OS — tests would vary by machine"
+        );
+    }
+
+    /// While forced colors are on, the dark/light follow must not run at all —
+    /// otherwise it would swap the high-contrast theme back for a brand theme
+    /// on the next observed frame and undo the accessibility selection.
+    /// `last_os_theme` must also survive, so turning high contrast OFF does not
+    /// re-apply a stale observation.
+    #[test]
+    fn forced_colors_suppresses_the_os_theme_follow_without_forgetting_it() {
+        let ctx = egui::Context::default();
+        let mut app = C0pl4ndApp::bootstrap();
+        app.config.follow_os_theme = true;
+        app.forced_colors = true;
+        app.config.theme = c0pl4nd_core::forced_colors::HIGH_CONTRAST_THEME.to_string();
+        app.last_os_theme = Some(egui::Theme::Dark);
+
+        app.follow_os_theme_tick(&ctx);
+
+        assert_eq!(
+            app.config.theme,
+            c0pl4nd_core::forced_colors::HIGH_CONTRAST_THEME,
+            "the follow must not override the high-contrast theme"
+        );
+        assert_eq!(
+            app.last_os_theme,
+            Some(egui::Theme::Dark),
+            "the tracked appearance must be kept, not forgotten"
+        );
+    }
+}
+
+#[cfg(test)]
+mod changelog_wiring_tests {
+    //! The in-app changelog panel reads `c0pl4nd_core::changelog::current()`.
+    //! These assert the binary-level contract the panel depends on: the entry it
+    //! renders is for THIS build, and it is never blank-with-no-explanation.
+
+    /// The panel must always have something to render — either a body, or a
+    /// notice explaining why there is none. A blank panel with no explanation is
+    /// the failure mode this feature exists to avoid.
+    #[test]
+    fn the_panel_always_has_something_to_render() {
+        let entry = c0pl4nd_core::changelog::current();
+        assert!(
+            !entry.is_empty() || entry.notice.is_some(),
+            "an empty changelog body MUST carry a notice explaining itself"
+        );
+        assert!(!entry.heading.is_empty(), "the panel needs a heading");
+    }
+
+    /// The embedded changelog is the one shipping in THIS binary, so the entry
+    /// resolves against this crate's own version, not some other tree's.
+    #[test]
+    fn the_entry_resolves_for_this_builds_version() {
+        let entry = c0pl4nd_core::changelog::current();
+        let version = env!("CARGO_PKG_VERSION");
+        // Either the running version's own section (heading names it) or an
+        // announced fallback that names the version it looked for.
+        let names_version = entry.heading.contains(version)
+            || entry.notice.as_deref().is_some_and(|n| n.contains(version));
+        assert!(
+            names_version,
+            "heading {:?} / notice {:?} must reference v{version}",
+            entry.heading, entry.notice
+        );
     }
 }

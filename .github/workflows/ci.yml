@@ -536,6 +536,61 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: python3 tests/author_identity_guard.py --base "$BASE" --head "$HEAD"
 
+  # The release workflow's signing / licence / checksum gates, proved able to
+  # FAIL. Runs on every push and PR, not only at tag time: each of these was
+  # once a gate that could not fail, and a release-only check would not surface
+  # a regression until the release it was meant to protect.
+  release-gates:
+    name: release gates can fail
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner (egress audit)
+        # step-security/harden-runner@v2.19.4
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        # actions/checkout@v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # `fetch-depth: 0` is NOT needed, but the index MUST exist: the
+          # line-ending check reads the committed blob (`git cat-file blob :path`)
+          # rather than the working copy, because a Windows checkout is
+          # legitimately CRLF while the committed bytes are LF.
+          persist-credentials: false
+
+      - name: Set up Python
+        # actions/setup-python@v7.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        # Same form the release workflow's license-delivery job uses.
+        run: python3 -m pip install --user --disable-pip-version-check pyyaml
+
+      - name: Falsify the release gates (each must be shown RED and GREEN)
+        # Executes the gate scripts directly AND extracts the `run:` blocks of
+        # the named release.yml steps via a real YAML parse and runs THAT TEXT
+        # against fixtures — so the shipped shell is falsified as-shipped, not
+        # as-quoted.
+        run: python3 packaging/falsify_release_gates.py
+
+      - name: Control — re-introduce each defect and require the falsifier to catch it
+        # The step above reporting green means the gates failed on the bad
+        # inputs it chose. It does NOT establish that it would notice if a gate
+        # stopped working — a falsifier that passes with or without the fix is
+        # the same "cannot fail" defect one level up. This puts each original
+        # defect back, one at a time, and fails unless the falsifier goes red
+        # for the SPECIFIC checks that defect should break.
+        #
+        # It mutates the working tree and restores it (asserting the bytes
+        # changed and were restored). Safe here because the checkout is
+        # ephemeral, and it runs AFTER the plain falsification so a genuine gate
+        # regression is reported as itself rather than as a failed baseline.
+        run: python3 packaging/mutate_release_gates.py
+
   # Credential-shape scan over the full history. Complements content-safety.
   gitleaks:
     name: gitleaks
@@ -587,7 +642,8 @@ jobs:
     name: CI Gate
     runs-on: ubuntu-latest
     needs:
-      [test, lint, msrv, security, flaky-gate-live, visual-qa, content-safety, gitleaks]
+      [test, lint, msrv, security, flaky-gate-live, visual-qa, content-safety, gitleaks,
+       release-gates]
     if: always()
     steps:
       - name: Verify all required jobs succeeded
@@ -602,6 +658,7 @@ jobs:
             [visual-qa]="${{ needs.visual-qa.result }}"
             [content-safety]="${{ needs.content-safety.result }}"
             [gitleaks]="${{ needs.gitleaks.result }}"
+            [release-gates]="${{ needs.release-gates.result }}"
           )
           failed=0
           for job in "${!results[@]}"; do

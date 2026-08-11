@@ -42,3 +42,21 @@
 *.zip      binary
 *.wasm     binary
 *.minisig  binary
+
+# Why the `*.sh` (and `*.yml`/`*.yaml`) rules above are load-bearing rather
+# than cosmetic.
+#
+# `packaging/require-installer-signing.sh` is executed by the windows-installer
+# job, on windows-latest, via `shell: bash`. A CRLF checkout there does not
+# merely look untidy: the trailing \r becomes part of the last token on every
+# line, so `sh` reports `$'\r': command not found`, and — worse, because it
+# fails QUIETLY in the wrong direction — a comparison like
+#
+#     [ "${UNSIGNED_WINDOWS_INSTALLER_ACK:-}" = "${ACK_SENTINEL}" ]
+#
+# compares against a sentinel with a trailing \r and can never match, silently
+# turning the acknowledged path back into a hard failure. Whether that happens
+# depends on the runner image's core.autocrlf, which is not ours to control.
+# Declaring the endings above removes the dependency entirely. The workflows
+# carry embedded shell in `run:` blocks that runs on Linux and macOS runners,
+# so they are pinned for the same reason.

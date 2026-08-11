@@ -472,7 +472,30 @@ jobs:
           [ -f app/README.md ] && cp app/README.md payload/
           sh app/packaging/collect-licenses.sh "app" payload
           echo "payload contents:"; find payload -maxdepth 2 | head -40
-          echo "font licenses in payload: $(find payload/licenses/fonts -type f 2>/dev/null | wc -l)"
+          # ASSERT, don't just print. This line used to be a bare `echo … $(find
+          # … | wc -l)`: it reported the count and accepted every value including
+          # zero, so an installer with no font licence at all published green.
+          # The sibling windows-msi job stages the identical tree and DOES assert
+          # `-gt 0`; the two are now symmetric. OFL-1.1 s2 requires the licence to
+          # accompany every copy of the font software, and ~22 typefaces are
+          # include_bytes!-embedded in the shipped exe, so zero here is a
+          # distribution breach, not a cosmetic gap.
+          #
+          # `2>/dev/null` is gone with it: it hid a missing payload/licenses/fonts
+          # directory — precisely the failure this now has to catch — behind the
+          # same `0` a present-but-empty directory produces.
+          # The directory is checked SEPARATELY and BEFORE the count. Folding the
+          # two together as `n=$(find … 2>/dev/null | wc -l)` looks equivalent
+          # and is not: with the directory absent, `find` exits non-zero, and
+          # under `set -euo pipefail` the failing command substitution kills the
+          # step ON THE ASSIGNMENT — before the explicit error below ever runs.
+          # The diagnostic would be unreachable code and the operator would get a
+          # bare `find: No such file or directory`. Measured, not assumed: the
+          # folded form was written first and falsify_release_gates.py caught it.
+          [ -d payload/licenses/fonts ] || { echo "::error::payload/licenses/fonts does not exist — collect-licenses.sh staged no font licenses at all. OFL-1.1 s2 requires the license text to accompany every copy of the embedded typefaces."; exit 1; }
+          n=$(find payload/licenses/fonts -type f | wc -l)
+          echo "font licenses in payload: $n"
+          [ "$n" -gt 0 ] || { echo "::error::payload/licenses/fonts is empty — no font licenses in the installer payload. OFL-1.1 s2 requires the license text to accompany every copy of the embedded typefaces."; exit 1; }
       - name: Build native installer
         shell: bash
         env:
@@ -507,6 +530,29 @@ jobs:
           github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
           wait-for-completion: true
           output-artifact-directory: dist-out
+      - name: Assert the installer signing state (fail-closed on a stable tag)
+        # BOTH SignPath steps above are gated on `vars.SIGNPATH_ORG_ID != ''`.
+        # That variable has never been set on this repository, so both have been
+        # permanently SKIPPED since the day they were added — including on stable
+        # tags, where (unlike the minisign step) there was no guard at all. A
+        # skipped step renders as a neutral grey tick, so v0.4.25 shipped
+        # `c0pl4nd-v0.4.25-x86_64-setup.exe` unsigned and the release was green
+        # with nothing in the log saying so.
+        #
+        # This step is deliberately NOT `if:`-gated on the same variable — a gate
+        # that disappears under the exact condition it exists to detect is the
+        # bug, not the fix. It always runs, always announces the real state, and
+        # fails the job on a stable tag unless an owner has recorded an explicit
+        # acknowledgement. Posture and escape hatch: see the script header.
+        shell: bash
+        env:
+          SIGNPATH_ORG_ID: ${{ vars.SIGNPATH_ORG_ID }}
+          UNSIGNED_WINDOWS_INSTALLER_ACK: ${{ vars.UNSIGNED_WINDOWS_INSTALLER_ACK }}
+        # `app/` prefix: this job checks out C0PL4ND with `path: app` and sets no
+        # working-directory, so $PWD is $GITHUB_WORKSPACE. `sh` on a missing file
+        # exits 127 under bash's -e, which would fail every prerelease too — the
+        # path is asserted by falsify_release_gates.py.
+        run: sh app/packaging/require-installer-signing.sh
       - name: Checksum installer (final, signed-or-unsigned)
         shell: bash
         run: |
@@ -1059,6 +1105,23 @@ jobs:
           cd dist
           for f in *.dmg; do shasum -a 256 "$f" > "$f.sha256"; done
           ls -la; cat *.sha256
+      - name: Assert the macOS signing state (fail-closed on a stable tag)
+        # This job contains no codesign, no notarytool, no stapler and no spctl —
+        # not a disabled step, not a gated step, nothing. So the .dmg is unsigned
+        # and unnotarized, macOS attaches com.apple.quarantine on download, and
+        # Gatekeeper refuses the app on first launch — while the release reports
+        # success and says nothing about any of it.
+        #
+        # The script READS the state off the built bundle with codesign/spctl
+        # rather than asserting it in a comment, so the documented "unsigned,
+        # quarantine expected" state is evidence on every run and cannot rot into
+        # a falsehood the day something changes it. It fails the job on a stable
+        # tag unless an owner has recorded an explicit acknowledgement. Posture
+        # and escape hatch: see the script header.
+        shell: bash
+        env:
+          UNSIGNED_MACOS_APP_ACK: ${{ vars.UNSIGNED_MACOS_APP_ACK }}
+        run: sh app/packaging/require-macos-signing.sh C0PL4ND.app
       - name: Attest macOS installer provenance (SLSA)
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
         with:
@@ -1139,11 +1202,52 @@ jobs:
           # `tr -d '\r'` is defence-in-depth for the CRLF a Windows producer can
           # introduce (see the `Package (Windows)` step). A single stray CR in a
           # filename field silently breaks every exact-name lookup downstream.
+          #
+          # Report on the SOURCE, before stripping. This used to be asserted
+          # AFTER the strip -- `grep -q $'\r' release/SHA256SUMS` on the very
+          # file `tr -d '\r'` had just produced -- which no input could ever make
+          # fire. It read like a guard on the CRLF hazard and was a tautology.
+          # Whether a producer emitted CRLF is a real, observable fact, so state
+          # it; it is NOT a failure, because stripping it is exactly what this
+          # line is for and a Windows producer doing so is expected.
+          # Measured as a byte-count delta across the strip, NOT with
+          # `grep -q $'\r'`: a text-mode grep (MSYS/Git-Bash, where this gate is
+          # falsified) silently translates CRLF away and never matches, so a
+          # grep-based probe would report "no CRLF" on a file full of it. The
+          # delta is the strip's own effect and is true on every platform.
+          raw_bytes=$(cat "${shas[@]}" | wc -c)
+          lf_bytes=$(cat "${shas[@]}" | tr -d '\r' | wc -c)
+          if [ "$raw_bytes" -ne "$lf_bytes" ]; then
+            echo "::notice::stripped $((raw_bytes - lf_bytes)) carriage return(s) from the source .sha256 sidecars (a Windows producer emitted CRLF); normalising to LF."
+          fi
           cat "${shas[@]}" | tr -d '\r' | sort -u > release/SHA256SUMS
           [ -s release/SHA256SUMS ] || { echo "::error::SHA256SUMS is empty"; exit 1; }
-          if LC_ALL=C grep -q $'\r' release/SHA256SUMS; then
-            echo "::error::SHA256SUMS still contains a carriage return"; exit 1
-          fi
+          # Assert the SHAPE of every line instead. This is the check the CR one
+          # was reaching for, and unlike it this one can fail: `tr -d '\r'` only
+          # removes carriage returns, so it does NOT catch a UTF-8 BOM (a
+          # PowerShell-produced sidecar carries one, and EF BB BF glued to the
+          # first digest breaks exact-name and hex lookups in precisely the same
+          # way a CR does), a truncated or empty sidecar, a `release/`-prefixed
+          # filename field, or a stray blank line. SHA256SUMS is the ONLY
+          # integrity record that survives the prune, so a malformed line is a
+          # consumer-visible break, not cosmetic.
+          bad=0
+          # `|| [ -n "$line" ]` belongs in the CONDITION, not after `done`: a
+          # final line with no trailing newline makes `read` return non-zero, and
+          # a plain loop would skip it -- a malformed LAST entry would pass
+          # unchecked. (After `done` it would test the loop body's status, not
+          # read's, and check nothing.) `sort -u` terminates its output, so this
+          # is insurance against a future producer change rather than a live
+          # hole, but a gate with a known unchecked row is not a gate.
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              *[!\ -~]*) echo "::error::SHA256SUMS line has a non-printable byte (BOM/CR/control char): $(printf '%s' "$line" | od -c | head -2)"; bad=1; continue ;;
+            esac
+            if ! printf '%s' "$line" | LC_ALL=C grep -qE '^[0-9a-f]{64} [ *][^/\\]+$'; then
+              echo "::error::malformed SHA256SUMS line (want '<64 hex> <sp|*><bare filename>'): $line"; bad=1
+            fi
+          done < release/SHA256SUMS
+          [ "$bad" -eq 0 ] || { echo "::error::SHA256SUMS is malformed - refusing to publish it as the release's only integrity record"; exit 1; }
           echo "----- release/SHA256SUMS -----"; cat release/SHA256SUMS
           ls -la release
 
@@ -1265,22 +1369,28 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
-            # A stable (non-prerelease) tag has no '-' in its name (e.g. v0.4.6);
-            # an rc/pre tag does (v0.4.6-rc.2). Shipping a STABLE release UNSIGNED
-            # is a release-readiness landmine: the fail-closed in-app updater
-            # rejects unsigned artifacts, so existing users could not auto-update
-            # to it — a release that looks successful yet is un-updatable. Fail
-            # loudly for stable tags; allow the unsigned path only for prereleases.
-            case "${GITHUB_REF_NAME:-}" in
-              *-*)
-                echo "::warning::MINISIGN_SECRET_KEY not set — shipping checksummed but UNSIGNED prerelease artifacts (auto-update will reject them; acceptable for an rc/pre tag)."
-                exit 0
-                ;;
-              *)
-                echo "::error::MINISIGN_SECRET_KEY not set on a STABLE tag (${GITHUB_REF_NAME:-?}). A stable release MUST be signed — the fail-closed in-app updater rejects unsigned artifacts, so existing users could not auto-update to it. Provision the signing key (see this step's comment) or cut a prerelease (-rc/-pre) tag instead. Failing the release."
-                exit 1
-                ;;
-            esac
+            # Shipping a STABLE release UNSIGNED is a release-readiness landmine:
+            # the fail-closed in-app updater rejects unsigned artifacts, so
+            # existing users could not auto-update to it — a release that looks
+            # successful yet is un-updatable. `require-signing-key.sh` fails
+            # loudly for stable tags and allows the unsigned path only for a real
+            # SemVer prerelease or a non-tag ref.
+            #
+            # This WAS `case "${GITHUB_REF_NAME:-}" in *-*)` — "contains a hyphen
+            # anywhere" — which classified `v2026-08-10`, `v1.0-final` and
+            # `v0.5-hotfix` as prereleases and let each publish UNSIGNED and
+            # green. The rule now lives in `release-ref-class.sh`, one home
+            # shared with the Windows/macOS gates and the publish step, and is
+            # pinned in both directions by falsify_release_gates.py.
+            #
+            # NOTE the `src/` prefix: the release job checks out with
+            # `path: src` and sets no working-directory, so $PWD is
+            # $GITHUB_WORKSPACE and the script is one level down. `sh` on a
+            # missing file exits 127 under `set -e`, which would hard-fail a
+            # PRERELEASE that this gate is meant to wave through — so the path
+            # is asserted by falsify_release_gates.py too.
+            sh src/packaging/require-signing-key.sh
+            exit 0
           fi
           cargo install rsign2 --locked --version "^0.6"
           umask 077
@@ -1455,6 +1565,29 @@ jobs:
             release/*.cdx.json
             release/SHA256SUMS
 
+      - name: Classify the tag (stable vs SemVer prerelease)
+        # The publish step below read `contains(github.ref_name, '-')`, the same
+        # "hyphen anywhere" rule the signing step used — so `v2026-08-10`,
+        # `v1.0-final` and `v0.5-hotfix` would each have been published as a
+        # GitHub PRERELEASE, hidden from the "Latest release" slot and from
+        # `gh release view` / the `/releases/latest` API that installers and the
+        # in-app updater resolve against. Left unfixed here, the signing gate and
+        # the publish step would also DISAGREE about what a stable tag is, which
+        # is how one silently drifts back.
+        #
+        # `release-ref-class.sh` is the single home of the SemVer rule; this step
+        # just lifts its verdict into a step output the action can read.
+        id: refclass
+        run: |
+          set -euo pipefail
+          class="$(sh src/packaging/release-ref-class.sh)"
+          echo "tag ${GITHUB_REF_NAME:-?} classified as: ${class}"
+          if [ "$class" = "prerelease" ]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create GitHub Release
         # softprops/action-gh-release@v3.0.2
         # zizmor: ignore[superfluous-actions]
@@ -1468,6 +1601,6 @@ jobs:
           name: ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ steps.refclass.outputs.prerelease }}
           generate_release_notes: true
           files: release/*

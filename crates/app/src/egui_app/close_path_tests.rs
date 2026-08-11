@@ -1013,3 +1013,124 @@ fn reopening_a_pane_lands_in_the_directory_the_shell_reported_over_osc7() {
          {unique:?} in the grid, got:\n{grid}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SEAM 6 — a RESTORED LAYOUT lands in the directory the shell reported
+// ---------------------------------------------------------------------------
+
+/// The same OSC 7 URI regression as SEAM 5, on the OTHER consumer: capture the
+/// layout, persist it, restore it, and assert on where the child ACTUALLY RAN.
+///
+/// WHY THIS EXISTS SEPARATELY. The URI normalisation lives at the shared
+/// [`spawn_pane_term`] funnel, so fixing reopen-closed-pane repaired this path
+/// too — silently, with no test of its own that could have noticed either way.
+/// The restore path's existing guard
+/// (`the_deferred_first_spawn_carries_the_restored_cwd_through_a_named_profile`)
+/// seeds `restored_cwds` with a PLAIN PATH by hand, so it never covered the URI
+/// case: it was green before the fix and after it. This test is what makes the
+/// restore path's URI behaviour able to fail.
+///
+/// WHY IT IS NOT REDUNDANT WITH SEAM 5. The funnel really is the only way in —
+/// `spawn_pane_term` has exactly two call sites, `spawn_term_in` (SEAM 5's path)
+/// and the deferred first-spawn in `render_pane_body` (this one) — so a fix at
+/// the funnel does cover both. But the two arms reach it through completely
+/// different machinery and assert on different evidence: SEAM 5 goes through
+/// `close_pane` → `closed_tab_cwds` → `Action::ReopenClosedTab` and can lean on
+/// `last_spawn_cwd`, which the deferred arm never sets. Here the ONLY evidence
+/// available is the child's own printed directory, and the value additionally
+/// has to survive `capture_layout` and a RON round-trip. Neither test can fail
+/// for the other's reasons, so neither substitutes for the other.
+///
+/// The whole chain is real: a live pane announces its cwd through the REAL OSC 7
+/// parser, `capture_layout` records it, the snapshot goes through the SAME RON
+/// round-trip `eframe`'s `set_value`/`get_value` performs, `apply_layout_snapshot`
+/// restores it as a DEFERRED pane, and the frame loop spawns it under a NAMED
+/// profile. Both halves of the assertion are load-bearing exactly as in SEAM 5:
+/// [`PROFILE_SENTINEL`] can only appear if the profile's ARGS ran, and the unique
+/// directory component only if the reported cwd survived as a real path.
+#[test]
+fn a_restored_layout_lands_in_the_directory_the_shell_reported_over_osc7() {
+    let dir = unique_dir("osc7-restore-cwd");
+    let unique = dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .expect("unique component")
+        .to_string();
+    let path = dir.to_str().expect("utf8 path").to_string();
+    // The shape a shell actually emits: `file://` + an absolute path with
+    // forward slashes (bash prefixes the hostname; either is a real emitter).
+    let uri = format!("file:///{}", path.replace('\\', "/"));
+
+    // --- CAPTURE: a live pane reports its cwd through the real OSC 7 parser ---
+    let mut seed = C0pl4ndApp::bootstrap();
+    assert!(seed.new_terminal_in(Some(&path)), "the seed pane must open");
+    let pid = seed.focused_pane;
+    {
+        let pane = seed.terms.get(&pid).expect("the seed pane is live");
+        let term = expect_live_pty(pane);
+        term.lock()
+            .unwrap()
+            .advance(format!("\x1b]7;{uri}\x07").as_bytes());
+    }
+    let snapshot = seed.capture_layout();
+    assert_eq!(
+        snapshot.cwds.get(&pid).map(String::as_str),
+        Some(uri.as_str()),
+        "precondition: the captured layout carries the OSC 7 value VERBATIM (a \
+         URI) — if this ever changes, this test is no longer covering the URI case"
+    );
+
+    // --- PERSIST: the same RON round-trip eframe's storage performs ---
+    let encoded = ron::to_string(&snapshot).expect("serialize the layout");
+    let restored: layout_state::LayoutSnapshot =
+        ron::from_str(&encoded).expect("deserialize the layout");
+
+    // --- RESTORE into a fresh app, under a NAMED profile ---
+    let mut app = C0pl4ndApp::bootstrap();
+    let (program, args) = print_cwd_program();
+    activate_profile(&mut app, program, &args);
+    app.apply_layout_snapshot(restored);
+    assert!(
+        app.terms.is_empty() && app.pending_spawn.contains(&pid),
+        "precondition: a restored pane is DEFERRED — it spawns inside the frame \
+         loop, which is the path under test"
+    );
+    assert_eq!(
+        app.restored_cwds.get(&pid).map(String::as_str),
+        Some(uri.as_str()),
+        "precondition: the restored cwd is still the URI going INTO the spawn"
+    );
+    let app = RefCell::new(app);
+
+    #[allow(deprecated)]
+    let mut h = egui_kittest::Harness::new(|ctx| app.borrow_mut().frame_tick(ctx));
+    h.set_size(egui::vec2(1200.0, 800.0));
+    let showed = run_until(&mut h, Duration::from_secs(20), || {
+        app.borrow()
+            .terms
+            .get(&pid)
+            .and_then(PaneTerm::grid_text)
+            .is_some_and(|g| shows_unwrapped(&g, PROFILE_SENTINEL) && shows_unwrapped(&g, &unique))
+    });
+    let grid = app
+        .borrow()
+        .terms
+        .get(&pid)
+        .and_then(PaneTerm::grid_text)
+        .unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        shows_unwrapped(&grid, PROFILE_SENTINEL),
+        "the restored pane must be running the NAMED PROFILE's program — no \
+         {PROFILE_SENTINEL:?} on screen means it fell back to the default shell; \
+         grid:\n{grid}"
+    );
+    assert!(
+        showed,
+        "the restored pane must RUN in the directory the shell reported; a \
+         `file://` URI is not a directory, so the core spawn's `is_dir()` check \
+         fails and it silently starts in home instead. Wanted {unique:?} in the \
+         grid, got:\n{grid}"
+    );
+}

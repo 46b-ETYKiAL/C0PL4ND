@@ -91,17 +91,32 @@ exclude_re = [
     # therefore unrecognised and produce the identical invalid reply, so no
     # input can distinguish the two programs.
     #
-    # !! Scoped to the EXTRACTED HELPER on purpose. The three payload caps in
-    # `<impl Perform for Screen>::put` (sixel 8 MiB, XTGETTCAP 4096, DECRQSS 64)
-    # generated the IDENTICAL mutant description while they shared that
-    # function, so the obvious
-    # `replace < with <= in <impl Perform for Screen>::put` would also have
-    # pardoned the XTGETTCAP cap — whose off-by-one IS observable, because it
-    # flips hex-string parity and so decides whether `hex_decode_bytes` succeeds
-    # or returns `None`. That would be exactly the silent gate hole the rest of
-    # this file exists to prevent. Hence the helper: the exclusion is surgical.
-    # The helper's other mutants stay live — `replace < with ==` and
-    # `replace push_decrqss_byte with ()` both empty the buffer and are caught
-    # by the DECRQSS reply tests.
+    # !! Scoped to the EXTRACTED HELPER on purpose, and the narrowness is
+    # MEASURED rather than asserted. `cargo mutants --list -f crates/core/src/term.rs`
+    # selects 3259 mutants; of the helper's four only `< -> <=` is filtered out,
+    # and BOTH `< -> <=` mutants inside `put` (2504:26 sixel, 2509:26 XTGETTCAP)
+    # remain selected. Those two still share ONE description string —
+    # `replace < with <= in <impl Perform for Screen>::put` — which is exactly
+    # why a description-based exclusion written against `put` could never be
+    # surgical: it cannot name one of them without taking the other.
+    #
+    # The XTGETTCAP cap is the one that must not be pardoned. Its off-by-one is
+    # observable: a >=4097-byte payload is truncated to 4096 (even -> decodes ->
+    # the reply quotes back a 4096-char hex name) versus 4097 (odd ->
+    # `hex_decode_bytes` returns `None` -> the reply is the BARE unknown form).
+    # Two different byte strings on the wire. Measured on this tree, applying
+    # `buf.len() <= 4096` at 2509 leaves the whole core lib suite GREEN
+    # (931 passed) — so it is not merely a hole that would open "the day the
+    # line enters a diff": it is a live, reachable, currently-uncaught mutant
+    # TODAY, and the broad regex would have pardoned it permanently and
+    # silently. Killing it needs a >=4097-byte DCS payload test; it is tracked
+    # as an open gap, NOT pardoned.
+    #
+    # The helper's other THREE mutants stay live and are all verified killed by
+    # the DECRQSS reply tests (6 failures each): `replace < with ==`,
+    # `replace < with >` (both leave `buf.len()` never below the cap on the
+    # first byte, so the buffer stays empty) and `replace push_decrqss_byte
+    # with ()`. Only `< -> <=` is excluded, and it survives the full suite
+    # (931 passed) as the equivalence argument above predicts.
     "replace < with <= in push_decrqss_byte",
 ]

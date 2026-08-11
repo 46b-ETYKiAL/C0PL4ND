@@ -546,6 +546,20 @@ mod tests {
 
     /// The pole-selection pivot is a STRICT `<`.
     ///
+    /// CORRECTS THE RECORD. Commit 80663c5 declared this mutant EQUIVALENT and
+    /// deliberately left it unchased, reasoning that it "changes behaviour only
+    /// when a background's relative luminance is exactly 0.1791, where black and
+    /// white contrast equally by construction". The second clause is false, and
+    /// the conclusion drawn from it is false. Measured on the witness below:
+    /// black contrasts 4.5820:1 and white 4.5831513:1 — close, but NOT equal
+    /// (delta 1.1516e-3), so the tie-break is decided, not arbitrary. And the
+    /// two programs do not return near-identical colours: at a 4.5 target the
+    /// strict `<` returns `(0, 0, 0)` and the `<=` mutant returns
+    /// `(255, 255, 255)`. That is the entire representable span, pure black
+    /// versus pure white — the most visible difference this function can
+    /// produce. The mutant is observable and killable, so it is killed here
+    /// rather than pardoned.
+    ///
     /// `relative_luminance(bg) < 0.1791` picks white BELOW the pivot and black
     /// AT OR ABOVE it, so widening it to `<=` changes the chosen pole for
     /// exactly one class of background: one whose luminance lands EXACTLY on the

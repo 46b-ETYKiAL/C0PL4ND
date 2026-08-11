@@ -78,8 +78,11 @@ opacity = 1.0   # top-level: 0.0 (fully see-through) .. 1.0 (solid)
 cols = 80       # initial terminal width in columns
 rows = 24       # initial terminal height in rows
 padding = 8     # inner padding between the window edge and the grid, in pixels
-# pos_x / pos_y / size_w / size_h / maximized / monitor are written automatically
-# to remember your window geometry; you normally don't set these by hand.
+# pos_x / pos_y / size_w / size_h / maximized / monitor are read and written only
+# by the default-off `legacy-winit` binary. The shipped shell neither reads nor
+# writes them — it remembers window geometry through eframe's own native-window
+# state (`persist_window`), stored outside this file. Setting them here has no
+# effect on the shipped shell.
 ```
 
 ## Transparency, tint & frost

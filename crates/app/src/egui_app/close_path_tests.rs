@@ -917,3 +917,99 @@ fn the_pinned_cursor_phase_reaches_the_painter() {
         "pinning it back ON must restore the caret"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SEAM 5 — the reopened pane lands in the directory the SHELL reported
+// ---------------------------------------------------------------------------
+
+/// The whole reopen loop, end to end, with nothing seeded by hand: a live pane
+/// announces its directory through the REAL OSC 7 parser, the REAL close path
+/// records it, and `Action::ReopenClosedTab` brings the pane back under a NAMED
+/// shell profile.
+///
+/// THE REGRESSION: OSC 7 reports a **URI** (`file://host/path`) and
+/// `Terminal::cwd` stores it verbatim, so every producer handed the spawn a
+/// `file://…` string. The core spawn's `is_dir()` check rejects that and falls
+/// back to home — which is the *deliberate* handling of a stale cwd, so nothing
+/// was ever red: the pane came back, ran the right program, reported no error,
+/// and was simply in the wrong directory. Driven end to end this is unmissable;
+/// asserted on `last_spawn_cwd` alone it was invisible, because the URI really
+/// did reach the spawn.
+///
+/// Both halves are load-bearing, exactly as in SEAM 3/4: [`PROFILE_SENTINEL`]
+/// can only appear if the named profile's ARGS ran, and the unique directory
+/// component can only appear if the reported cwd survived as a real path. On
+/// Windows a spawn that ignored the profile entirely would still print the right
+/// directory (in `cmd.exe`'s own prompt), so the sentinel is what stops that
+/// passing.
+#[test]
+fn reopening_a_pane_lands_in_the_directory_the_shell_reported_over_osc7() {
+    let _guard = close_path_guard();
+    let dir = unique_dir("osc7-reopen-cwd");
+    let unique = dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .expect("unique component")
+        .to_string();
+    let path = dir.to_str().expect("utf8 path").to_string();
+    // The shape a shell actually emits: `file://` + an absolute path with
+    // forward slashes (bash prefixes the hostname; either is a real emitter).
+    let uri = format!("file:///{}", path.replace('\\', "/"));
+
+    let mut app = C0pl4ndApp::bootstrap();
+    assert!(app.new_terminal_in(Some(&path)), "the seed pane must open");
+    let pid = app.focused_pane;
+    {
+        let pane = app.terms.get(&pid).expect("the seed pane is live");
+        let term = expect_live_pty(pane);
+        term.lock()
+            .unwrap()
+            .advance(format!("\x1b]7;{uri}\x07").as_bytes());
+    }
+    assert_eq!(
+        app.terms.get(&pid).and_then(PaneTerm::cwd).as_deref(),
+        Some(uri.as_str()),
+        "precondition: the terminal stores the OSC 7 value VERBATIM (a URI) — if \
+         this ever changes, this test is no longer covering the URI case"
+    );
+
+    // The REAL close path is what records the cwd (not a hand-pushed entry).
+    app.close_pane(pid);
+    assert_eq!(
+        app.closed_tab_cwds.last().map(Option::as_deref),
+        Some(Some(uri.as_str())),
+        "the close path must record the pane's reported cwd"
+    );
+
+    let (program, args) = print_cwd_program();
+    activate_profile(&mut app, program, &args);
+
+    let ctx = egui::Context::default();
+    app.dispatch_action(crate::egui_app::actions::Action::ReopenClosedTab, &ctx);
+    assert_eq!(
+        app.last_spawn_cwd.as_deref(),
+        Some(c0pl4nd_core::term::cwd_uri_to_path(&uri).as_str()),
+        "the spawn must be asked for a PATH; a `file://` URI is not a directory \
+         and the core spawn silently falls back to home"
+    );
+
+    let pane = app.terms.get(&app.focused_pane).expect("the reopened pane");
+    assert!(
+        pane.error().is_none(),
+        "the named profile must have spawned, got: {:?}",
+        pane.error()
+    );
+    let grid = wait_for_grid(pane, &unique, Duration::from_secs(20));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        shows_unwrapped(&grid, PROFILE_SENTINEL),
+        "the reopened pane must be running the NAMED PROFILE's program — no \
+         {PROFILE_SENTINEL:?} on screen means it fell back to the default shell; \
+         grid:\n{grid}"
+    );
+    assert!(
+        shows_unwrapped(&grid, &unique),
+        "the reopened pane must RUN in the directory the shell reported; wanted \
+         {unique:?} in the grid, got:\n{grid}"
+    );
+}

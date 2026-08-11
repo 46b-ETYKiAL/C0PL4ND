@@ -713,6 +713,12 @@ pub(crate) struct SpawnProfile<'a> {
 /// shell's own default directory); a `cwd` that no longer exists falls back to
 /// home inside the core spawn, and a failed spawn degrades to an error pane —
 /// never a panic.
+///
+/// The cwd is normalised through [`resolved_spawn_cwd`] HERE, at the one funnel,
+/// rather than at each producer: the value arrives from the close-record, the
+/// restored layout (including one persisted by an older build), the CLI, and a
+/// forwarded launch, and only this function knows they all end up as an OS
+/// directory.
 fn spawn_pane_term(
     theme: c0pl4nd_core::Theme,
     program: Option<&str>,
@@ -722,6 +728,8 @@ fn spawn_pane_term(
     term: Option<&str>,
     cwd: Option<&str>,
 ) -> PaneTerm {
+    let cwd = resolved_spawn_cwd(cwd);
+    let cwd = cwd.as_deref();
     match program {
         // A NAMED profile: its program wins, and the cwd now travels with it.
         Some(program) => {
@@ -734,6 +742,22 @@ fn spawn_pane_term(
             None => PaneTerm::spawn_with_term(theme, cols, rows, term),
         },
     }
+}
+
+/// The directory a spawn will actually be given, from whatever a producer
+/// recorded.
+///
+/// A pane's cwd comes from OSC 7, which reports a **URI** (`file://host/path`),
+/// and [`c0pl4nd_core::Terminal::cwd`] stores it verbatim. Handing that URI
+/// straight to the OS makes the core spawn's `is_dir()` check fail, so it falls
+/// back to home — silently, because that fallback is the deliberate handling of
+/// a cwd that no longer exists. The observable effect was that reopen-closed-pane
+/// and restore-layout came back in the WRONG directory for every shell that
+/// actually reports one, with nothing red anywhere.
+///
+/// A plain path (the CLI / forwarded-launch producers) passes through unchanged.
+fn resolved_spawn_cwd(cwd: Option<&str>) -> Option<String> {
+    cwd.map(c0pl4nd_core::term::cwd_uri_to_path)
 }
 
 impl C0pl4ndApp {
@@ -1131,7 +1155,13 @@ impl C0pl4ndApp {
         // test asserts the cwd reached the spawn rather than merely that a pane
         // appeared (which a pane opened in the wrong directory would also
         // satisfy). Set for BOTH profile arms now that both honour it.
-        self.last_spawn_cwd = cwd.map(str::to_string);
+        //
+        // It records the RESOLVED directory — the same value `spawn_pane_term`
+        // hands the OS — not the raw recorded one. Recording the raw value would
+        // make this accessor report `file:///C:/x` for a spawn that was actually
+        // given `C:/x`, which is precisely the "the argument was stored" answer
+        // it exists to avoid giving.
+        self.last_spawn_cwd = resolved_spawn_cwd(cwd);
         let term = spawn_pane_term(
             theme,
             program.as_deref(),

@@ -20,8 +20,8 @@ use charset::{dec_line_draw, is_variation_selector, Charset};
 pub use keys::{encode_key, encode_key_kitty, KeyEventKind, KeyModifiers, LogicalKey};
 use osc::{base64_decode, base64_encode, format_color_reply, parse_color_spec, Rgb};
 pub use osc::{
-    ClipboardSelection, ClipboardWrite, ColorSet, CommandMark, CommandMarkKind, DynamicColor,
-    Notification, Progress, ProgressState,
+    cwd_uri_to_path, ClipboardSelection, ClipboardWrite, ColorSet, CommandMark, CommandMarkKind,
+    DynamicColor, Notification, Progress, ProgressState,
 };
 
 /// Default scrollback line cap when not configured.

@@ -399,6 +399,93 @@ pub fn format_color_reply(rgb: Rgb) -> String {
     )
 }
 
+// ============================================================================
+// Working directory (OSC 7)
+// ============================================================================
+
+/// Turn a shell-reported OSC 7 working directory into a filesystem path.
+///
+/// OSC 7 reports the cwd as a **URI** — `file://<host>/<percent-encoded path>`
+/// (bash's stock `PROMPT_COMMAND` emits `file://$HOSTNAME$PWD`) — and
+/// [`crate::Terminal::cwd`] deliberately stores it verbatim, because that is
+/// what the shell said. But every consumer that RE-SPAWNS a shell hands that
+/// value to the OS as a directory, and `file:///C:/x` is not a directory: the
+/// spawn's `is_dir()` check fails and it silently falls back to home. The
+/// reopen-closed-pane and restore-layout paths therefore came back in the wrong
+/// directory for any shell that actually reports one — a failure with no error
+/// anywhere, because "fall back to home" is the deliberate handling of a *stale*
+/// cwd.
+///
+/// A value that is not a `file:` URI is returned **unchanged**: the CLI /
+/// forwarded-launch paths pass a plain path, and they must survive this untouched.
+///
+/// The authority (host) is skipped rather than compared against the local
+/// hostname: a genuinely remote path simply will not exist locally, so the
+/// spawn's existing `is_dir()` fallback still handles it exactly as it does
+/// today. What an OSC 7 emitter can influence is which directory a re-spawned
+/// pane starts in — which is precisely the feature, and is already true of every
+/// terminal that honours OSC 7.
+#[must_use]
+pub fn cwd_uri_to_path(cwd: &str) -> String {
+    // Scheme match is case-insensitive per RFC 3986 §3.1.
+    const SCHEME: &str = "file://";
+    if !cwd
+        .get(..SCHEME.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(SCHEME))
+    {
+        return cwd.to_string();
+    }
+    let after_scheme = &cwd[SCHEME.len()..];
+    // Everything up to the first `/` is the authority; the path starts AT that
+    // slash (so it keeps its leading separator).
+    let path = match after_scheme.find('/') {
+        Some(i) => &after_scheme[i..],
+        // `file://host` with no path at all carries no directory.
+        None => return cwd.to_string(),
+    };
+    let Some(decoded) = percent_decode(path) else {
+        return cwd.to_string();
+    };
+    // `file:///C:/x` -> `C:/x`: a Windows drive path is absolute WITHOUT the
+    // URI's leading slash, which no OS API accepts.
+    let bytes = decoded.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+        && (bytes.len() == 3 || bytes[3] == b'/' || bytes[3] == b'\\')
+    {
+        return decoded[1..].to_string();
+    }
+    decoded
+}
+
+/// Percent-decode a URI path into a UTF-8 string.
+///
+/// Returns `None` for a malformed escape or for bytes that are not valid UTF-8,
+/// so the caller can fall back to the raw value rather than invent a path.
+fn percent_decode(s: &str) -> Option<String> {
+    if !s.contains('%') {
+        return Some(s.to_string());
+    }
+    let src = s.as_bytes();
+    let mut out = Vec::with_capacity(src.len());
+    let mut i = 0;
+    while i < src.len() {
+        if src[i] == b'%' {
+            let hi = src.get(i + 1)?;
+            let lo = src.get(i + 2)?;
+            let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+            out.push(hex(*hi)? * 16 + hex(*lo)?);
+            i += 3;
+        } else {
+            out.push(src[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,5 +627,73 @@ mod tests {
         );
         // 4-digit `0001` rounds to 0.
         assert_eq!(parse_color_spec("rgb:0001/0000/0000"), Some((0, 0, 0)));
+    }
+
+    // ---- OSC 7 cwd URI -> filesystem path ----------------------------------
+
+    /// The regression this helper exists for: a bash/zsh-style `file://<host><path>`
+    /// must yield the PATH, not the URI. Handing the URI to a spawn makes its
+    /// `is_dir()` check fail and the shell silently starts in home instead.
+    #[test]
+    fn cwd_uri_yields_the_path_not_the_uri() {
+        assert_eq!(cwd_uri_to_path("file:///home/user"), "/home/user");
+        // bash's stock PROMPT_COMMAND emits file://$HOSTNAME$PWD.
+        assert_eq!(cwd_uri_to_path("file://myhost/home/user"), "/home/user");
+        assert_eq!(cwd_uri_to_path("file://localhost/srv/app"), "/srv/app");
+    }
+
+    /// A Windows drive path is absolute WITHOUT the URI's leading slash.
+    #[test]
+    fn cwd_uri_strips_the_leading_slash_before_a_windows_drive() {
+        assert_eq!(cwd_uri_to_path("file:///C:/Users/me"), "C:/Users/me");
+        assert_eq!(cwd_uri_to_path("file://host/D:/data"), "D:/data");
+        // A bare drive with no trailing component is still a drive root.
+        assert_eq!(cwd_uri_to_path("file:///C:"), "C:");
+        // NOT a drive: a single-letter DIRECTORY must keep its leading slash.
+        assert_eq!(cwd_uri_to_path("file:///c/data"), "/c/data");
+    }
+
+    /// Percent escapes are decoded — a path with a space is the common case.
+    #[test]
+    fn cwd_uri_percent_decodes_the_path() {
+        assert_eq!(
+            cwd_uri_to_path("file:///home/my%20user/a%2Bb"),
+            "/home/my user/a+b"
+        );
+        assert_eq!(
+            cwd_uri_to_path("file:///C:/Program%20Files"),
+            "C:/Program Files"
+        );
+        // Multi-byte UTF-8 survives the byte-wise decode.
+        assert_eq!(cwd_uri_to_path("file:///tmp/%C3%A9"), "/tmp/é");
+    }
+
+    /// Anything that is not a `file:` URI passes through UNCHANGED — the CLI and
+    /// forwarded-launch paths hand this function a plain path.
+    #[test]
+    fn a_plain_path_and_a_foreign_scheme_pass_through_unchanged() {
+        assert_eq!(cwd_uri_to_path("/home/user"), "/home/user");
+        assert_eq!(cwd_uri_to_path(r"C:\Users\me"), r"C:\Users\me");
+        assert_eq!(cwd_uri_to_path(""), "");
+        assert_eq!(
+            cwd_uri_to_path("sftp://host/home/user"),
+            "sftp://host/home/user"
+        );
+        // A file URI with an authority but NO path carries no directory.
+        assert_eq!(cwd_uri_to_path("file://host"), "file://host");
+    }
+
+    /// The scheme is matched case-insensitively (RFC 3986 §3.1), and a malformed
+    /// or non-UTF-8 escape falls back to the raw value rather than inventing a path.
+    #[test]
+    fn scheme_is_case_insensitive_and_bad_escapes_fall_back() {
+        assert_eq!(cwd_uri_to_path("FILE:///home/user"), "/home/user");
+        assert_eq!(cwd_uri_to_path("File://h/tmp"), "/tmp");
+        // Truncated escape.
+        assert_eq!(cwd_uri_to_path("file:///tmp/%2"), "file:///tmp/%2");
+        // Non-hex escape.
+        assert_eq!(cwd_uri_to_path("file:///tmp/%zz"), "file:///tmp/%zz");
+        // Valid escape, invalid UTF-8.
+        assert_eq!(cwd_uri_to_path("file:///tmp/%FF"), "file:///tmp/%FF");
     }
 }

@@ -1782,6 +1782,32 @@ fn render_sections(
                 ui.end_row();
             }
 
+            if row_visible(q, "text weight contrast glyph") {
+                ui.label("Text weight").on_hover_text(
+                    "How heavily glyph edges are inked. The centre detent is the \
+                     shipped default, chosen automatically from the theme's \
+                     polarity. Also affects rounded-corner smoothing in the app \
+                     chrome — there is one glyph atlas for the whole window.",
+                );
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(
+                                &mut config.font.text_contrast,
+                                TEXT_CONTRAST_RANGE,
+                            )
+                            .step_by(0.05)
+                            // "Lighter … Heavier" reads as the physical property;
+                            // the raw −1..1 number means nothing to a reader.
+                            .custom_formatter(|v, _| text_contrast_label(v as f32)),
+                        )
+                        .changed();
+                });
+                changed |=
+                    reset_to_default(ui, &mut config.font.text_contrast, &def.font.text_contrast);
+                ui.end_row();
+            }
+
             if row_visible(q, "line height") {
                 ui.label("Line height").on_hover_text(
                     "Row height for the primary font. Applies on restart — the grid \
@@ -3637,6 +3663,43 @@ fn step_font_size(size: f32, delta: f32) -> f32 {
     (size + delta).clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end())
 }
 
+/// The glyph-coverage ("Text weight") slider's bounds.
+///
+/// These are the KNOB's bounds, deliberately mirrored from
+/// [`c0pl4nd_core::theme::glyph_coverage::CONTRAST_MIN`]/`CONTRAST_MAX` rather
+/// than invented here — the policy that maps this number onto a curve owns the
+/// meaning of its range, and `curve_for` clamps anyway, so the UI cannot produce
+/// a value the engine would reject. Kept honest by
+/// `the_text_weight_slider_spans_exactly_the_knobs_range`.
+const TEXT_CONTRAST_RANGE: std::ops::RangeInclusive<f32> =
+    c0pl4nd_core::theme::glyph_coverage::CONTRAST_MIN
+        ..=c0pl4nd_core::theme::glyph_coverage::CONTRAST_MAX;
+
+/// The slider's human-readable value: a physical description, not a raw number.
+///
+/// "−0.35" tells a reader nothing; "Lighter" does. The neutral detent is named
+/// "Default" so the shipped state is legible as the shipped state rather than as
+/// one setting among many.
+fn text_contrast_label(v: f32) -> String {
+    use c0pl4nd_core::theme::glyph_coverage::CONTRAST_NEUTRAL;
+    if v == CONTRAST_NEUTRAL {
+        return "Default".to_string();
+    }
+    let magnitude = if v.abs() >= 0.66 {
+        "Much "
+    } else if v.abs() >= 0.33 {
+        ""
+    } else {
+        "Slightly "
+    };
+    let direction = if v > CONTRAST_NEUTRAL {
+        "heavier"
+    } else {
+        "lighter"
+    };
+    format!("{magnitude}{direction}")
+}
+
 /// Step the line height by `delta` PIXELS, re-clamped into [`LINE_HEIGHT_PX_RANGE`].
 /// C0PL4ND's line-height is px (not SCR1B3's ratio), so the step is ±1.0 px rather
 /// than SCR1B3's ±0.1 ratio — the UI pattern is ported, the unit/range are not.
@@ -4013,6 +4076,44 @@ mod tests {
         // The stepper band matches the slider's declared range.
         assert_eq!(*FONT_SIZE_RANGE.start(), 8.0);
         assert_eq!(*FONT_SIZE_RANGE.end(), 32.0);
+    }
+
+    /// The UI must not offer a value the engine would clamp away — a slider that
+    /// ran wider than the knob would show the user a setting that silently does
+    /// nothing past the edge.
+    #[test]
+    fn the_text_weight_slider_spans_exactly_the_knobs_range() {
+        use c0pl4nd_core::theme::glyph_coverage::{CONTRAST_MAX, CONTRAST_MIN};
+        assert_eq!(*TEXT_CONTRAST_RANGE.start(), CONTRAST_MIN);
+        assert_eq!(*TEXT_CONTRAST_RANGE.end(), CONTRAST_MAX);
+        assert!(
+            TEXT_CONTRAST_RANGE.contains(&c0pl4nd_core::config::FontConfig::default().text_contrast),
+            "the shipped default must be reachable on the slider"
+        );
+    }
+
+    /// The slider shows words, not a raw float, and the neutral detent must be
+    /// legible AS the default. A formatter that lost the "Default" label would
+    /// leave a user unable to find their way back to the shipped state.
+    #[test]
+    fn the_text_weight_label_names_the_detent_and_both_directions() {
+        assert_eq!(text_contrast_label(0.0), "Default");
+        assert!(
+            text_contrast_label(0.5).contains("heavier"),
+            "positive contrast must read as heavier"
+        );
+        assert!(
+            text_contrast_label(-0.5).contains("lighter"),
+            "negative contrast must read as lighter"
+        );
+        assert!(text_contrast_label(0.1).starts_with("Slightly"));
+        assert!(text_contrast_label(1.0).starts_with("Much"));
+        // Distinct labels across the band, or the slider would read as stuck.
+        let labels: std::collections::HashSet<String> = [-1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0]
+            .into_iter()
+            .map(text_contrast_label)
+            .collect();
+        assert_eq!(labels.len(), 7, "each band must read distinctly: {labels:?}");
     }
 
     #[test]

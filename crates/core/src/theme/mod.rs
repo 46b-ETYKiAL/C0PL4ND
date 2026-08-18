@@ -5,12 +5,14 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 mod color_model;
+pub mod glyph_coverage;
 mod itermcolors;
 
 pub use color_model::{
     contrast_ratio, dim_foreground, enforce_min_contrast, relative_luminance, ColorOptions,
     ContrastScope, IntenseTextStyle, CONTRAST_RATIO_MAX, CONTRAST_RATIO_MIN,
 };
+pub use glyph_coverage::{curve_for, CoverageCurve};
 
 /// Remap an *indexed* foreground 0-7 to its bright twin 8-15 (the bold-as-bright
 /// rule). Every other colour — an already-bright index, an extended 16-255

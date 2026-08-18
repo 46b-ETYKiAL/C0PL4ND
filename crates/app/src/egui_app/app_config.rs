@@ -114,7 +114,30 @@ impl super::C0pl4ndApp {
     /// exercising the same `visuals_from_theme` derivation the live app applies.
     #[allow(dead_code)]
     pub fn visuals_are_light(&self) -> bool {
-        theme::is_light(theme::visuals_from_theme(&self.theme).window_fill)
+        theme::is_light(
+            theme::visuals_from_theme(&self.theme, self.config.font.text_contrast).window_fill,
+        )
+    }
+
+    /// The glyph COVERAGE CURVE the live `Visuals` carry — the observation
+    /// accessor the curve scenes assert against.
+    ///
+    /// This reads the app's own derivation rather than the `egui::Context`, so it
+    /// answers "what curve did THIS app instance ask for", which is the half a
+    /// leaking sibling scene would corrupt. The context-side reading is asserted
+    /// separately, and the two agreeing is what proves the curve reached the
+    /// renderer rather than merely being computed.
+    #[allow(dead_code)]
+    pub fn glyph_coverage_curve(&self) -> egui::epaint::AlphaFromCoverage {
+        let bg = theme::theme_color(&self.theme.background, theme::brand::BG);
+        let fg = theme::theme_color(&self.theme.foreground, theme::brand::FG);
+        theme::alpha_from_coverage_for(fg, bg, self.config.font.text_contrast)
+    }
+
+    /// The live glyph-coverage knob value (`config.font.text_contrast`).
+    #[allow(dead_code)]
+    pub fn config_text_contrast(&self) -> f32 {
+        self.config.font.text_contrast
     }
 
     /// The current scrollback line count from the live config.

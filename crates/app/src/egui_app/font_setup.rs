@@ -167,10 +167,86 @@ pub(crate) fn font_apply_key(font: &c0pl4nd_core::config::FontConfig) -> String 
     key
 }
 
+/// Everything that determines the CONTENT of the pre-warmed grid glyph atlas.
+///
+/// `(font-stack key, size bits, pixels-per-point bits, text-contrast bits)`.
+/// Floats are compared by bit pattern rather than by value because this is an
+/// identity question ("is the atlas the one we warmed?"), not a numeric one —
+/// and `NaN != NaN` under value comparison would re-warm forever.
+pub(crate) type AtlasWarmKey = (String, u32, u32, u32);
+
+/// Build the [`AtlasWarmKey`] for a live font stack + coverage curve.
+///
+/// `text_contrast` is in the key for a concrete reason that is easy to miss:
+/// changing the glyph coverage curve makes epaint RECREATE the whole font atlas
+/// (its `Fonts::begin_pass` compares the incoming `TextOptions` against the
+/// live ones and recreates on any difference). An atlas key blind to the curve
+/// would therefore report a warm atlas that no longer exists, leaving the warmup
+/// gate un-armed across exactly the kind of atlas reset that gate was built for.
+///
+/// Pure + GPU-free so the invalidation is unit-testable without a renderer.
+pub(crate) fn atlas_warm_key(
+    font_family_key: &str,
+    size: f32,
+    pixels_per_point: f32,
+    text_contrast: f32,
+) -> AtlasWarmKey {
+    (
+        font_family_key.to_string(),
+        size.to_bits(),
+        pixels_per_point.to_bits(),
+        text_contrast.to_bits(),
+    )
+}
+
 #[cfg(test)]
 mod key_tests {
-    use super::font_apply_key;
+    use super::{atlas_warm_key, font_apply_key};
     use c0pl4nd_core::config::FontConfig;
+
+    /// THE atlas-invalidation regression guard.
+    ///
+    /// A coverage-curve change recreates the font atlas. If the warm key cannot
+    /// see the curve, the app believes its atlas is still warm across that
+    /// recreation — so the warmup gate never re-arms and the cached galleys are
+    /// never dropped. This is the no-GPU half of that contract; the galley-cache
+    /// half is `apply_live_glyph_curve_change`.
+    #[test]
+    fn the_atlas_warm_key_changes_when_the_coverage_curve_changes() {
+        let base = atlas_warm_key("JetBrains Mono", 13.0, 1.0, 0.0);
+        assert_ne!(
+            base,
+            atlas_warm_key("JetBrains Mono", 13.0, 1.0, 0.35),
+            "the atlas warm key must move when text_contrast moves — otherwise a \
+             live curve change silently leaves the app pointing at a discarded \
+             atlas"
+        );
+        assert_ne!(
+            base,
+            atlas_warm_key("JetBrains Mono", 13.0, 1.0, -0.35),
+            "…in both directions"
+        );
+        // A curve change that is too small to move the key would be a curve
+        // change the atlas gate cannot see. Bit-comparison means ANY distinct
+        // float registers.
+        assert_ne!(base, atlas_warm_key("JetBrains Mono", 13.0, 1.0, f32::MIN_POSITIVE));
+    }
+
+    /// The pre-existing key components must still be load-bearing — this guard
+    /// would otherwise pass on a key that ONLY carried the contrast.
+    #[test]
+    fn the_atlas_warm_key_still_tracks_family_size_and_dpi() {
+        let base = atlas_warm_key("JetBrains Mono", 13.0, 1.0, 0.0);
+        assert_ne!(base, atlas_warm_key("IBM Plex Mono", 13.0, 1.0, 0.0));
+        assert_ne!(base, atlas_warm_key("JetBrains Mono", 14.0, 1.0, 0.0));
+        assert_ne!(base, atlas_warm_key("JetBrains Mono", 13.0, 2.0, 0.0));
+        assert_eq!(
+            base,
+            atlas_warm_key("JetBrains Mono", 13.0, 1.0, 0.0),
+            "and it must be stable for identical inputs, or the atlas would \
+             re-warm every frame"
+        );
+    }
 
     #[test]
     fn font_apply_key_changes_when_ui_family_changes() {

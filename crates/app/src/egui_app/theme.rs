@@ -145,7 +145,7 @@ pub fn accent_text_color(accent: Color32, surface: Color32) -> Color32 {
 /// Parse a `c0pl4nd_core::Theme` `#rrggbb` field into an egui `Color32`, falling
 /// back to `fallback` when the field is empty or unparseable (e.g. the optional
 /// `selection_background` slot a minimal theme omits).
-fn theme_color(hex: &str, fallback: Color32) -> Color32 {
+pub(crate) fn theme_color(hex: &str, fallback: Color32) -> Color32 {
     match c0pl4nd_core::theme::parse_hex(hex) {
         Ok((r, g, b)) => Color32::from_rgb(r, g, b),
         Err(_) => fallback,
@@ -192,6 +192,33 @@ fn ensure_readable_tone(tone: Color32, bg: Color32) -> Color32 {
     out
 }
 
+/// The epaint coverage curve for grid text of colour `fg` on `bg`, at the user's
+/// `text_contrast`.
+///
+/// The ONE place `c0pl4nd_core`'s engine-free [`CoverageCurve`] is mapped onto
+/// epaint's enum. Core deliberately does not depend on egui (see
+/// [`c0pl4nd_core::theme::glyph_coverage`]'s module docs), so the policy is
+/// decided there and translated here — this function holds no policy of its own,
+/// which is what keeps the decision unit-testable without a GPU or an egui
+/// context.
+///
+/// Takes the already-resolved colours rather than the `Theme`, so it cannot
+/// disagree with the `bg`/`fg` its caller derived from the same theme (including
+/// their fallbacks when a minimal theme omits a slot).
+pub(crate) fn alpha_from_coverage_for(
+    fg: Color32,
+    bg: Color32,
+    text_contrast: f32,
+) -> egui::epaint::AlphaFromCoverage {
+    use c0pl4nd_core::theme::CoverageCurve;
+    use egui::epaint::AlphaFromCoverage;
+    match c0pl4nd_core::theme::curve_for(rgb_triple(fg), rgb_triple(bg), text_contrast) {
+        CoverageCurve::Linear => AlphaFromCoverage::Linear,
+        CoverageCurve::TwoCMinusCSq => AlphaFromCoverage::TwoCoverageMinusCoverageSq,
+        CoverageCurve::Gamma(g) => AlphaFromCoverage::Gamma(g),
+    }
+}
+
 /// Build an `egui::Visuals` DERIVED FROM the active terminal colour `theme`, so
 /// the whole chrome (titlebar / tab strip / status bar / settings window /
 /// panel fills) follows the selected theme — light themes (e.g. `ghost-paper`)
@@ -205,7 +232,21 @@ fn ensure_readable_tone(tone: Color32, bg: Color32) -> Color32 {
 /// `theme.selection_background` (falling back to a bright accent when the theme
 /// omits it). The two-tone C0PL4ND wordmark keeps its fixed brand accent (drawn
 /// directly in `chrome.rs`); only the surfaces follow the theme.
-pub fn visuals_from_theme(theme: &c0pl4nd_core::Theme) -> Visuals {
+///
+/// # `text_contrast` and the glyph coverage curve
+///
+/// `text_contrast` is `config.font.text_contrast`, and it selects the GLYPH
+/// COVERAGE CURVE the font atlas is baked with (see
+/// [`c0pl4nd_core::theme::glyph_coverage`]). It is a REQUIRED parameter rather
+/// than an optional one on purpose: the curve was previously inherited as a
+/// side effect of the `Visuals::light()` / `Visuals::dark()` choice above and
+/// never named anywhere in this repo, which is precisely the silent-inheritance
+/// defect this signature exists to remove. An overload that defaulted it would
+/// recreate that defect for any call site that forgot to pass it.
+///
+/// `0.0` — the shipped default — reproduces the previously-inherited curve, so
+/// this is a no-op at the defaults.
+pub fn visuals_from_theme(theme: &c0pl4nd_core::Theme, text_contrast: f32) -> Visuals {
     let bg = theme_color(&theme.background, Color32::from_rgb(0x12, 0x12, 0x12));
     let fg = theme_color(&theme.foreground, Color32::from_rgb(0xe8, 0xe6, 0xf0));
     let light = is_light(bg);
@@ -234,6 +275,17 @@ pub fn visuals_from_theme(theme: &c0pl4nd_core::Theme) -> Visuals {
     } else {
         Visuals::dark()
     };
+    // OWN THE GLYPH COVERAGE CURVE. Both `Visuals::light()` and `Visuals::dark()`
+    // carry a `text_options.alpha_from_coverage`, and until this line C0PL4ND
+    // took whichever one that base happened to have without ever naming it —
+    // making how every glyph in the app is inked a silent side effect of an
+    // unrelated chrome-polarity decision.
+    //
+    // The selection now comes from the GRID's own polarity (`fg` vs `bg`) rather
+    // than the chrome base's, and from the user's contrast knob. For every
+    // shipped theme this resolves to the same curve as before, which is the
+    // point: the behaviour is pinned, not changed.
+    v.text_options.alpha_from_coverage = alpha_from_coverage_for(fg, bg, text_contrast);
     v.extreme_bg_color = bg;
     v.panel_fill = panel;
     v.window_fill = panel;
@@ -377,6 +429,7 @@ pub mod brand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use c0pl4nd_core::theme::glyph_coverage::CONTRAST_NEUTRAL;
 
     #[test]
     fn luminance_separates_light_and_dark() {
@@ -397,10 +450,169 @@ mod tests {
         assert!(luminance(shade(light, 0.12)) < luminance(light));
     }
 
+    // ----- the glyph coverage curve -----------------------------------------
+
+    /// THE anti-drift pin between core's engine-free curve MODEL and epaint's
+    /// real arithmetic.
+    ///
+    /// `CoverageCurve::alpha_at` exists so the curve can be reasoned about and
+    /// tested in `c0pl4nd-core`, which must not depend on egui. Nothing renders
+    /// through it — epaint's `alpha_from_coverage` does the real work. That makes
+    /// it a second implementation of one function, and a second implementation
+    /// with no equivalence check is a copy waiting to drift: core's tests would
+    /// stay green while describing arithmetic the renderer no longer performs.
+    ///
+    /// This is the check. It runs in the app crate because this is the only crate
+    /// that can see BOTH.
+    #[test]
+    fn the_core_curve_model_matches_epaints_arithmetic() {
+        use c0pl4nd_core::theme::glyph_coverage::{CoverageCurve, GAMMA_MAX, GAMMA_MIN};
+        use egui::epaint::AlphaFromCoverage;
+        let pairs = [
+            (CoverageCurve::Linear, AlphaFromCoverage::Linear),
+            (
+                CoverageCurve::TwoCMinusCSq,
+                AlphaFromCoverage::TwoCoverageMinusCoverageSq,
+            ),
+            (
+                CoverageCurve::Gamma(GAMMA_MIN),
+                AlphaFromCoverage::Gamma(GAMMA_MIN),
+            ),
+            (
+                CoverageCurve::Gamma(GAMMA_MAX),
+                AlphaFromCoverage::Gamma(GAMMA_MAX),
+            ),
+            (CoverageCurve::Gamma(0.55), AlphaFromCoverage::Gamma(0.55)),
+        ];
+        for (model, real) in pairs {
+            // Sweep past the ends too, so the clamping agrees as well as the
+            // curve — a model that clamped differently at the extremes would
+            // mis-describe the first and last pixel of every stem.
+            for step in -10..=110 {
+                let c = step as f32 / 100.0;
+                let (m, r) = (model.alpha_at(c), real.alpha_from_coverage(c));
+                assert!(
+                    (m - r).abs() < 1e-6,
+                    "core's model of {model:?} says alpha({c}) = {m}, epaint's \
+                     {real:?} says {r} — the model has drifted from the \
+                     arithmetic the renderer actually performs"
+                );
+            }
+        }
+    }
+
+    /// The whole selection policy, checked at the seam that applies it: the
+    /// `Visuals` handed to egui must carry the curve `curve_for` chose, for BOTH
+    /// polarities and for a non-neutral contrast.
+    #[test]
+    fn visuals_carry_the_curve_the_policy_selected() {
+        use egui::epaint::AlphaFromCoverage;
+        let dark = c0pl4nd_core::Theme::builtin_void();
+        let light = c0pl4nd_core::Theme::builtin_named("ghost-paper").expect("ghost-paper embedded");
+
+        assert_eq!(
+            visuals_from_theme(&dark, CONTRAST_NEUTRAL)
+                .text_options
+                .alpha_from_coverage,
+            AlphaFromCoverage::TwoCoverageMinusCoverageSq,
+            "a dark theme's light-on-dark grid text needs the fattening curve"
+        );
+        assert_eq!(
+            visuals_from_theme(&light, CONTRAST_NEUTRAL)
+                .text_options
+                .alpha_from_coverage,
+            AlphaFromCoverage::Linear,
+            "a light theme's dark-on-light grid text needs the identity curve"
+        );
+        assert!(
+            matches!(
+                visuals_from_theme(&dark, 0.35)
+                    .text_options
+                    .alpha_from_coverage,
+                AlphaFromCoverage::Gamma(_)
+            ),
+            "a non-neutral contrast must reach the Visuals as a Gamma curve — \
+             otherwise the knob is wired to nothing"
+        );
+    }
+
+    /// THE "no visible change at the default" contract.
+    ///
+    /// Before this work the curve was whatever `Visuals::light()` /
+    /// `Visuals::dark()` happened to carry. Making the selection EXPLICIT is only
+    /// safe if the explicit answer is the same answer — otherwise shipping the
+    /// pin would silently re-ink every existing user's terminal.
+    ///
+    /// This compares against the egui bases directly rather than against a
+    /// hard-coded enum variant, so it is a genuine equivalence rather than two
+    /// copies of one guess. It is also the guard that would fire on an egui
+    /// upgrade that changed a base default: at that point the app's rendering no
+    /// longer matches its inherited past, and that is a decision to take
+    /// deliberately, not a diff to absorb silently.
+    #[test]
+    fn the_default_contrast_reproduces_the_previously_inherited_curve() {
+        for (name, theme, base) in [
+            (
+                "itasha-void (dark base)",
+                c0pl4nd_core::Theme::builtin_void(),
+                Visuals::dark(),
+            ),
+            (
+                "ghost-paper (light base)",
+                c0pl4nd_core::Theme::builtin_named("ghost-paper").expect("ghost-paper embedded"),
+                Visuals::light(),
+            ),
+        ] {
+            assert_eq!(
+                visuals_from_theme(&theme, CONTRAST_NEUTRAL)
+                    .text_options
+                    .alpha_from_coverage,
+                base.text_options.alpha_from_coverage,
+                "{name}: the EXPLICIT curve selection at the neutral detent must \
+                 equal the curve this theme's egui base previously supplied \
+                 implicitly. A mismatch means pinning the curve CHANGED how every \
+                 glyph is inked."
+            );
+        }
+    }
+
+    /// Every SHIPPED theme must classify to the same curve its egui base would
+    /// have supplied. The two tests above check the two representative themes;
+    /// this checks the whole set, which is what makes "no shipped theme changes"
+    /// a measurement rather than a sample.
+    #[test]
+    fn no_shipped_theme_changes_curve_under_the_explicit_selection() {
+        let mut checked = 0usize;
+        for (name, src) in c0pl4nd_core::Theme::EMBEDDED_THEMES {
+            let theme = c0pl4nd_core::Theme::from_toml(src)
+                .unwrap_or_else(|e| panic!("shipped theme {name} must parse: {e}"));
+            let base = if is_light(theme_color(&theme.background, brand::BG)) {
+                Visuals::light()
+            } else {
+                Visuals::dark()
+            };
+            assert_eq!(
+                visuals_from_theme(&theme, CONTRAST_NEUTRAL)
+                    .text_options
+                    .alpha_from_coverage,
+                base.text_options.alpha_from_coverage,
+                "{name}: the fg-vs-bg polarity policy disagrees with the \
+                 background-luminance pivot this theme's chrome base uses, so \
+                 pinning the curve would change how this theme renders"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 30,
+            "only {checked} themes were checked — the shipped set is ~35, so this \
+             assertion is not covering what it claims to"
+        );
+    }
+
     #[test]
     fn visuals_from_dark_theme_are_dark() {
         let t = c0pl4nd_core::Theme::builtin_void();
-        let v = visuals_from_theme(&t);
+        let v = visuals_from_theme(&t, CONTRAST_NEUTRAL);
         assert!(
             !is_light(v.window_fill),
             "a dark theme must produce a dark egui base (window_fill={:?})",
@@ -417,7 +629,7 @@ mod tests {
     #[test]
     fn visuals_from_light_theme_are_light() {
         let t = c0pl4nd_core::Theme::builtin_named("ghost-paper").expect("ghost-paper embedded");
-        let v = visuals_from_theme(&t);
+        let v = visuals_from_theme(&t, CONTRAST_NEUTRAL);
         assert!(
             is_light(v.window_fill),
             "a light theme (ghost-paper) must produce a LIGHT egui base \
@@ -700,7 +912,7 @@ mod tests {
             c0pl4nd_core::Theme::builtin_named("ghost-paper").expect("ghost-paper embedded"),
         ] {
             assert_eq!(
-                visuals_from_theme(&theme).interact_cursor,
+                visuals_from_theme(&theme, CONTRAST_NEUTRAL).interact_cursor,
                 Some(egui::CursorIcon::PointingHand),
                 "buttons must show a pointing hand on hover"
             );

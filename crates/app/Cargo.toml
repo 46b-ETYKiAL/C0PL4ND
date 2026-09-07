@@ -99,7 +99,7 @@ semver = "=1.0.28"                                        # release version comp
 sha2 = "=0.11.0"                                          # artifact checksum (catches corruption)
 minisign-verify = "=0.2.5"                                # ed25519 signature verify (catches tampering); zero-dep
 self-replace = "=1.5.0"                                   # atomic running-exe swap (Windows rename-aside)
-flate2 = "=1.1.9"                                         # gunzip the Unix `.tar.gz` release archive
+flate2 = "=1.1.10"                                         # gunzip the Unix `.tar.gz` release archive
 tar = { version = "=0.4.46", default-features = false }   # untar the binary from the Unix archive
 zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }  # unzip the Windows `.zip` archive
 tempfile = "=3.27.0"                                      # per-run unique 0700 staging dir for the verified download (defense-in-depth TOCTOU fix; already in the lock graph)

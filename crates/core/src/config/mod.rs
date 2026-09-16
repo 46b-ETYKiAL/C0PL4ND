@@ -84,6 +84,29 @@ pub struct FontConfig {
     /// surface. Default: "IBM Plex Mono". Mirrors SCR1B3's `ui_family`.
     #[serde(default = "default_ui_family")]
     pub ui_family: String,
+    /// How heavily glyph coverage is inked — the GLYPH COVERAGE CURVE knob, in
+    /// `-1.0..=1.0`. Positive is heavier/darker stems, negative is lighter/finer.
+    ///
+    /// `0.0` (the default, and what `#[serde(default)]` gives an older
+    /// `config.toml` with no migration) selects the POLARITY DEFAULT — the exact
+    /// curve C0PL4ND previously inherited implicitly from `Visuals::light()` /
+    /// `Visuals::dark()`. So this ships as a no-op and only does something when a
+    /// user moves it.
+    ///
+    /// Lives on [`FontConfig`] because it is a property of how the terminal
+    /// typeface is rasterised, alongside [`size`](Self::size) and
+    /// [`line_height`](Self::line_height). Note it is app-WIDE in effect, not
+    /// terminal-only: there is one glyph atlas per `egui::Context` and the same
+    /// curve is applied to the pre-rasterised discs egui uses for rounded-corner
+    /// antialiasing, so it also moves chrome corner smoothing.
+    ///
+    /// The policy that turns this number into a curve — including its bounds and
+    /// the reason those bounds are where they are — is
+    /// [`crate::theme::glyph_coverage::curve_for`]. Out-of-range and non-finite
+    /// values are handled there (clamped and defaulted respectively), so a
+    /// hand-edited config can never produce an invalid curve.
+    #[serde(default)]
+    pub text_contrast: f32,
 }
 
 /// The app-UI-font choice that keeps egui's built-in proportional font (i.e. does
@@ -119,6 +142,12 @@ impl Default for FontConfig {
             line_height: 20.0,
             fallback: vec!["Noto Sans JP".to_string(), "monospace".to_string()],
             ui_family: default_ui_family(),
+            // The NEUTRAL detent: select the polarity default coverage curve and
+            // apply no gamma at all, which is byte-identical to the curve the app
+            // previously inherited without naming it. Kept in lockstep with
+            // `theme::glyph_coverage::CONTRAST_NEUTRAL` by
+            // `the_default_text_contrast_is_the_neutral_detent`.
+            text_contrast: crate::theme::glyph_coverage::CONTRAST_NEUTRAL,
         }
     }
 }
@@ -2246,6 +2275,46 @@ mod tests {
         // points — NOT the previous 14.0 (which read large, especially on HiDPI).
         // A user-saved size is untouched; only the default is pinned here.
         assert_eq!(FontConfig::default().size, 13.0);
+    }
+
+    /// The shipped glyph-coverage knob must sit exactly on the NEUTRAL detent,
+    /// because that is what makes the explicit curve selection reproduce the
+    /// curve the app previously inherited implicitly. A default that drifted off
+    /// zero would change how every glyph in the app is inked, for everyone, with
+    /// no other signal.
+    #[test]
+    fn the_default_text_contrast_is_the_neutral_detent() {
+        assert_eq!(
+            FontConfig::default().text_contrast,
+            crate::theme::glyph_coverage::CONTRAST_NEUTRAL,
+        );
+        assert_eq!(
+            crate::theme::curve_for(
+                (0xe8, 0xe6, 0xf0),
+                (0x12, 0x12, 0x12),
+                FontConfig::default().text_contrast
+            ),
+            crate::theme::CoverageCurve::TwoCMinusCSq,
+            "the default must resolve to the polarity default curve, with no gamma"
+        );
+    }
+
+    /// An EXISTING `config.toml`, written before this field existed, must upgrade
+    /// to the neutral detent rather than to whatever `f32` happens to deserialize
+    /// as — i.e. the field must carry `#[serde(default)]`. Without this, shipping
+    /// the knob would silently re-ink every existing user's terminal.
+    #[test]
+    fn a_config_written_before_the_curve_knob_upgrades_to_neutral() {
+        let p = PathBuf::from("test.toml");
+        let c = Config::from_toml(
+            "[font]\nfamily = \"JetBrains Mono\"\nsize = 13.0\nline_height = 20.0\nfallback = []\n",
+            &p,
+        )
+        .expect("a font table without the new key must still parse");
+        assert_eq!(
+            c.font.text_contrast,
+            crate::theme::glyph_coverage::CONTRAST_NEUTRAL
+        );
     }
 
     #[test]

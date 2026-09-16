@@ -254,6 +254,20 @@ pub struct C0pl4ndApp {
     /// single live re-install of the font stack — and the (expensive) system-font
     /// load runs ONLY on an actual change, never per frame.
     pub(crate) applied_font_family: String,
+    /// The glyph-coverage contrast (`config.font.text_contrast`) whose curve is
+    /// currently baked into the live font atlas.
+    ///
+    /// Tracked for the same reason [`Self::applied_font_family`] is, and with the
+    /// same consequence: changing the coverage curve makes epaint RECREATE the
+    /// whole font atlas, so every cached galley from before the change references
+    /// a discarded atlas. Comparing this against the live config each frame is
+    /// what turns a settings-slider move into exactly one atlas reset instead of
+    /// either none (stale glyphs) or one per frame.
+    ///
+    /// Initialised to a sentinel `NaN` so the first comparison always registers as
+    /// a change; the constructor then records the real value once the initial
+    /// `set_visuals` has established the curve.
+    pub(crate) applied_text_contrast: f32,
     /// The UI scale (F2-3) currently applied to the egui context, tracked so
     /// `frame_tick` re-applies `set_zoom_factor` ONLY when the configured
     /// `ui_scale` actually changes (not every frame, and without fighting the
@@ -355,16 +369,14 @@ pub struct C0pl4ndApp {
     /// [`c0pl4nd_core::Config::default_path`] by default; a test repoints it
     /// with [`Self::watch_config_at`].
     pub(crate) config_watch: config_watch::ConfigWatcher,
-    /// The `(font-family-key, size-bits, pixels-per-point-bits)` the grid glyph
-    /// atlas was last PRE-WARMED for. When this differs from the live font stack
-    /// (first frame, a system-font swap, a zoom, OR a DPI/`pixels_per_point`
-    /// change — the last is why `ppp` is in the key: egui rasterises glyphs at
-    /// `size × ppp`, so a 1.0→1.5 DPI settle re-rasterises the whole set), the
-    /// atlas is re-warmed. Warming rasterises every glyph the grid draws up-front
-    /// so the atlas reaches its FINAL size in one step, never growing mid-render —
-    /// the growth that feeds the DX12 upload↔sample hazard (garbled/blank grid
-    /// glyphs). `None` == never warmed yet.
-    pub(crate) warmed_atlas: Option<(String, u32, u32)>,
+    /// The [`AtlasWarmKey`] the grid glyph atlas was last PRE-WARMED for. When
+    /// this differs from the live font stack (first frame, a system-font swap, a
+    /// zoom, a DPI/`pixels_per_point` change, OR a glyph-coverage-curve change),
+    /// the atlas is re-warmed. Warming rasterises every glyph the grid draws
+    /// up-front so the atlas reaches its FINAL size in one step, never growing
+    /// mid-render — the growth that feeds the DX12 upload↔sample hazard
+    /// (garbled/blank grid glyphs). `None` == never warmed yet.
+    pub(crate) warmed_atlas: Option<AtlasWarmKey>,
     /// Frames remaining in the atlas WARMUP GATE. While > 0 the grid draws NO
     /// glyphs (empty panes) and `ui` blocks on `device.poll(Wait)` so the warmed
     /// atlas upload is guaranteed RESIDENT on the GPU before any glyph is sampled —
@@ -861,9 +873,13 @@ impl C0pl4ndApp {
         // opacity (only glyph text stays over the desktop at opacity 0). Done after
         // `bootstrap()` so `app.theme`/`app.config` are loaded; re-applied on every
         // theme/opacity change (see `settings_window` / `follow_os_theme_tick`).
-        let mut visuals = theme::visuals_from_theme(&app.theme);
+        let mut visuals = theme::visuals_from_theme(&app.theme, app.config.font.text_contrast);
         window_effects::apply_window_opacity(&mut visuals, app.config.opacity);
         cc.egui_ctx.set_visuals(visuals);
+        // The curve the atlas is about to be baked with is now live, so record it
+        // as applied — otherwise the first frame's live-apply check would see a
+        // spurious change and reset a perfectly good atlas.
+        app.applied_text_contrast = app.config.font.text_contrast;
         app.fonts_installed = true; // already installed above; skip the frame-tick install
                                     // A wgpu render state means a real window (also true under the wgpu test
                                     // harness, which drives frames explicitly with `step()`); headless tests
@@ -972,6 +988,7 @@ impl C0pl4ndApp {
             active_shell: 0,
             fonts_installed: false,
             applied_font_family: String::new(),
+            applied_text_contrast: f32::NAN,
             applied_ui_scale: f32::NAN,
             settings_open: false,
             overlay_exclude_rect: None,
@@ -3319,9 +3336,10 @@ impl C0pl4ndApp {
         for term in self.terms.values_mut() {
             term.set_theme(self.theme.clone());
         }
-        let mut visuals = theme::visuals_from_theme(&self.theme);
+        let mut visuals = theme::visuals_from_theme(&self.theme, self.config.font.text_contrast);
         window_effects::apply_window_opacity(&mut visuals, self.config.opacity);
         ctx.set_visuals(visuals);
+        self.applied_text_contrast = self.config.font.text_contrast;
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
@@ -3413,9 +3431,10 @@ impl C0pl4ndApp {
                 term.set_theme(self.theme.clone());
             }
         }
-        let mut visuals = theme::visuals_from_theme(&self.theme);
+        let mut visuals = theme::visuals_from_theme(&self.theme, self.config.font.text_contrast);
         window_effects::apply_window_opacity(&mut visuals, self.config.opacity);
         ctx.set_visuals(visuals);
+        self.applied_text_contrast = self.config.font.text_contrast;
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
             if self.config.always_on_top {
                 egui::WindowLevel::AlwaysOnTop
@@ -4765,17 +4784,19 @@ impl C0pl4ndApp {
             self.fonts_installed = true;
         }
         // Pre-warm the grid glyph atlas whenever the live font stack (family,
-        // size, OR DPI/pixels_per_point) differs from what it was last warmed for
-        // — first frame, a system-font swap, a live zoom, or a DPI settle. This
-        // rasterises the full grid glyph set at the FINAL scale in one step so the
-        // atlas reaches its final size immediately, and ARMS the warmup gate so the
-        // grid holds its glyphs off (and `ui` GPU-fences) until that atlas is
-        // uploaded + resident — closing the DX12 upload↔sample race (see
+        // size, DPI/pixels_per_point, OR the glyph coverage curve) differs from
+        // what it was last warmed for — first frame, a system-font swap, a live
+        // zoom, a DPI settle, or a text-contrast change. This rasterises the full
+        // grid glyph set at the FINAL scale in one step so the atlas reaches its
+        // final size immediately, and ARMS the warmup gate so the grid holds its
+        // glyphs off (and `ui` GPU-fences) until that atlas is uploaded +
+        // resident — closing the DX12 upload↔sample race (see
         // `prewarm_grid_atlas` + `warmup_frames_left`).
-        let atlas_key = (
-            self.applied_font_family.clone(),
-            self.config.font.size.to_bits(),
-            ctx.pixels_per_point().to_bits(),
+        let atlas_key = atlas_warm_key(
+            &self.applied_font_family,
+            self.config.font.size,
+            ctx.pixels_per_point(),
+            self.config.font.text_contrast,
         );
         if self.warmed_atlas.as_ref() != Some(&atlas_key) {
             prewarm_grid_atlas(ctx, self.config.font.size);
@@ -4876,6 +4897,9 @@ impl C0pl4ndApp {
         // never the font apply); only headless tests ever exercised it. That made
         // the font dropdown a no-op in production. It is now an unconditional call.
         self.apply_live_font_change(ctx);
+        // Same unconditional placement, and for the same reason: a glyph-coverage
+        // change must apply in the real window too, not only headless.
+        self.apply_live_glyph_curve_change(ctx);
         // Off-thread startup font load (audit #3): when the worker thread that
         // enumerated the system font DB has finished, swap in the custom stack.
         // Until then the window painted with the built-in mono. `try_recv` is
@@ -5677,6 +5701,56 @@ impl C0pl4ndApp {
             // A settings re-install supersedes any in-flight startup load.
             self.pending_fonts = None;
         }
+    }
+
+    /// Re-push the `Visuals` when the user moves the glyph-coverage knob, so the
+    /// new curve shows THIS frame without a relaunch — and clean up after the
+    /// atlas reset it causes.
+    ///
+    /// # Why this is not just a `set_visuals`
+    ///
+    /// The coverage curve reaches epaint through `Visuals::text_options`, and
+    /// epaint's `Fonts::begin_pass` compares the incoming `TextOptions` against
+    /// the live ones and RECREATES THE WHOLE ATLAS on any difference. So a curve
+    /// change is an atlas reset — the same event a font re-install causes — and
+    /// it needs the same three pieces of cleanup that
+    /// [`Self::apply_live_font_change`] and the startup-font swap already do:
+    ///
+    /// 1. **Drop the cached galleys.** `GalleyCache` holds laid-out galleys that
+    ///    reference the previous atlas. Without this they would be handed to the
+    ///    renderer pointing at a texture that no longer exists. This is the piece
+    ///    that would have been missed most easily: `galley_cache.clear()` was
+    ///    reachable only from the two font paths, and a curve change goes through
+    ///    neither.
+    /// 2. **Invalidate the warm key.** `warmed_atlas` records the atlas we warmed;
+    ///    after a reset there is nothing warm, so the next frame must re-warm.
+    ///    (The key itself also carries `text_contrast` — see [`atlas_warm_key`] —
+    ///    so this is belt-and-braces rather than the only line of defence: a curve
+    ///    change arriving by some other route, e.g. a config hot-reload, still
+    ///    invalidates.)
+    /// 3. **Re-arm the warmup gate, on the real window only.** The gate exists for
+    ///    the DX12 upload↔sample race, and that race is an ATLAS-RESET race. A
+    ///    headless render is serialised and never races, so arming there would
+    ///    only hide grid text from tests for no benefit — which is exactly why the
+    ///    pre-warm site above is `live_window`-gated too.
+    fn apply_live_glyph_curve_change(&mut self, ctx: &egui::Context) {
+        let want = self.config.font.text_contrast;
+        // Bit comparison, not value comparison: `applied_text_contrast` starts as
+        // a NaN sentinel so the first call always applies, and `NaN != NaN` under
+        // `!=` would make it apply on EVERY frame instead of exactly once.
+        if want.to_bits() == self.applied_text_contrast.to_bits() {
+            return;
+        }
+        self.applied_text_contrast = want;
+        let mut visuals = theme::visuals_from_theme(&self.theme, want);
+        window_effects::apply_window_opacity(&mut visuals, self.config.opacity);
+        ctx.set_visuals(visuals);
+        self.galley_cache.clear();
+        self.warmed_atlas = None;
+        if self.live_window {
+            self.warmup_frames_left = ATLAS_WARMUP_GATE_FRAMES;
+        }
+        ctx.request_repaint();
     }
 
     /// Drain every live pane's terminal-owed effects once per frame.

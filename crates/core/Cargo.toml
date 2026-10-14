@@ -60,7 +60,7 @@ image = { version = "=0.25.10", default-features = false, features = ["png"] }
 # write payloads, paste-staging text) on drop/reset so plaintext does not linger
 # in freed allocations recoverable from a crash dump / pagefile. Already in the
 # lock graph transitively; exact-pinned per dependency-management.md.
-zeroize = "=1.9.0"
+zeroize = "=1.9.1"
 
 [dev-dependencies]
 toml.workspace = true
